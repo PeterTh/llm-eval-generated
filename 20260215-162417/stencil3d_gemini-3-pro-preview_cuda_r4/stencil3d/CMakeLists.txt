@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.10)
+project(stencil3d_benchmark LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set_source_files_properties(stencil3d.cpp PROPERTIES LANGUAGE CUDA)
+
+add_executable(stencil3d stencil3d.cpp)
+
+# Enable optimizations
+if(CMAKE_CUDA_COMPILER_ID MATCHES "NVIDIA")
+    target_compile_options(stencil3d PRIVATE 
+        $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -Wall -Wextra>
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -arch=native>
+    )
+else()
+    target_compile_options(stencil3d PRIVATE -O3 -march=native -Wall -Wextra)
+endif()
+
+# Link math library
+target_link_libraries(stencil3d m)

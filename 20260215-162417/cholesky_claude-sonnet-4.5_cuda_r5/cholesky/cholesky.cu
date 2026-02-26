@@ -1,0 +1,281 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+#include <cuda_runtime.h>
+
+#include "../common/results_output.hpp"
+
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
+                    cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
+
+// CUDA kernel for computing diagonal element
+__global__ void diagonal_kernel(double* A, const size_t n, const size_t j, double* diag_val) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        double sum = 0.0;
+        for (size_t k = 0; k < j; ++k) {
+            double val = A[j * n + k];
+            sum += val * val;
+        }
+        double val = A[j * n + j] - sum;
+        if (val > 0.0) {
+            *diag_val = sqrt(val);
+            A[j * n + j] = *diag_val;
+        } else {
+            *diag_val = -1.0; // Error flag
+        }
+    }
+}
+
+// CUDA kernel to compute off-diagonal elements
+__global__ void offdiag_kernel(double* A, const size_t n, const size_t j) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x + j + 1;
+    
+    if (i < n) {
+        double sum = 0.0;
+        for (size_t k = 0; k < j; ++k) {
+            sum += A[i * n + k] * A[j * n + k];
+        }
+        A[i * n + j] = (A[i * n + j] - sum) / A[j * n + j];
+    }
+}
+
+// CUDA kernel to zero upper triangular part
+__global__ void zero_upper_kernel(double* A, const size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = n * n;
+    
+    if (idx < total) {
+        size_t i = idx / n;
+        size_t j = idx % n;
+        if (j > i) {
+            A[idx] = 0.0;
+        }
+    }
+}
+
+// CUDA-parallelized Cholesky decomposition
+bool choleskyDecomposition(std::vector<double>& A, const size_t n) {
+    // Allocate device memory
+    double* d_A;
+    double* d_diag;
+    size_t size = n * n * sizeof(double);
+    CUDA_CHECK(cudaMalloc(&d_A, size));
+    CUDA_CHECK(cudaMalloc(&d_diag, sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_A, A.data(), size, cudaMemcpyHostToDevice));
+    
+    const int blockSize = 256;
+    double h_diag;
+    
+    // A is stored in row-major order
+    for (size_t j = 0; j < n; ++j) {
+        // Compute diagonal element
+        diagonal_kernel<<<1, 1>>>(d_A, n, j, d_diag);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // Check if diagonal computation was successful
+        CUDA_CHECK(cudaMemcpy(&h_diag, d_diag, sizeof(double), cudaMemcpyDeviceToHost));
+        if (h_diag < 0.0) {
+            printf("Error: Matrix is not positive definite at diagonal element %zu\n", j);
+            CUDA_CHECK(cudaFree(d_A));
+            CUDA_CHECK(cudaFree(d_diag));
+            return false;
+        }
+        
+        // Compute off-diagonal elements
+        size_t num_elements = n - j - 1;
+        if (num_elements > 0) {
+            int numBlocks = (num_elements + blockSize - 1) / blockSize;
+            offdiag_kernel<<<numBlocks, blockSize>>>(d_A, n, j);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+    }
+    
+    // Zero out upper triangular part
+    size_t total_elements = n * n;
+    int numBlocks = (total_elements + blockSize - 1) / blockSize;
+    zero_upper_kernel<<<numBlocks, blockSize>>>(d_A, n);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // Copy result back to host
+    CUDA_CHECK(cudaMemcpy(A.data(), d_A, size, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_diag));
+    
+    return true;
+}
+
+// Generate a symmetric positive definite matrix
+void generatePositiveDefiniteMatrix(std::vector<double>& A, const size_t n) {
+    // Method: Create A = B * B^T where B is random
+    // This guarantees A is positive semi-definite
+    // Then add identity to make it strictly positive definite
+    
+    std::vector<double> B(n * n);
+    unsigned int seed = 42;
+    
+    // Generate random matrix B
+    for (size_t i = 0; i < n * n; ++i) {
+        B[i] = (rand_r(&seed) / (double)RAND_MAX) - 0.5;
+    }
+    
+    // Compute A = B * B^T
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            double sum = 0.0;
+            for (size_t k = 0; k < n; ++k) {
+                sum += B[i * n + k] * B[j * n + k];
+            }
+            A[i * n + j] = sum;
+        }
+    }
+    
+    // Add diagonal dominance to ensure positive definiteness
+    for (size_t i = 0; i < n; ++i) {
+        A[i * n + i] += n;
+    }
+}
+
+bool validateCholesky(const std::vector<double>& L, const std::vector<double>& A_orig, const size_t n) {
+    // Validate by computing L * L^T and comparing with original matrix
+    
+    std::vector<double> reconstructed(n * n);
+    
+    // Compute L * L^T
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            double sum = 0.0;
+            for (size_t k = 0; k < n; ++k) {
+                sum += L[i * n + k] * L[j * n + k];
+            }
+            reconstructed[i * n + j] = sum;
+        }
+    }
+    
+    // Compare with original
+    double maxError = 0.0;
+    double relError = 0.0;
+    
+    for (size_t i = 0; i < n * n; ++i) {
+        const double error = fabs(reconstructed[i] - A_orig[i]);
+        maxError = std::max(maxError, error);
+        
+        const double rel = error / (fabs(A_orig[i]) + 1e-10);
+        relError = std::max(relError, rel);
+    }
+    
+    printf("Max absolute error: %.10e\n", maxError);
+    printf("Max relative error: %.10e\n", relError);
+    
+    // Check if error is within tolerance
+    if (relError > 1e-6) {
+        printf("Validation failed: relative error too large\n");
+        return false;
+    }
+    
+    return true;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Matrix size (default: 512)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    size_t n = 512;
+    bool validate = false;
+    bool printResults = false;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            n = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+    
+    printf("Cholesky Decomposition Benchmark\n");
+    printf("Matrix size: %zu x %zu\n", n, n);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    
+    // Allocate matrix
+    std::vector<double> A(n * n);
+    std::vector<double> A_orig;
+    
+    // Generate positive definite matrix
+    printf("Generating positive definite matrix...\n");
+    generatePositiveDefiniteMatrix(A, n);
+    
+    if (validate) {
+        A_orig = A; // Save original for validation
+    }
+    
+    // Perform Cholesky decomposition
+    printf("Computing Cholesky decomposition...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    bool success = choleskyDecomposition(A, n);
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    
+    if (!success) {
+        printf("Cholesky decomposition failed\n");
+        return 1;
+    }
+    
+    printf("Computation time: %ld ms\n", duration.count());
+    
+    // Calculate GFLOPS (approximately n³/3 operations for Cholesky)
+    double ops = (double)n * n * n / 3.0;
+    double gflops = ops / (duration.count() / 1000.0) / 1e9;
+    printf("Performance: %.3f GFLOPS\n", gflops);
+    
+    // Print results for external validation
+    if (printResults) {
+        print_results(A, "CholeskyL");
+    }
+    
+    // Validation
+    if (validate) {
+        printf("Validating result...\n");
+        bool valid = validateCholesky(A, A_orig, n);
+        
+        if (valid) {
+            printf("Validation: PASSED\n");
+            return 0;
+        } else {
+            printf("Validation: FAILED\n");
+            return 1;
+        }
+    }
+    
+    return 0;
+}
