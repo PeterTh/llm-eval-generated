@@ -2,7 +2,6 @@
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -146,141 +145,100 @@ void printUsage(const char* progName) {
 }
 
 int main(int argc, char** argv) {
+    // Initialize MPI
     MPI_Init(&argc, &argv);
     
-    int rank, nprocs;
+    int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
     
     size_t numOptions = 10000;
     bool validate = false;
     bool printResults = false;
     
-    // Parse command line arguments (all ranks parse)
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
-            numOptions = atoll(argv[++i]);
-        } else if (strcmp(argv[i], "-v") == 0) {
-            validate = true;
-        } else if (strcmp(argv[i], "-r") == 0) {
-            printResults = true;
-        } else if (strcmp(argv[i], "-h") == 0) {
-            if (rank == 0) {
+    // Parse command line arguments (on rank 0)
+    if (rank == 0) {
+        for (int i = 1; i < argc; ++i) {
+            if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+                numOptions = atoll(argv[++i]);
+            } else if (strcmp(argv[i], "-v") == 0) {
+                validate = true;
+            } else if (strcmp(argv[i], "-r") == 0) {
+                printResults = true;
+            } else if (strcmp(argv[i], "-h") == 0) {
                 printUsage(argv[0]);
+                MPI_Finalize();
+                return 0;
+            } else {
+                printf("Unknown option: %s\n", argv[i]);
+                printUsage(argv[0]);
+                MPI_Finalize();
+                return 1;
             }
-            MPI_Finalize();
-            return 0;
-        } else if (rank == 0) {
-            printf("Unknown option: %s\n", argv[i]);
-            printUsage(argv[0]);
-            MPI_Finalize();
-            return 1;
         }
     }
+    
+    // Broadcast configuration to all ranks
+    MPI_Bcast(&numOptions, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&validate, 1, MPI_C_BOOL, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&printResults, 1, MPI_C_BOOL, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
         printf("Black-Scholes Option Pricing Benchmark\n");
         printf("Number of options: %zu\n", numOptions);
         printf("Validation: %s\n", validate ? "enabled" : "disabled");
-        printf("MPI processes: %d\n", nprocs);
-    }
-    
-    // Calculate local work distribution
-    size_t localStart = (numOptions / nprocs) * rank;
-    size_t localEnd = (rank == nprocs - 1) ? numOptions : (numOptions / nprocs) * (rank + 1);
-    size_t localCount = localEnd - localStart;
-    
-    // Generate full option set on rank 0, then distribute
-    std::vector<OptionInput> allOptions;
-    std::vector<OptionInput> localOptions(localCount);
-    
-    if (rank == 0) {
-        allOptions.resize(numOptions);
-        generateOptions(allOptions, numOptions);
-    }
-    
-    // Broadcast numOptions to all ranks (for safety)
-    MPI_Bcast(&numOptions, 1, MPI_UNSIGNED_LONG, 0, MPI_COMM_WORLD);
-    
-    // Create MPI datatype for OptionInput
-    MPI_Datatype mpi_option_type;
-    int blocklen[9] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
-    MPI_Aint displacement[9] = {
-        offsetof(OptionInput, type),
-        offsetof(OptionInput, strike),
-        offsetof(OptionInput, spot),
-        offsetof(OptionInput, q),
-        offsetof(OptionInput, r),
-        offsetof(OptionInput, t),
-        offsetof(OptionInput, vol),
-        offsetof(OptionInput, value),
-        offsetof(OptionInput, tol)
-    };
-    MPI_Datatype types[9] = {
-        MPI_INT,
-        MPI_DOUBLE,
-        MPI_DOUBLE,
-        MPI_DOUBLE,
-        MPI_DOUBLE,
-        MPI_DOUBLE,
-        MPI_DOUBLE,
-        MPI_DOUBLE,
-        MPI_DOUBLE
-    };
-    
-    MPI_Type_create_struct(9, blocklen, displacement, types, &mpi_option_type);
-    MPI_Type_commit(&mpi_option_type);
-    
-    // Distribute options to all ranks
-    std::vector<int> sendcounts(nprocs);
-    std::vector<int> displs(nprocs);
-    for (int i = 0; i < nprocs; ++i) {
-        size_t start = (numOptions / nprocs) * i;
-        size_t end = (i == nprocs - 1) ? numOptions : (numOptions / nprocs) * (i + 1);
-        sendcounts[i] = end - start;
-        displs[i] = start;
-    }
-    
-    // Scatter options from rank 0
-    MPI_Scatterv(rank == 0 ? allOptions.data() : nullptr,
-                 sendcounts.data(), displs.data(), mpi_option_type,
-                 localOptions.data(), localCount, mpi_option_type,
-                 0, MPI_COMM_WORLD);
-    
-    // Compute local results
-    std::vector<double> localResults(localCount);
-    
-    if (rank == 0) {
+        printf("MPI ranks: %d\n", size);
         printf("Pricing options...\n");
     }
     
+    // Generate options (all ranks generate same options for validation)
+    std::vector<OptionInput> options;
+    generateOptions(options, numOptions);
+    
+    // Compute work distribution
+    size_t localSize = numOptions / size;
+    size_t remainder = numOptions % size;
+    size_t startIdx = rank * localSize + std::min(static_cast<size_t>(rank), remainder);
+    size_t endIdx = startIdx + localSize + (rank < remainder ? 1 : 0);
+    size_t localCount = endIdx - startIdx;
+    
+    // Allocate local results
+    std::vector<double> localResults(localCount);
+    
+    // Barrier to ensure all ranks ready before timing
+    MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
     
+    // Price options locally
     for (size_t i = 0; i < localCount; ++i) {
-        localResults[i] = blackScholes(localOptions[i]);
+        localResults[i] = blackScholes(options[startIdx + i]);
     }
     
-    // Synchronize all ranks
+    // Barrier after computation
     MPI_Barrier(MPI_COMM_WORLD);
-    
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     
-    // Gather results on rank 0
-    std::vector<double> results(numOptions, 0.0);
-    std::vector<int> recv_counts(nprocs);
-    std::vector<int> recv_displs(nprocs);
-    for (int i = 0; i < nprocs; ++i) {
-        recv_counts[i] = sendcounts[i];
-        recv_displs[i] = displs[i];
+    // Gather all results to rank 0
+    std::vector<int> recvCounts(size);
+    std::vector<int> displs(size);
+    for (int i = 0; i < size; ++i) {
+        size_t iSize = numOptions / size;
+        size_t iRem = numOptions % size;
+        recvCounts[i] = iSize + (i < iRem ? 1 : 0);
+        displs[i] = (i == 0) ? 0 : displs[i - 1] + recvCounts[i - 1];
+    }
+    
+    std::vector<double> results;
+    if (rank == 0) {
+        results.resize(numOptions);
     }
     
     MPI_Gatherv(localResults.data(), localCount, MPI_DOUBLE,
-                results.data(), recv_counts.data(), recv_displs.data(), MPI_DOUBLE,
+                results.data(), recvCounts.data(), displs.data(), MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
     
-    // Rank 0 finishes up
     if (rank == 0) {
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
         printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
         printf("Options per second: %.0f\n", numOptions / (duration.count() / 1e6));
         
@@ -292,20 +250,17 @@ int main(int argc, char** argv) {
         // Validation
         if (validate) {
             printf("Validating results...\n");
-            bool valid = validateResults(allOptions, results);
+            bool valid = validateResults(options, results);
             
             if (valid) {
                 printf("Validation: PASSED\n");
             } else {
                 printf("Validation: FAILED\n");
-                MPI_Type_free(&mpi_option_type);
-                MPI_Finalize();
-                return 1;
             }
         }
     }
     
-    MPI_Type_free(&mpi_option_type);
     MPI_Finalize();
+    
     return 0;
 }
