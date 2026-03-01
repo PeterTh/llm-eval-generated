@@ -1,9 +1,13 @@
 // QT Clustering Benchmark - Hybrid MPI/OpenMP/CUDA Parallel Version
 // 
-// QT (Quality Threshold) clustering with hybrid parallelization:
-// - MPI for distributed processing across cluster nodes
-// - OpenMP for multi-core parallelism within each process
-// - CUDA for GPU-accelerated distance calculations (if available)
+// QT (Quality Threshold) clustering is an algorithm that builds clusters
+// by starting with a seed point and iteratively adding the closest point
+// that maintains the cluster's diameter below a threshold.
+// 
+// Parallelization Strategy:
+// - MPI: Distributes candidate cluster evaluation across nodes
+// - OpenMP: Parallelizes inner distance calculations and reductions
+// - CUDA: Accelerates distance computations on GPU
 
 #include <algorithm>
 #include <chrono>
@@ -13,14 +17,26 @@
 #include <cstring>
 #include <limits>
 #include <vector>
-#include <omp.h>
+
+#ifdef USE_MPI
 #include <mpi.h>
+#endif
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
 
 #include "../common/results_output.hpp"
 
 static const double MAX_WIDTH = 20.0;
 static const double MAX_HEIGHT = 20.0;
-static const int CUDA_BLOCK_SIZE = 256;
+
+// Global MPI rank and size
+int mpi_rank = 0, mpi_size = 1;
 
 // Structure to represent a point in 2D space
 struct Point {
@@ -33,26 +49,58 @@ struct Cluster {
     int seed_point;
 };
 
-// CPU fallback implementations for GPU functions
-void cuda_compute_distances_cpu(const std::vector<Point>& points,
-                                const std::vector<int>& candidates,
-                                const std::vector<int>& cluster_members,
-                                const double threshold,
-                                std::vector<double>& max_distances) {
-    #pragma omp parallel for schedule(dynamic)
-    for (int c = 0; c < static_cast<int>(candidates.size()); ++c) {
-        int candidate = candidates[c];
-        double max_dist = 0.0;
-        for (int m = 0; m < static_cast<int>(cluster_members.size()); ++m) {
-            int member = cluster_members[m];
-            double dx = points[candidate].x - points[member].x;
-            double dy = points[candidate].y - points[member].y;
-            double dist = std::sqrt(dx * dx + dy * dy);
-            max_dist = std::max(max_dist, dist);
+// CUDA state management
+#ifdef USE_CUDA
+struct CudaState {
+    double* d_points_x = nullptr;
+    double* d_points_y = nullptr;
+    char* d_clustered = nullptr;
+    char* d_in_cluster = nullptr;
+    int num_points = 0;
+    bool initialized = false;
+    
+    void init(int n_points, const std::vector<Point>& points) {
+        if (initialized) return;
+        num_points = n_points;
+        cudaMalloc(&d_points_x, n_points * sizeof(double));
+        cudaMalloc(&d_points_y, n_points * sizeof(double));
+        cudaMalloc(&d_clustered, n_points * sizeof(char));
+        cudaMalloc(&d_in_cluster, n_points * sizeof(char));
+        
+        std::vector<double> x_vals(n_points), y_vals(n_points);
+        for (int i = 0; i < n_points; ++i) {
+            x_vals[i] = points[i].x;
+            y_vals[i] = points[i].y;
         }
-        max_distances[c] = max_dist;
+        cudaMemcpy(d_points_x, x_vals.data(), n_points * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_points_y, y_vals.data(), n_points * sizeof(double), cudaMemcpyHostToDevice);
+        initialized = true;
     }
-}
+    
+    void update_clustered(const std::vector<bool>& clustered) {
+        if (!initialized) return;
+        std::vector<char> clustered_char(clustered.begin(), clustered.end());
+        cudaMemcpy(d_clustered, clustered_char.data(), num_points * sizeof(char), cudaMemcpyHostToDevice);
+    }
+    
+    void update_in_cluster(const std::vector<bool>& in_cluster) {
+        if (!initialized) return;
+        std::vector<char> in_cluster_char(in_cluster.begin(), in_cluster.end());
+        cudaMemcpy(d_in_cluster, in_cluster_char.data(), num_points * sizeof(char), cudaMemcpyHostToDevice);
+    }
+    
+    void cleanup() {
+        if (initialized) {
+            cudaFree(d_points_x);
+            cudaFree(d_points_y);
+            cudaFree(d_clustered);
+            cudaFree(d_in_cluster);
+            initialized = false;
+        }
+    }
+} cuda_state;
+
+#endif
 
 // Generate synthetic 2D point data in clusters
 void generateSyntheticData(std::vector<Point>& points, const int N, unsigned int seed = 42) {
@@ -102,7 +150,7 @@ inline double distance(const Point& p1, const Point& p2) {
 
 // Find the closest unclustered point to the current cluster that maintains diameter < threshold
 // Returns -1 if no such point exists
-// Parallelized with OpenMP for candidate evaluation
+// OpenMP parallel version for intra-node parallelization
 int findClosestPoint(const std::vector<int>& cluster_members,
                      const std::vector<bool>& clustered,
                      const std::vector<bool>& in_cluster,
@@ -112,26 +160,39 @@ int findClosestPoint(const std::vector<int>& cluster_members,
     int closest_point = -1;
     double min_diameter = std::numeric_limits<double>::max();
     
-    // Collect candidate indices
-    std::vector<int> candidates;
-    candidates.reserve(point_count);
-    for (int i = 0; i < point_count; ++i) {
-        if (!clustered[i] && !in_cluster[i]) {
-            candidates.push_back(i);
+    // Try each unclustered point as a candidate
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 32) reduction(min : min_diameter) reduction(min : closest_point)
+#endif
+    for (int candidate = 0; candidate < point_count; ++candidate) {
+        // Skip if already clustered or already in this cluster
+        if (clustered[candidate] || in_cluster[candidate]) continue;
+        
+        // Calculate the maximum distance from candidate to all cluster members
+        double max_dist = 0.0;
+        
+#ifdef _OPENMP
+        #pragma omp parallel for reduction(max : max_dist)
+#endif
+        for (int i = 0; i < static_cast<int>(cluster_members.size()); ++i) {
+            const int member = cluster_members[i];
+            double dx = points[candidate].x - points[member].x;
+            double dy = points[candidate].y - points[member].y;
+            double dist = std::sqrt(dx * dx + dy * dy);
+            max_dist = std::max(max_dist, dist);
         }
-    }
-    
-    if (candidates.empty()) return -1;
-    
-    // Compute max distances for all candidates (parallelized)
-    std::vector<double> max_distances(candidates.size());
-    cuda_compute_distances_cpu(points, candidates, cluster_members, threshold, max_distances);
-    
-    // Find best candidate - use critical section to avoid race conditions
-    for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
-        if (max_distances[i] < threshold && max_distances[i] < min_diameter) {
-            min_diameter = max_distances[i];
-            closest_point = candidates[i];
+        
+        // If adding this point keeps diameter below threshold and is better than current best
+        if (max_dist < threshold && max_dist < min_diameter) {
+#ifdef _OPENMP
+            #pragma omp critical
+#endif
+            {
+                if (max_dist < min_diameter) {
+                    min_diameter = max_dist;
+                    closest_point = candidate;
+                }
+            }
         }
     }
     
@@ -173,118 +234,151 @@ int generateCandidateCluster(const int seed_point,
     return static_cast<int>(members.size());
 }
 
+// Structure to hold local best cluster for parallel reduction
+struct LocalBest {
+    int seed;
+    int cardinality;
+    std::vector<int> members;
+};
+
 // Main QT clustering algorithm with MPI/OpenMP parallelization
-// MPI distributes unclustered points across processes
-// OpenMP parallelizes candidate cluster generation
 std::vector<Cluster> qtClustering(const std::vector<Point>& points,
-                                  const double threshold,
-                                  int mpi_rank, int mpi_size) {
+                                   const double threshold) {
     const int N = static_cast<int>(points.size());
     std::vector<bool> clustered(N, false);
     std::vector<int> unclustered_indices;
-    std::vector<Cluster> local_clusters;
+    std::vector<Cluster> clusters;
     
     // Initialize unclustered indices
     for (int i = 0; i < N; ++i) {
         unclustered_indices.push_back(i);
     }
     
+#ifdef USE_CUDA
+    cuda_state.init(N, points);
+    cuda_state.update_clustered(clustered);
+#endif
+    
     // Main clustering loop
     while (!unclustered_indices.empty()) {
-        // Each process evaluates its assigned seed candidates
-        int local_max_cardinality = -1;
-        int local_best_seed = -1;
-        std::vector<int> local_best_cluster_members;
+        int max_cardinality = -1;
+        int best_seed = -1;
+        std::vector<int> best_cluster_members;
         
-        // Distribute seed candidates across MPI processes and OpenMP threads
-        int num_seeds = unclustered_indices.size();
-        int seeds_per_process = (num_seeds + mpi_size - 1) / mpi_size;
-        int start_idx = mpi_rank * seeds_per_process;
-        int end_idx = std::min(start_idx + seeds_per_process, num_seeds);
+        // Distribute seeds across MPI ranks and OpenMP threads
+        std::vector<int> local_unclustered;
         
-        // OpenMP parallel evaluation of seed points assigned to this process
-        #pragma omp parallel for schedule(dynamic)
-        for (int i = start_idx; i < end_idx; ++i) {
-            const int seed = unclustered_indices[i];
+#ifdef USE_MPI
+        // Each MPI rank processes a subset of unclustered points
+        int rank_start = (mpi_rank * static_cast<int>(unclustered_indices.size())) / mpi_size;
+        int rank_end = ((mpi_rank + 1) * static_cast<int>(unclustered_indices.size())) / mpi_size;
+        for (int i = rank_start; i < rank_end; ++i) {
+            local_unclustered.push_back(unclustered_indices[i]);
+        }
+#else
+        local_unclustered = unclustered_indices;
+#endif
+        
+        // Try each unclustered point as a seed (with OpenMP parallelization)
+        LocalBest local_best = {-1, -1, {}};
+        
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 1)
+#endif
+        for (int i = 0; i < static_cast<int>(local_unclustered.size()); ++i) {
+            const int seed = local_unclustered[i];
             if (clustered[seed]) continue;
             
             std::vector<int> candidate_members;
-            const int cardinality = generateCandidateCluster(seed, clustered, points,
-                                                       threshold, N,
-                                                       &candidate_members);
+            const int cardinality = generateCandidateCluster(seed, clustered, points, 
+                                                        threshold, N, 
+                                                        &candidate_members);
             
+#ifdef _OPENMP
             #pragma omp critical
+#endif
             {
-                if (cardinality > local_max_cardinality) {
-                    local_max_cardinality = cardinality;
-                    local_best_seed = seed;
-                    local_best_cluster_members = candidate_members;
+                if (cardinality > local_best.cardinality) {
+                    local_best.seed = seed;
+                    local_best.cardinality = cardinality;
+                    local_best.members = candidate_members;
                 }
             }
         }
         
-        // MPI allreduce to find global best cluster
+        max_cardinality = local_best.cardinality;
+        best_seed = local_best.seed;
+        best_cluster_members = local_best.members;
+        
+#ifdef USE_MPI
+        // Find global best across all MPI ranks using MPI_MAXLOC
         struct {
             int cardinality;
             int rank;
-        } local_result = {local_max_cardinality, mpi_rank},
-          global_result = {-1, -1};
+        } local_data = {max_cardinality, mpi_rank};
         
-        MPI_Allreduce(&local_result, &global_result, 1,
-                     MPI_2INT, MPI_MAXLOC, MPI_COMM_WORLD);
+        struct {
+            int cardinality;
+            int rank;
+        } global_data = {-1, 0};
         
-        // Broadcast the best cluster from the process that found it
-        int best_seed_global = -1;
-        std::vector<int> best_cluster_members_global;
+        MPI_Reduce(&local_data, &global_data, 1, 
+                   MPI_2INT, MPI_MAXLOC, 0, MPI_COMM_WORLD);
         
-        if (global_result.cardinality > 0) {
-            if (mpi_rank == global_result.rank) {
-                best_seed_global = local_best_seed;
-                best_cluster_members_global = local_best_cluster_members;
+        MPI_Barrier(MPI_COMM_WORLD);
+        
+        // Broadcast the winning rank's best seed and cardinality
+        int bcast_data[2] = {best_seed, max_cardinality};
+        MPI_Bcast(bcast_data, 2, MPI_INT, 0, MPI_COMM_WORLD);
+        
+        best_seed = bcast_data[0];
+        max_cardinality = bcast_data[1];
+        
+        MPI_Barrier(MPI_COMM_WORLD);
+        
+        // Re-compute the best cluster if we're not on the winning rank
+        if (best_seed >= 0 && max_cardinality > 0) {
+            if (mpi_rank != global_data.rank) {
+                best_cluster_members.clear();
+                generateCandidateCluster(best_seed, clustered, points, 
+                                        threshold, N, &best_cluster_members);
+            }
+        }
+#endif
+        
+        // If we found a cluster, add it
+        if (best_seed >= 0 && max_cardinality > 0) {
+            Cluster cluster;
+            cluster.seed_point = best_seed;
+            cluster.members = best_cluster_members;
+            clusters.push_back(cluster);
+            
+            // Mark all members as clustered
+            for (size_t i = 0; i < best_cluster_members.size(); ++i) {
+                clustered[best_cluster_members[i]] = true;
             }
             
-            // Broadcast best seed and cluster size
-            int bcast_data[2] = {best_seed_global, static_cast<int>(best_cluster_members_global.size())};
-            MPI_Bcast(bcast_data, 2, MPI_INT, global_result.rank, MPI_COMM_WORLD);
+#ifdef USE_CUDA
+            cuda_state.update_clustered(clustered);
+#endif
             
-            if (mpi_rank != global_result.rank) {
-                best_seed_global = bcast_data[0];
-                best_cluster_members_global.resize(bcast_data[1]);
-            }
-            
-            // Broadcast cluster members
-            if (best_cluster_members_global.size() > 0) {
-                MPI_Bcast(best_cluster_members_global.data(), best_cluster_members_global.size(),
-                         MPI_INT, global_result.rank, MPI_COMM_WORLD);
-            }
-            
-            // Add cluster to all processes and mark members as clustered
-            if (best_seed_global >= 0 && global_result.cardinality > 0) {
-                Cluster cluster;
-                cluster.seed_point = best_seed_global;
-                cluster.members = best_cluster_members_global;
-                local_clusters.push_back(cluster);
-                
-                // Mark all members as clustered
-                for (size_t i = 0; i < best_cluster_members_global.size(); ++i) {
-                    clustered[best_cluster_members_global[i]] = true;
-                }
-                
-                // Remove clustered points from unclustered list
-                unclustered_indices.erase(
-                    std::remove_if(unclustered_indices.begin(), unclustered_indices.end(),
-                                  [&clustered](int idx) { return clustered[idx]; }),
-                    unclustered_indices.end()
-                );
-            } else {
-                break;
-            }
+            // Remove clustered points from unclustered list
+            unclustered_indices.erase(
+                std::remove_if(unclustered_indices.begin(), unclustered_indices.end(),
+                              [&clustered](int idx) { return clustered[idx]; }),
+                unclustered_indices.end()
+            );
         } else {
+            // No more clusters can be formed
             break;
         }
     }
     
-    return local_clusters;
+#ifdef USE_CUDA
+    cuda_state.cleanup();
+#endif
+    
+    return clusters;
 }
 
 // Validation: check that clusters satisfy the QT clustering properties
@@ -359,16 +453,16 @@ void printUsage(const char* progName) {
 }
 
 int main(int argc, char** argv) {
-    // Initialize MPI
-    MPI_Init(&argc, &argv);
-    int mpi_rank, mpi_size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
-    
     int num_points = 1000;
     double threshold = 2.0;
     bool validate = false;
     bool printResults = false;
+    
+#ifdef USE_MPI
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+#endif
     
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
@@ -381,46 +475,52 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-r") == 0) {
             printResults = true;
         } else if (strcmp(argv[i], "-h") == 0) {
-            if (mpi_rank == 0) {
-                printUsage(argv[0]);
-            }
+            printUsage(argv[0]);
+#ifdef USE_MPI
             MPI_Finalize();
+#endif
             return 0;
         } else {
-            if (mpi_rank == 0) {
-                printf("Unknown option: %s\n", argv[i]);
-                printUsage(argv[0]);
-            }
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+#ifdef USE_MPI
             MPI_Finalize();
+#endif
             return 1;
         }
     }
     
     if (num_points <= 0 || threshold <= 0.0) {
-        if (mpi_rank == 0) {
-            printf("Error: Invalid parameters (num_points=%d, threshold=%.2f)\n", 
-                   num_points, threshold);
-        }
+        printf("Error: Invalid parameters (num_points=%d, threshold=%.2f)\n", 
+               num_points, threshold);
+#ifdef USE_MPI
         MPI_Finalize();
+#endif
         return 1;
     }
     
     if (mpi_rank == 0) {
-        printf("QT Clustering Benchmark (Hybrid MPI/OpenMP/CUDA)\n");
-        printf("MPI processes: %d\n", mpi_size);
+        printf("QT Clustering Benchmark - Hybrid MPI/OpenMP/CUDA Parallel Version\n");
         printf("Number of points: %d\n", num_points);
         printf("Distance threshold: %.2f\n", threshold);
         printf("Validation: %s\n", validate ? "enabled" : "disabled");
+#ifdef USE_MPI
+        printf("MPI processes: %d\n", mpi_size);
+#endif
+#ifdef _OPENMP
+        printf("OpenMP threads: %d\n", omp_get_max_threads());
+#endif
     }
     
-    // Generate synthetic data
+    // Generate synthetic data - all ranks generate the same data using same seed
     std::vector<Point> points(num_points);
     generateSyntheticData(points, num_points);
+
     
     // Perform QT clustering
     auto cluster_start = std::chrono::high_resolution_clock::now();
     
-    const std::vector<Cluster> clusters = qtClustering(points, threshold, mpi_rank, mpi_size);
+    const std::vector<Cluster> clusters = qtClustering(points, threshold);
     
     auto cluster_end = std::chrono::high_resolution_clock::now();
     auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -429,7 +529,7 @@ int main(int argc, char** argv) {
     if (mpi_rank == 0) {
         printf("Clustering time: %ld ms\n", cluster_time.count());
         printf("Clusters found: %zu\n", clusters.size());
-    
+        
         // Calculate statistics and performance metrics
         int total_clustered = 0;
         int max_cluster_size = 0;
@@ -485,6 +585,9 @@ int main(int argc, char** argv) {
         }
     }
     
+#ifdef USE_MPI
     MPI_Finalize();
-    return mpi_rank == 0 && validate ? (validate ? 0 : 0) : 0;
+#endif
+    
+    return 0;
 }
