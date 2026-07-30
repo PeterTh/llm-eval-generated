@@ -1,0 +1,240 @@
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include <cuda_runtime.h>
+
+#include "../common/results_output.hpp"
+
+#define TILE_SIZE 16
+
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
+                    cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+
+// Generate pseudo-random values for matrix initialization
+constexpr double getPseudoRndValue(const size_t N, const size_t i, const size_t j) noexcept {
+    return (((i + 1) * (i + j + 1) * 1299709) % (N * N)) / static_cast<double>(N * N);
+}
+
+void initMatrix(std::vector<double>& mat, const size_t N) {
+    for (size_t i = 0; i < N; ++i) {
+        for (size_t j = 0; j < N; ++j) {
+            mat[i * N + j] = getPseudoRndValue(N, i, j);
+        }
+    }
+}
+
+// Tiled matrix multiplication kernel using shared memory
+__global__ void matrixMultiplyKernel(const double* __restrict__ A, 
+                                      const double* __restrict__ B, 
+                                      double* __restrict__ C, 
+                                      const size_t N) {
+    __shared__ double tileA[TILE_SIZE][TILE_SIZE];
+    __shared__ double tileB[TILE_SIZE][TILE_SIZE];
+    
+    const size_t row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    const size_t col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    
+    double sum = 0.0;
+    
+    const size_t numTiles = (N + TILE_SIZE - 1) / TILE_SIZE;
+    for (size_t t = 0; t < numTiles; ++t) {
+        const size_t aCol = t * TILE_SIZE + threadIdx.x;
+        const size_t bRow = t * TILE_SIZE + threadIdx.y;
+        
+        tileA[threadIdx.y][threadIdx.x] = (row < N && aCol < N) ? A[row * N + aCol] : 0.0;
+        tileB[threadIdx.y][threadIdx.x] = (bRow < N && col < N) ? B[bRow * N + col] : 0.0;
+        
+        __syncthreads();
+        
+        #pragma unroll
+        for (size_t k = 0; k < TILE_SIZE; ++k) {
+            sum += tileA[threadIdx.y][k] * tileB[k][threadIdx.x];
+        }
+        
+        __syncthreads();
+    }
+    
+    if (row < N && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
+void matrixMultiplyAllocate(const std::vector<double>& A, const std::vector<double>& B, 
+                            std::vector<double>& C, const size_t N,
+                            double*& d_A, double*& d_B, double*& d_C) {
+    const size_t size = N * N * sizeof(double);
+    
+    CUDA_CHECK(cudaMalloc(&d_A, size));
+    CUDA_CHECK(cudaMalloc(&d_B, size));
+    CUDA_CHECK(cudaMalloc(&d_C, size));
+    
+    CUDA_CHECK(cudaMemcpy(d_A, A.data(), size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, B.data(), size, cudaMemcpyHostToDevice));
+}
+
+void matrixMultiplyExecute(double* d_A, double* d_B, double* d_C, const size_t N) {
+    dim3 blockSize(TILE_SIZE, TILE_SIZE);
+    dim3 gridSize((N + TILE_SIZE - 1) / TILE_SIZE, (N + TILE_SIZE - 1) / TILE_SIZE);
+    
+    matrixMultiplyKernel<<<gridSize, blockSize>>>(d_A, d_B, d_C, N);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void matrixMultiplyRetrieve(double* d_C, std::vector<double>& C, const size_t N) {
+    const size_t size = N * N * sizeof(double);
+    CUDA_CHECK(cudaMemcpy(C.data(), d_C, size, cudaMemcpyDeviceToHost));
+}
+
+void matrixMultiplyFree(double* d_A, double* d_B, double* d_C) {
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B));
+    CUDA_CHECK(cudaFree(d_C));
+}
+
+// Simple validation: compute a single element and compare
+bool validateResult(const std::vector<double>& A, const std::vector<double>& B,
+                   const std::vector<double>& C, const size_t N) {
+    // Check a few random positions
+    constexpr size_t checkPoints[] = {0, 1, 2, 3, 4};
+    
+    for (size_t pi = 0; pi < 5; ++pi) {
+        for (size_t pj = 0; pj < 5; ++pj) {
+            const size_t i = checkPoints[pi] % N;
+            const size_t j = checkPoints[pj] % N;
+            
+            double expected = 0.0;
+            for (size_t k = 0; k < N; ++k) {
+                expected += A[i * N + k] * B[k * N + j];
+            }
+            
+            const double actual = C[i * N + j];
+            const double relError = std::abs((actual - expected) / (expected + 1e-10));
+            
+            if (relError > 1e-6) {
+                printf("Validation failed at (%zu, %zu): expected %.10f, got %.10f (error: %.10e)\n",
+                       i, j, expected, actual, relError);
+                return false;
+            }
+        }
+    }
+    
+    return true;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Matrix size N (computes NxN * NxN) (default: 512)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    size_t N = 512;
+    bool validate = false;
+    bool printResults = false;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            N = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+    
+    printf("Matrix Multiplication Benchmark (CUDA)\n");
+    printf("Matrix size: %zu x %zu\n", N, N);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    
+    // Warm up CUDA runtime
+    {
+        double* d_tmp;
+        CUDA_CHECK(cudaMalloc(&d_tmp, 1024));
+        CUDA_CHECK(cudaFree(d_tmp));
+    }
+    
+    // Allocate matrices
+    std::vector<double> A(N * N);
+    std::vector<double> B(N * N);
+    std::vector<double> C(N * N);
+    
+    // Initialize matrices
+    printf("Initializing matrices...\n");
+    initMatrix(A, N);
+    initMatrix(B, N);
+    
+    // Perform matrix multiplication
+    printf("Computing matrix multiplication...\n");
+    
+    double *d_A, *d_B, *d_C;
+    matrixMultiplyAllocate(A, B, C, N, d_A, d_B, d_C);
+    
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    
+    cudaEventRecord(start);
+    matrixMultiplyExecute(d_A, d_B, d_C, N);
+    cudaEventRecord(stop);
+    
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    
+    matrixMultiplyRetrieve(d_C, C, N);
+    matrixMultiplyFree(d_A, d_B, d_C);
+    double duration = milliseconds;
+    
+    printf("Computation time: %.3f ms\n", duration);
+    
+    // Calculate GFLOPS
+    double gflops = (2.0 * N * N * N) / (duration / 1000.0) / 1e9;
+    printf("Performance: %.3f GFLOPS\n", gflops);
+    
+    // Print results for external validation
+    if (printResults) {
+        print_results(C, "MatrixC");
+    }
+    
+    // Validation
+    if (validate) {
+        printf("Validating result...\n");
+        bool valid = validateResult(A, B, C, N);
+        
+        if (valid) {
+            printf("Validation: PASSED\n");
+            return 0;
+        } else {
+            printf("Validation: FAILED\n");
+            return 1;
+        }
+    }
+    
+    return 0;
+}
