@@ -1,0 +1,2614 @@
+OpenAI Codex v0.146.0
+--------
+workdir: /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-sol-low_cuda_r1
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: low
+reasoning summaries: none
+session id: 01a00bdc-5dd4-7e70-a89d-9c550f010ad6
+--------
+user
+Parallelize the spmv benchmark code found in ./spmv/ with CUDA for GPU parallelism. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the existing benchmark and build setup first, then implement the CUDA path in-place and validate both correctness and the available build/test flow.
+exec
+/bin/bash -lc "rg --files spmv && sed -n '1,240p' spmv/CMakeLists.txt && for f in spmv/*; do if [ -f \""'$f" ] && [ "$(basename "$f")" != CMakeLists.txt ]; then echo "FILE:$f"; sed -n '"'1,280p' \""'$f"; fi; done' in /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-sol-low_cuda_r1
+ succeeded in 0ms:
+spmv/CMakeLists.txt
+spmv/spmv.cpp
+cmake_minimum_required(VERSION 3.10)
+project(spmv_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(spmv spmv.cpp)
+
+# Enable optimizations
+target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link math library
+target_link_libraries(spmv m)
+FILE:spmv/spmv.cpp
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+using index_t = uint32_t;
+
+// Constants
+constexpr double MAX_RELATIVE_ERROR = 0.02;
+
+// ****************************************************************************
+// Function: fill
+//
+// Purpose:
+//   Initialize array with random values
+//
+// Arguments:
+//   A: pointer to the array to initialize
+//   n: number of elements in the array
+//   maxVal: specifies range of random values [0, maxVal]
+//
+// ****************************************************************************
+void fill(double* A, const index_t n, const double maxVal) {
+    for (index_t i = 0; i < n; ++i) {
+        A[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+    }
+}
+
+// ****************************************************************************
+// Function: initRandomMatrix
+//
+// Purpose:
+//   Assigns random positions to a given number of elements in a square
+//   matrix. The function encodes these positions in compressed sparse
+//   row (CSR) format.
+//
+// Arguments:
+//   cols:          array for column indexes of elements (size should be = n)
+//   rowDelimiters: array of size dim+1 holding indices to rows;
+//                  last element is the index one past the last element
+//   n:             number of nonzero elements
+//   dim:           number of rows/columns in the matrix
+//
+// ****************************************************************************
+void initRandomMatrix(index_t* cols, index_t* rowDelimiters, const index_t n, const index_t dim) {
+    index_t nnzAssigned = 0;
+
+    // Figure out the probability that a nonzero should be assigned
+    double prob = static_cast<double>(n) / (static_cast<double>(dim) * static_cast<double>(dim));
+
+    // Seed random number generator
+    srand(8675309);
+
+    // Randomly decide whether entry i,j gets a value, but ensure n values are assigned
+    bool fillRemaining = false;
+    for (index_t i = 0; i < dim; ++i) {
+        rowDelimiters[i] = nnzAssigned;
+        for (index_t j = 0; j < dim; ++j) {
+            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+            index_t needToAssign = n - nnzAssigned;
+            if (numEntriesLeft <= needToAssign) {
+                fillRemaining = true;
+            }
+            double randVal = static_cast<double>(rand()) / RAND_MAX;
+            if ((nnzAssigned < n && randVal <= prob) || fillRemaining) {
+                // Assign (i,j) a value
+                cols[nnzAssigned] = j;
+                nnzAssigned++;
+            }
+        }
+    }
+    // Convention: put the number of non-zeroes at the end of the row delimiters array
+    rowDelimiters[dim] = n;
+}
+
+// ****************************************************************************
+// Function: spmvCpu
+//
+// Purpose:
+//   Computes sparse matrix-vector multiplication using CSR format
+//
+// Arguments:
+//   val: array holding the non-zero values for the matrix
+//   cols: array of column indices for each element
+//   rowDelimiters: array of size dim+1 holding indices to rows;
+//                  last element is the index one past the last element
+//   vec: dense vector of size dim to be used for multiplication
+//   dim: number of rows/columns in the matrix
+//   out: output - result from the spmv calculation
+//
+// ****************************************************************************
+void spmvCpu(const double* val, const index_t* cols, const index_t* rowDelimiters,
+             const double* vec, const index_t dim, double* out) {
+    for (index_t i = 0; i < dim; ++i) {
+        double t = 0.0;
+        for (index_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
+            const auto col = cols[j];
+            t += val[j] * vec[col];
+        }
+        out[i] = t;
+    }
+}
+
+// ****************************************************************************
+// Function: verifyResults
+//
+// Purpose:
+//   Verifies correctness of results by comparing to reference solution
+//
+// Arguments:
+//   reference: array holding the reference result vector
+//   result: array holding the result vector to verify
+//   size: number of elements per vector
+//
+// ****************************************************************************
+bool verifyResults(const double* reference, const double* result, const index_t size) {
+    for (index_t i = 0; i < size; ++i) {
+        const double ref = reference[i];
+        const double res = result[i];
+        if (std::abs(ref) < 1e-10) {
+            // For very small values, check absolute error
+            if (std::abs(res) > MAX_RELATIVE_ERROR) {
+                printf("Validation failed at index %u: reference %.10e, got %.10e\n", i, ref, res);
+                return false;
+            }
+        } else {
+            // Check relative error
+            const double relError = std::abs((res - ref) / ref);
+            if (relError > MAX_RELATIVE_ERROR) {
+                printf("Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\n",
+                       i, ref, res, relError);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Number of rows/columns in the matrix (default: 1024)\n");
+    printf("  -s <num>     Sparsity: 1 out of N entries is non-zero (default: 10)\n");
+    printf("  -i <num>     Number of iterations (default: 10)\n");
+    printf("  -m <val>     Maximum value for matrix and vector elements (default: 1.0)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    index_t numRows = 1024;
+    index_t sparsity = 10;
+    index_t iterations = 10;
+    double maxVal = 1.0;
+    bool validate = false;
+    bool printResults = false;
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            numRows = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            sparsity = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            iterations = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            maxVal = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+
+    // Calculate number of non-zero elements
+    const index_t nItems = (numRows * numRows) / sparsity;
+
+    printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+    printf("Matrix size: %u x %u\n", numRows, numRows);
+    printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+    printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
+    printf("Iterations: %u\n", iterations);
+    printf("Max value: %.2f\n", maxVal);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+
+    // Allocate and initialize data structures
+    std::vector<double> h_val(nItems);                  // Non-zero values
+    std::vector<index_t> h_cols(nItems);                // Column indices
+    std::vector<index_t> h_rowDelimiters(numRows + 1);  // Row delimiters
+    std::vector<double> h_vec(numRows);                 // Dense vector
+    std::vector<double> h_out(numRows);                 // Output vector
+
+    printf("Initializing data structures...\n");
+    fill(h_vec.data(), numRows, maxVal);
+    fill(h_val.data(), nItems, maxVal);
+    initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+
+    // For validation, compute reference solution
+    std::vector<double> h_reference;
+    if (validate) {
+        printf("Computing reference solution...\n");
+        h_reference.resize(numRows);
+        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(), 
+                h_vec.data(), numRows, h_reference.data());
+    }
+
+    // Perform SpMV computation
+    printf("Computing SpMV...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (index_t iter = 0; iter < iterations; ++iter) {
+        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+                h_vec.data(), numRows, h_out.data());
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+    printf("Computation time: %ld ms\n", duration.count());
+    
+    // Calculate performance metrics
+    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+    const double avgTime = duration.count() / static_cast<double>(iterations);
+    
+    printf("Average time per iteration: %.3f ms\n", avgTime);
+    printf("Performance: %.3f GFLOPS\n", gflops);
+    
+    // Print results for external validation
+    if (printResults) {
+        print_results(h_out, "OutputVector");
+    }
+
+    // Validation
+    if (validate) {
+        printf("Validating result...\n");
+        const bool valid = verifyResults(h_reference.data(), h_out.data(), numRows);
+
+        if (valid) {
+            printf("Validation: PASSED\n");
+            return 0;
+        } else {
+            printf("Validation: FAILED\n");
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+codex
+The matrix averages many nonzeros per row, so I’m using a warp-per-row CSR kernel: lanes cooperatively traverse each row, then reduce within the warp. This preserves each output row’s semantics while giving coalesced matrix/index reads and enough independent warps to scale across the GPU. GPU timing will use CUDA events so asynchronous launches are measured correctly.
+apply patch
+patch: completed
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-sol-low_cuda_r1/spmv/CMakeLists.txt
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-sol-low_cuda_r1/spmv/spmv.cpp
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..2f066db20686279bb299d5c5ea54c1ee80be4c4d
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,22 @@
+-cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++cmake_minimum_required(VERSION 3.18)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
++set_target_properties(spmv PROPERTIES
++    CUDA_STANDARD 17
++    CUDA_STANDARD_REQUIRED ON
++    CUDA_ARCHITECTURES native
++)
+ 
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--extra-device-vectorization;-Xcompiler=-Wall,-Wextra>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..aa9cf0250031c4e6ba60aed22a5598e80e2db652
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -3,8 +3,11 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +108,40 @@
+     }
+ }
+ 
++// One warp cooperatively evaluates one CSR row.  This layout gives contiguous
++// accesses to val/cols and avoids atomics or intermediate output buffers.
++__global__ void spmvCuda(const double* __restrict__ val,
++                         const index_t* __restrict__ cols,
++                         const index_t* __restrict__ rowDelimiters,
++                         const double* __restrict__ vec,
++                         const index_t dim, double* __restrict__ out) {
++    constexpr unsigned FULL_WARP = 0xffffffffu;
++    const unsigned lane = threadIdx.x & 31u;
++    const index_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
++    const index_t warpStride = (gridDim.x * blockDim.x) >> 5;
++
++    for (index_t row = warp; row < dim; row += warpStride) {
++        double sum = 0.0;
++        const index_t begin = rowDelimiters[row];
++        const index_t end = rowDelimiters[row + 1];
++        for (index_t j = begin + lane; j < end; j += 32)
++            sum += val[j] * vec[cols[j]];
++
++#pragma unroll
++        for (int offset = 16; offset; offset >>= 1)
++            sum += __shfl_down_sync(FULL_WARP, sum, offset);
++        if (lane == 0)
++            out[row] = sum;
++    }
++}
++
++static void cudaCheck(cudaError_t status, const char* operation) {
++    if (status != cudaSuccess) {
++        fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(status));
++        std::exit(EXIT_FAILURE);
++    }
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -184,14 +221,23 @@
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
++    if (numRows == 0 || sparsity == 0 || iterations == 0) {
++        fprintf(stderr, "Matrix size, sparsity, and iterations must be non-zero.\n");
++        return 1;
++    }
++    const uint64_t matrixItems = static_cast<uint64_t>(numRows) * numRows;
++    const uint64_t itemCount = matrixItems / sparsity;
++    if (itemCount > std::numeric_limits<index_t>::max()) {
++        fprintf(stderr, "The requested matrix has too many non-zero elements.\n");
++        return 1;
++    }
++    const index_t nItems = static_cast<index_t>(itemCount);
+ 
+     printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+     printf("Matrix size: %u x %u\n", numRows, numRows);
+     printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+     printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
++           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / matrixItems));
+     printf("Iterations: %u\n", iterations);
+     printf("Max value: %.2f\n", maxVal);
+     printf("Validation: %s\n", validate ? "enabled" : "disabled");
+@@ -217,23 +263,56 @@
+                 h_vec.data(), numRows, h_reference.data());
+     }
+ 
++    double* d_val = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    cudaCheck(cudaMalloc(&d_val, h_val.size() * sizeof(double)), "allocating matrix values");
++    cudaCheck(cudaMalloc(&d_cols, h_cols.size() * sizeof(index_t)), "allocating column indices");
++    cudaCheck(cudaMalloc(&d_rowDelimiters, h_rowDelimiters.size() * sizeof(index_t)), "allocating row offsets");
++    cudaCheck(cudaMalloc(&d_vec, h_vec.size() * sizeof(double)), "allocating input vector");
++    cudaCheck(cudaMalloc(&d_out, h_out.size() * sizeof(double)), "allocating output vector");
++    cudaCheck(cudaMemcpy(d_val, h_val.data(), h_val.size() * sizeof(double), cudaMemcpyHostToDevice), "copying matrix values");
++    cudaCheck(cudaMemcpy(d_cols, h_cols.data(), h_cols.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying column indices");
++    cudaCheck(cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), h_rowDelimiters.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying row offsets");
++    cudaCheck(cudaMemcpy(d_vec, h_vec.data(), h_vec.size() * sizeof(double), cudaMemcpyHostToDevice), "copying input vector");
++
++    int device = 0;
++    cudaDeviceProp props{};
++    cudaCheck(cudaGetDevice(&device), "querying active device");
++    cudaCheck(cudaGetDeviceProperties(&props, device), "querying device properties");
++    constexpr int threads = 256;
++    const uint64_t rowBlocks = (static_cast<uint64_t>(numRows) * 32 + threads - 1) / threads;
++    const int blocks = static_cast<int>(std::min<uint64_t>(rowBlocks, props.multiProcessorCount * 32ull));
++
++    // Warm up runtime initialization and populate GPU caches before timing.
++    spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    cudaCheck(cudaGetLastError(), "launching warm-up kernel");
++    cudaCheck(cudaDeviceSynchronize(), "running warm-up kernel");
++
+     // Perform SpMV computation
+     printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    cudaEvent_t start, end;
++    cudaCheck(cudaEventCreate(&start), "creating start event");
++    cudaCheck(cudaEventCreate(&end), "creating stop event");
++    cudaCheck(cudaEventRecord(start), "recording start event");
+ 
+     for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++        spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+     }
+-
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
++    cudaCheck(cudaGetLastError(), "launching SpMV kernel");
++    cudaCheck(cudaEventRecord(end), "recording stop event");
++    cudaCheck(cudaEventSynchronize(end), "waiting for SpMV kernels");
++    float elapsedMs = 0.0f;
++    cudaCheck(cudaEventElapsedTime(&elapsedMs, start, end), "measuring kernel time");
++    cudaCheck(cudaMemcpy(h_out.data(), d_out, h_out.size() * sizeof(double), cudaMemcpyDeviceToHost), "copying output vector");
+ 
+-    printf("Computation time: %ld ms\n", duration.count());
++    printf("Computation time: %.3f ms\n", elapsedMs);
+     
+     // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
++    const double gflops = (2.0 * nItems * iterations) / (elapsedMs * 1e6);
++    const double avgTime = elapsedMs / static_cast<double>(iterations);
+     
+     printf("Average time per iteration: %.3f ms\n", avgTime);
+     printf("Performance: %.3f GFLOPS\n", gflops);
+@@ -243,6 +322,14 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaEventDestroy(start);
++    cudaEventDestroy(end);
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..2f066db20686279bb299d5c5ea54c1ee80be4c4d
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,22 @@
+-cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++cmake_minimum_required(VERSION 3.18)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
++set_target_properties(spmv PROPERTIES
++    CUDA_STANDARD 17
++    CUDA_STANDARD_REQUIRED ON
++    CUDA_ARCHITECTURES native
++)
+ 
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--extra-device-vectorization;-Xcompiler=-Wall,-Wextra>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..aa9cf0250031c4e6ba60aed22a5598e80e2db652
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -3,8 +3,11 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +108,40 @@
+     }
+ }
+ 
++// One warp cooperatively evaluates one CSR row.  This layout gives contiguous
++// accesses to val/cols and avoids atomics or intermediate output buffers.
++__global__ void spmvCuda(const double* __restrict__ val,
++                         const index_t* __restrict__ cols,
++                         const index_t* __restrict__ rowDelimiters,
++                         const double* __restrict__ vec,
++                         const index_t dim, double* __restrict__ out) {
++    constexpr unsigned FULL_WARP = 0xffffffffu;
++    const unsigned lane = threadIdx.x & 31u;
++    const index_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
++    const index_t warpStride = (gridDim.x * blockDim.x) >> 5;
++
++    for (index_t row = warp; row < dim; row += warpStride) {
++        double sum = 0.0;
++        const index_t begin = rowDelimiters[row];
++        const index_t end = rowDelimiters[row + 1];
++        for (index_t j = begin + lane; j < end; j += 32)
++            sum += val[j] * vec[cols[j]];
++
++#pragma unroll
++        for (int offset = 16; offset; offset >>= 1)
++            sum += __shfl_down_sync(FULL_WARP, sum, offset);
++        if (lane == 0)
++            out[row] = sum;
++    }
++}
++
++static void cudaCheck(cudaError_t status, const char* operation) {
++    if (status != cudaSuccess) {
++        fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(status));
++        std::exit(EXIT_FAILURE);
++    }
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -184,14 +221,23 @@
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
++    if (numRows == 0 || sparsity == 0 || iterations == 0) {
++        fprintf(stderr, "Matrix size, sparsity, and iterations must be non-zero.\n");
++        return 1;
++    }
++    const uint64_t matrixItems = static_cast<uint64_t>(numRows) * numRows;
++    const uint64_t itemCount = matrixItems / sparsity;
++    if (itemCount > std::numeric_limits<index_t>::max()) {
++        fprintf(stderr, "The requested matrix has too many non-zero elements.\n");
++        return 1;
++    }
++    const index_t nItems = static_cast<index_t>(itemCount);
+ 
+     printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+     printf("Matrix size: %u x %u\n", numRows, numRows);
+     printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+     printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
++           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / matrixItems));
+     printf("Iterations: %u\n", iterations);
+     printf("Max value: %.2f\n", maxVal);
+     printf("Validation: %s\n", validate ? "enabled" : "disabled");
+@@ -217,23 +263,56 @@
+                 h_vec.data(), numRows, h_reference.data());
+     }
+ 
++    double* d_val = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    cudaCheck(cudaMalloc(&d_val, h_val.size() * sizeof(double)), "allocating matrix values");
++    cudaCheck(cudaMalloc(&d_cols, h_cols.size() * sizeof(index_t)), "allocating column indices");
++    cudaCheck(cudaMalloc(&d_rowDelimiters, h_rowDelimiters.size() * sizeof(index_t)), "allocating row offsets");
++    cudaCheck(cudaMalloc(&d_vec, h_vec.size() * sizeof(double)), "allocating input vector");
++    cudaCheck(cudaMalloc(&d_out, h_out.size() * sizeof(double)), "allocating output vector");
++    cudaCheck(cudaMemcpy(d_val, h_val.data(), h_val.size() * sizeof(double), cudaMemcpyHostToDevice), "copying matrix values");
++    cudaCheck(cudaMemcpy(d_cols, h_cols.data(), h_cols.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying column indices");
++    cudaCheck(cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), h_rowDelimiters.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying row offsets");
++    cudaCheck(cudaMemcpy(d_vec, h_vec.data(), h_vec.size() * sizeof(double), cudaMemcpyHostToDevice), "copying input vector");
++
++    int device = 0;
++    cudaDeviceProp props{};
++    cudaCheck(cudaGetDevice(&device), "querying active device");
++    cudaCheck(cudaGetDeviceProperties(&props, device), "querying device properties");
++    constexpr int threads = 256;
++    const uint64_t rowBlocks = (static_cast<uint64_t>(numRows) * 32 + threads - 1) / threads;
++    const int blocks = static_cast<int>(std::min<uint64_t>(rowBlocks, props.multiProcessorCount * 32ull));
++
++    // Warm up runtime initialization and populate GPU caches before timing.
++    spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    cudaCheck(cudaGetLastError(), "launching warm-up kernel");
++    cudaCheck(cudaDeviceSynchronize(), "running warm-up kernel");
++
+     // Perform SpMV computation
+     printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    cudaEvent_t start, end;
++    cudaCheck(cudaEventCreate(&start), "creating start event");
++    cudaCheck(cudaEventCreate(&end), "creating stop event");
++    cudaCheck(cudaEventRecord(start), "recording start event");
+ 
+     for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++        spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+     }
+-
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
++    cudaCheck(cudaGetLastError(), "launching SpMV kernel");
++    cudaCheck(cudaEventRecord(end), "recording stop event");
++    cudaCheck(cudaEventSynchronize(end), "waiting for SpMV kernels");
++    float elapsedMs = 0.0f;
++    cudaCheck(cudaEventElapsedTime(&elapsedMs, start, end), "measuring kernel time");
++    cudaCheck(cudaMemcpy(h_out.data(), d_out, h_out.size() * sizeof(double), cudaMemcpyDeviceToHost), "copying output vector");
+ 
+-    printf("Computation time: %ld ms\n", duration.count());
++    printf("Computation time: %.3f ms\n", elapsedMs);
+     
+     // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
++    const double gflops = (2.0 * nItems * iterations) / (elapsedMs * 1e6);
++    const double avgTime = elapsedMs / static_cast<double>(iterations);
+     
+     printf("Average time per iteration: %.3f ms\n", avgTime);
+     printf("Performance: %.3f GFLOPS\n", gflops);
+@@ -243,6 +322,14 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaEventDestroy(start);
++    cudaEventDestroy(end);
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+exec
+/bin/bash -lc 'cmake -S spmv -B /tmp/spmv-build -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/spmv-build -j2 && /tmp/spmv-build/spmv -n 128 -s 10 -i 3 -v' in /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-sol-low_cuda_r1
+ exited 1 in 0ms:
+CMake Error: The source "/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-sol-low_cuda_r1/spmv/CMakeLists.txt" does not match the source "/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-sol-xhigh_mpi_r4/spmv/CMakeLists.txt" used to generate cache.  Re-run cmake with a different source directory.
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..2f066db20686279bb299d5c5ea54c1ee80be4c4d
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,22 @@
+-cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++cmake_minimum_required(VERSION 3.18)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
++set_target_properties(spmv PROPERTIES
++    CUDA_STANDARD 17
++    CUDA_STANDARD_REQUIRED ON
++    CUDA_ARCHITECTURES native
++)
+ 
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--extra-device-vectorization;-Xcompiler=-Wall,-Wextra>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..aa9cf0250031c4e6ba60aed22a5598e80e2db652
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -3,8 +3,11 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +108,40 @@
+     }
+ }
+ 
++// One warp cooperatively evaluates one CSR row.  This layout gives contiguous
++// accesses to val/cols and avoids atomics or intermediate output buffers.
++__global__ void spmvCuda(const double* __restrict__ val,
++                         const index_t* __restrict__ cols,
++                         const index_t* __restrict__ rowDelimiters,
++                         const double* __restrict__ vec,
++                         const index_t dim, double* __restrict__ out) {
++    constexpr unsigned FULL_WARP = 0xffffffffu;
++    const unsigned lane = threadIdx.x & 31u;
++    const index_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
++    const index_t warpStride = (gridDim.x * blockDim.x) >> 5;
++
++    for (index_t row = warp; row < dim; row += warpStride) {
++        double sum = 0.0;
++        const index_t begin = rowDelimiters[row];
++        const index_t end = rowDelimiters[row + 1];
++        for (index_t j = begin + lane; j < end; j += 32)
++            sum += val[j] * vec[cols[j]];
++
++#pragma unroll
++        for (int offset = 16; offset; offset >>= 1)
++            sum += __shfl_down_sync(FULL_WARP, sum, offset);
++        if (lane == 0)
++            out[row] = sum;
++    }
++}
++
++static void cudaCheck(cudaError_t status, const char* operation) {
++    if (status != cudaSuccess) {
++        fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(status));
++        std::exit(EXIT_FAILURE);
++    }
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -184,14 +221,23 @@
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
++    if (numRows == 0 || sparsity == 0 || iterations == 0) {
++        fprintf(stderr, "Matrix size, sparsity, and iterations must be non-zero.\n");
++        return 1;
++    }
++    const uint64_t matrixItems = static_cast<uint64_t>(numRows) * numRows;
++    const uint64_t itemCount = matrixItems / sparsity;
++    if (itemCount > std::numeric_limits<index_t>::max()) {
++        fprintf(stderr, "The requested matrix has too many non-zero elements.\n");
++        return 1;
++    }
++    const index_t nItems = static_cast<index_t>(itemCount);
+ 
+     printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+     printf("Matrix size: %u x %u\n", numRows, numRows);
+     printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+     printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
++           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / matrixItems));
+     printf("Iterations: %u\n", iterations);
+     printf("Max value: %.2f\n", maxVal);
+     printf("Validation: %s\n", validate ? "enabled" : "disabled");
+@@ -217,23 +263,56 @@
+                 h_vec.data(), numRows, h_reference.data());
+     }
+ 
++    double* d_val = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    cudaCheck(cudaMalloc(&d_val, h_val.size() * sizeof(double)), "allocating matrix values");
++    cudaCheck(cudaMalloc(&d_cols, h_cols.size() * sizeof(index_t)), "allocating column indices");
++    cudaCheck(cudaMalloc(&d_rowDelimiters, h_rowDelimiters.size() * sizeof(index_t)), "allocating row offsets");
++    cudaCheck(cudaMalloc(&d_vec, h_vec.size() * sizeof(double)), "allocating input vector");
++    cudaCheck(cudaMalloc(&d_out, h_out.size() * sizeof(double)), "allocating output vector");
++    cudaCheck(cudaMemcpy(d_val, h_val.data(), h_val.size() * sizeof(double), cudaMemcpyHostToDevice), "copying matrix values");
++    cudaCheck(cudaMemcpy(d_cols, h_cols.data(), h_cols.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying column indices");
++    cudaCheck(cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), h_rowDelimiters.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying row offsets");
++    cudaCheck(cudaMemcpy(d_vec, h_vec.data(), h_vec.size() * sizeof(double), cudaMemcpyHostToDevice), "copying input vector");
++
++    int device = 0;
++    cudaDeviceProp props{};
++    cudaCheck(cudaGetDevice(&device), "querying active device");
++    cudaCheck(cudaGetDeviceProperties(&props, device), "querying device properties");
++    constexpr int threads = 256;
++    const uint64_t rowBlocks = (static_cast<uint64_t>(numRows) * 32 + threads - 1) / threads;
++    const int blocks = static_cast<int>(std::min<uint64_t>(rowBlocks, props.multiProcessorCount * 32ull));
++
++    // Warm up runtime initialization and populate GPU caches before timing.
++    spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    cudaCheck(cudaGetLastError(), "launching warm-up kernel");
++    cudaCheck(cudaDeviceSynchronize(), "running warm-up kernel");
++
+     // Perform SpMV computation
+     printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    cudaEvent_t start, end;
++    cudaCheck(cudaEventCreate(&start), "creating start event");
++    cudaCheck(cudaEventCreate(&end), "creating stop event");
++    cudaCheck(cudaEventRecord(start), "recording start event");
+ 
+     for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++        spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+     }
+-
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
++    cudaCheck(cudaGetLastError(), "launching SpMV kernel");
++    cudaCheck(cudaEventRecord(end), "recording stop event");
++    cudaCheck(cudaEventSynchronize(end), "waiting for SpMV kernels");
++    float elapsedMs = 0.0f;
++    cudaCheck(cudaEventElapsedTime(&elapsedMs, start, end), "measuring kernel time");
++    cudaCheck(cudaMemcpy(h_out.data(), d_out, h_out.size() * sizeof(double), cudaMemcpyDeviceToHost), "copying output vector");
+ 
+-    printf("Computation time: %ld ms\n", duration.count());
++    printf("Computation time: %.3f ms\n", elapsedMs);
+     
+     // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
++    const double gflops = (2.0 * nItems * iterations) / (elapsedMs * 1e6);
++    const double avgTime = elapsedMs / static_cast<double>(iterations);
+     
+     printf("Average time per iteration: %.3f ms\n", avgTime);
+     printf("Performance: %.3f GFLOPS\n", gflops);
+@@ -243,6 +322,14 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaEventDestroy(start);
++    cudaEventDestroy(end);
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+codex
+The first configure attempt hit an unrelated stale CMake cache in `/tmp`; no source issue was involved. I’m rerunning in a fresh temporary build directory, then I’ll address any compiler or runtime findings.
+exec
+/bin/bash -lc 'build_dir=$(mktemp -d /tmp/spmv-cuda-build.XXXXXX) && cmake -S spmv -B "$build_dir" -DCMAKE_BUILD_TYPE=Release && cmake --build "$build_dir" -j2 && "$build_dir/spmv" -n 128 -s 10 -i 3 -v' in /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-sol-low_cuda_r1
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..2f066db20686279bb299d5c5ea54c1ee80be4c4d
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,22 @@
+-cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++cmake_minimum_required(VERSION 3.18)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
++set_target_properties(spmv PROPERTIES
++    CUDA_STANDARD 17
++    CUDA_STANDARD_REQUIRED ON
++    CUDA_ARCHITECTURES native
++)
+ 
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--extra-device-vectorization;-Xcompiler=-Wall,-Wextra>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..aa9cf0250031c4e6ba60aed22a5598e80e2db652
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -3,8 +3,11 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +108,40 @@
+     }
+ }
+ 
++// One warp cooperatively evaluates one CSR row.  This layout gives contiguous
++// accesses to val/cols and avoids atomics or intermediate output buffers.
++__global__ void spmvCuda(const double* __restrict__ val,
++                         const index_t* __restrict__ cols,
++                         const index_t* __restrict__ rowDelimiters,
++                         const double* __restrict__ vec,
++                         const index_t dim, double* __restrict__ out) {
++    constexpr unsigned FULL_WARP = 0xffffffffu;
++    const unsigned lane = threadIdx.x & 31u;
++    const index_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
++    const index_t warpStride = (gridDim.x * blockDim.x) >> 5;
++
++    for (index_t row = warp; row < dim; row += warpStride) {
++        double sum = 0.0;
++        const index_t begin = rowDelimiters[row];
++        const index_t end = rowDelimiters[row + 1];
++        for (index_t j = begin + lane; j < end; j += 32)
++            sum += val[j] * vec[cols[j]];
++
++#pragma unroll
++        for (int offset = 16; offset; offset >>= 1)
++            sum += __shfl_down_sync(FULL_WARP, sum, offset);
++        if (lane == 0)
++            out[row] = sum;
++    }
++}
++
++static void cudaCheck(cudaError_t status, const char* operation) {
++    if (status != cudaSuccess) {
++        fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(status));
++        std::exit(EXIT_FAILURE);
++    }
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -184,14 +221,23 @@
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
++    if (numRows == 0 || sparsity == 0 || iterations == 0) {
++        fprintf(stderr, "Matrix size, sparsity, and iterations must be non-zero.\n");
++        return 1;
++    }
++    const uint64_t matrixItems = static_cast<uint64_t>(numRows) * numRows;
++    const uint64_t itemCount = matrixItems / sparsity;
++    if (itemCount > std::numeric_limits<index_t>::max()) {
++        fprintf(stderr, "The requested matrix has too many non-zero elements.\n");
++        return 1;
++    }
++    const index_t nItems = static_cast<index_t>(itemCount);
+ 
+     printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+     printf("Matrix size: %u x %u\n", numRows, numRows);
+     printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+     printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
++           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / matrixItems));
+     printf("Iterations: %u\n", iterations);
+     printf("Max value: %.2f\n", maxVal);
+     printf("Validation: %s\n", validate ? "enabled" : "disabled");
+@@ -217,23 +263,56 @@
+                 h_vec.data(), numRows, h_reference.data());
+     }
+ 
++    double* d_val = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    cudaCheck(cudaMalloc(&d_val, h_val.size() * sizeof(double)), "allocating matrix values");
++    cudaCheck(cudaMalloc(&d_cols, h_cols.size() * sizeof(index_t)), "allocating column indices");
++    cudaCheck(cudaMalloc(&d_rowDelimiters, h_rowDelimiters.size() * sizeof(index_t)), "allocating row offsets");
++    cudaCheck(cudaMalloc(&d_vec, h_vec.size() * sizeof(double)), "allocating input vector");
++    cudaCheck(cudaMalloc(&d_out, h_out.size() * sizeof(double)), "allocating output vector");
++    cudaCheck(cudaMemcpy(d_val, h_val.data(), h_val.size() * sizeof(double), cudaMemcpyHostToDevice), "copying matrix values");
++    cudaCheck(cudaMemcpy(d_cols, h_cols.data(), h_cols.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying column indices");
++    cudaCheck(cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), h_rowDelimiters.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying row offsets");
++    cudaCheck(cudaMemcpy(d_vec, h_vec.data(), h_vec.size() * sizeof(double), cudaMemcpyHostToDevice), "copying input vector");
++
++    int device = 0;
++    cudaDeviceProp props{};
++    cudaCheck(cudaGetDevice(&device), "querying active device");
++    cudaCheck(cudaGetDeviceProperties(&props, device), "querying device properties");
++    constexpr int threads = 256;
++    const uint64_t rowBlocks = (static_cast<uint64_t>(numRows) * 32 + threads - 1) / threads;
++    const int blocks = static_cast<int>(std::min<uint64_t>(rowBlocks, props.multiProcessorCount * 32ull));
++
++    // Warm up runtime initialization and populate GPU caches before timing.
++    spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    cudaCheck(cudaGetLastError(), "launching warm-up kernel");
++    cudaCheck(cudaDeviceSynchronize(), "running warm-up kernel");
++
+     // Perform SpMV computation
+     printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    cudaEvent_t start, end;
++    cudaCheck(cudaEventCreate(&start), "creating start event");
++    cudaCheck(cudaEventCreate(&end), "creating stop event");
++    cudaCheck(cudaEventRecord(start), "recording start event");
+ 
+     for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++        spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+     }
+-
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
++    cudaCheck(cudaGetLastError(), "launching SpMV kernel");
++    cudaCheck(cudaEventRecord(end), "recording stop event");
++    cudaCheck(cudaEventSynchronize(end), "waiting for SpMV kernels");
++    float elapsedMs = 0.0f;
++    cudaCheck(cudaEventElapsedTime(&elapsedMs, start, end), "measuring kernel time");
++    cudaCheck(cudaMemcpy(h_out.data(), d_out, h_out.size() * sizeof(double), cudaMemcpyDeviceToHost), "copying output vector");
+ 
+-    printf("Computation time: %ld ms\n", duration.count());
++    printf("Computation time: %.3f ms\n", elapsedMs);
+     
+     // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
++    const double gflops = (2.0 * nItems * iterations) / (elapsedMs * 1e6);
++    const double avgTime = elapsedMs / static_cast<double>(iterations);
+     
+     printf("Average time per iteration: %.3f ms\n", avgTime);
+     printf("Performance: %.3f GFLOPS\n", gflops);
+@@ -243,6 +322,14 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaEventDestroy(start);
++    cudaEventDestroy(end);
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+ succeeded in 11368ms:
+-- The CUDA compiler identification is NVIDIA 12.0.140
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Configuring done (5.3s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/spmv-cuda-build.gVvfkU
+[ 50%] Building CUDA object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CUDA executable spmv
+[100%] Built target spmv
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 128 x 128
+Sparsity: 1 out of 10 entries is non-zero
+Non-zero elements: 1638 (90.00% sparse)
+Iterations: 3
+Max value: 1.00
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 0.016 ms
+Average time per iteration: 0.005 ms
+Performance: 0.606 GFLOPS
+Validating result...
+Validation: PASSED
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..2f066db20686279bb299d5c5ea54c1ee80be4c4d
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,22 @@
+-cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++cmake_minimum_required(VERSION 3.18)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
++set_target_properties(spmv PROPERTIES
++    CUDA_STANDARD 17
++    CUDA_STANDARD_REQUIRED ON
++    CUDA_ARCHITECTURES native
++)
+ 
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--extra-device-vectorization;-Xcompiler=-Wall,-Wextra>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..aa9cf0250031c4e6ba60aed22a5598e80e2db652
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -3,8 +3,11 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +108,40 @@
+     }
+ }
+ 
++// One warp cooperatively evaluates one CSR row.  This layout gives contiguous
++// accesses to val/cols and avoids atomics or intermediate output buffers.
++__global__ void spmvCuda(const double* __restrict__ val,
++                         const index_t* __restrict__ cols,
++                         const index_t* __restrict__ rowDelimiters,
++                         const double* __restrict__ vec,
++                         const index_t dim, double* __restrict__ out) {
++    constexpr unsigned FULL_WARP = 0xffffffffu;
++    const unsigned lane = threadIdx.x & 31u;
++    const index_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
++    const index_t warpStride = (gridDim.x * blockDim.x) >> 5;
++
++    for (index_t row = warp; row < dim; row += warpStride) {
++        double sum = 0.0;
++        const index_t begin = rowDelimiters[row];
++        const index_t end = rowDelimiters[row + 1];
++        for (index_t j = begin + lane; j < end; j += 32)
++            sum += val[j] * vec[cols[j]];
++
++#pragma unroll
++        for (int offset = 16; offset; offset >>= 1)
++            sum += __shfl_down_sync(FULL_WARP, sum, offset);
++        if (lane == 0)
++            out[row] = sum;
++    }
++}
++
++static void cudaCheck(cudaError_t status, const char* operation) {
++    if (status != cudaSuccess) {
++        fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(status));
++        std::exit(EXIT_FAILURE);
++    }
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -184,14 +221,23 @@
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
++    if (numRows == 0 || sparsity == 0 || iterations == 0) {
++        fprintf(stderr, "Matrix size, sparsity, and iterations must be non-zero.\n");
++        return 1;
++    }
++    const uint64_t matrixItems = static_cast<uint64_t>(numRows) * numRows;
++    const uint64_t itemCount = matrixItems / sparsity;
++    if (itemCount > std::numeric_limits<index_t>::max()) {
++        fprintf(stderr, "The requested matrix has too many non-zero elements.\n");
++        return 1;
++    }
++    const index_t nItems = static_cast<index_t>(itemCount);
+ 
+     printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+     printf("Matrix size: %u x %u\n", numRows, numRows);
+     printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+     printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
++           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / matrixItems));
+     printf("Iterations: %u\n", iterations);
+     printf("Max value: %.2f\n", maxVal);
+     printf("Validation: %s\n", validate ? "enabled" : "disabled");
+@@ -217,23 +263,56 @@
+                 h_vec.data(), numRows, h_reference.data());
+     }
+ 
++    double* d_val = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    cudaCheck(cudaMalloc(&d_val, h_val.size() * sizeof(double)), "allocating matrix values");
++    cudaCheck(cudaMalloc(&d_cols, h_cols.size() * sizeof(index_t)), "allocating column indices");
++    cudaCheck(cudaMalloc(&d_rowDelimiters, h_rowDelimiters.size() * sizeof(index_t)), "allocating row offsets");
++    cudaCheck(cudaMalloc(&d_vec, h_vec.size() * sizeof(double)), "allocating input vector");
++    cudaCheck(cudaMalloc(&d_out, h_out.size() * sizeof(double)), "allocating output vector");
++    cudaCheck(cudaMemcpy(d_val, h_val.data(), h_val.size() * sizeof(double), cudaMemcpyHostToDevice), "copying matrix values");
++    cudaCheck(cudaMemcpy(d_cols, h_cols.data(), h_cols.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying column indices");
++    cudaCheck(cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), h_rowDelimiters.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying row offsets");
++    cudaCheck(cudaMemcpy(d_vec, h_vec.data(), h_vec.size() * sizeof(double), cudaMemcpyHostToDevice), "copying input vector");
++
++    int device = 0;
++    cudaDeviceProp props{};
++    cudaCheck(cudaGetDevice(&device), "querying active device");
++    cudaCheck(cudaGetDeviceProperties(&props, device), "querying device properties");
++    constexpr int threads = 256;
++    const uint64_t rowBlocks = (static_cast<uint64_t>(numRows) * 32 + threads - 1) / threads;
++    const int blocks = static_cast<int>(std::min<uint64_t>(rowBlocks, props.multiProcessorCount * 32ull));
++
++    // Warm up runtime initialization and populate GPU caches before timing.
++    spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    cudaCheck(cudaGetLastError(), "launching warm-up kernel");
++    cudaCheck(cudaDeviceSynchronize(), "running warm-up kernel");
++
+     // Perform SpMV computation
+     printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    cudaEvent_t start, end;
++    cudaCheck(cudaEventCreate(&start), "creating start event");
++    cudaCheck(cudaEventCreate(&end), "creating stop event");
++    cudaCheck(cudaEventRecord(start), "recording start event");
+ 
+     for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++        spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+     }
+-
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
++    cudaCheck(cudaGetLastError(), "launching SpMV kernel");
++    cudaCheck(cudaEventRecord(end), "recording stop event");
++    cudaCheck(cudaEventSynchronize(end), "waiting for SpMV kernels");
++    float elapsedMs = 0.0f;
++    cudaCheck(cudaEventElapsedTime(&elapsedMs, start, end), "measuring kernel time");
++    cudaCheck(cudaMemcpy(h_out.data(), d_out, h_out.size() * sizeof(double), cudaMemcpyDeviceToHost), "copying output vector");
+ 
+-    printf("Computation time: %ld ms\n", duration.count());
++    printf("Computation time: %.3f ms\n", elapsedMs);
+     
+     // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
++    const double gflops = (2.0 * nItems * iterations) / (elapsedMs * 1e6);
++    const double avgTime = elapsedMs / static_cast<double>(iterations);
+     
+     printf("Average time per iteration: %.3f ms\n", avgTime);
+     printf("Performance: %.3f GFLOPS\n", gflops);
+@@ -243,6 +322,14 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaEventDestroy(start);
++    cudaEventDestroy(end);
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+apply patch
+patch: completed
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-sol-low_cuda_r1/spmv/spmv.cpp
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..2f066db20686279bb299d5c5ea54c1ee80be4c4d
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,22 @@
+-cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++cmake_minimum_required(VERSION 3.18)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
++set_target_properties(spmv PROPERTIES
++    CUDA_STANDARD 17
++    CUDA_STANDARD_REQUIRED ON
++    CUDA_ARCHITECTURES native
++)
+ 
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--extra-device-vectorization;-Xcompiler=-Wall,-Wextra>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..4bfa478920656da00610a4da29f8d622e0788916
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -3,8 +3,11 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -60,8 +63,9 @@
+     for (index_t i = 0; i < dim; ++i) {
+         rowDelimiters[i] = nnzAssigned;
+         for (index_t j = 0; j < dim; ++j) {
+-            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+-            index_t needToAssign = n - nnzAssigned;
++            const uint64_t numEntriesLeft = static_cast<uint64_t>(dim) * dim -
++                                            (static_cast<uint64_t>(i) * dim + j);
++            const uint64_t needToAssign = n - nnzAssigned;
+             if (numEntriesLeft <= needToAssign) {
+                 fillRemaining = true;
+             }
+@@ -105,6 +109,40 @@
+     }
+ }
+ 
++// One warp cooperatively evaluates one CSR row.  This layout gives contiguous
++// accesses to val/cols and avoids atomics or intermediate output buffers.
++__global__ void spmvCuda(const double* __restrict__ val,
++                         const index_t* __restrict__ cols,
++                         const index_t* __restrict__ rowDelimiters,
++                         const double* __restrict__ vec,
++                         const index_t dim, double* __restrict__ out) {
++    constexpr unsigned FULL_WARP = 0xffffffffu;
++    const unsigned lane = threadIdx.x & 31u;
++    const index_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
++    const index_t warpStride = (gridDim.x * blockDim.x) >> 5;
++
++    for (index_t row = warp; row < dim; row += warpStride) {
++        double sum = 0.0;
++        const index_t begin = rowDelimiters[row];
++        const index_t end = rowDelimiters[row + 1];
++        for (index_t j = begin + lane; j < end; j += 32)
++            sum += val[j] * vec[cols[j]];
++
++#pragma unroll
++        for (int offset = 16; offset; offset >>= 1)
++            sum += __shfl_down_sync(FULL_WARP, sum, offset);
++        if (lane == 0)
++            out[row] = sum;
++    }
++}
++
++static void cudaCheck(cudaError_t status, const char* operation) {
++    if (status != cudaSuccess) {
++        fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(status));
++        std::exit(EXIT_FAILURE);
++    }
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -184,14 +222,23 @@
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
++    if (numRows == 0 || sparsity == 0 || iterations == 0) {
++        fprintf(stderr, "Matrix size, sparsity, and iterations must be non-zero.\n");
++        return 1;
++    }
++    const uint64_t matrixItems = static_cast<uint64_t>(numRows) * numRows;
++    const uint64_t itemCount = matrixItems / sparsity;
++    if (itemCount > std::numeric_limits<index_t>::max()) {
++        fprintf(stderr, "The requested matrix has too many non-zero elements.\n");
++        return 1;
++    }
++    const index_t nItems = static_cast<index_t>(itemCount);
+ 
+     printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+     printf("Matrix size: %u x %u\n", numRows, numRows);
+     printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+     printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
++           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / matrixItems));
+     printf("Iterations: %u\n", iterations);
+     printf("Max value: %.2f\n", maxVal);
+     printf("Validation: %s\n", validate ? "enabled" : "disabled");
+@@ -217,23 +264,62 @@
+                 h_vec.data(), numRows, h_reference.data());
+     }
+ 
++    double* d_val = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    // CUDA does not accept a zero-byte allocation; keep valid dummy storage for
++    // the legitimate all-zero matrix case.
++    const size_t valueBytes = std::max<size_t>(h_val.size() * sizeof(double), sizeof(double));
++    const size_t columnBytes = std::max<size_t>(h_cols.size() * sizeof(index_t), sizeof(index_t));
++    cudaCheck(cudaMalloc(&d_val, valueBytes), "allocating matrix values");
++    cudaCheck(cudaMalloc(&d_cols, columnBytes), "allocating column indices");
++    cudaCheck(cudaMalloc(&d_rowDelimiters, h_rowDelimiters.size() * sizeof(index_t)), "allocating row offsets");
++    cudaCheck(cudaMalloc(&d_vec, h_vec.size() * sizeof(double)), "allocating input vector");
++    cudaCheck(cudaMalloc(&d_out, h_out.size() * sizeof(double)), "allocating output vector");
++    if (nItems != 0) {
++        cudaCheck(cudaMemcpy(d_val, h_val.data(), h_val.size() * sizeof(double), cudaMemcpyHostToDevice), "copying matrix values");
++        cudaCheck(cudaMemcpy(d_cols, h_cols.data(), h_cols.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying column indices");
++    }
++    cudaCheck(cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), h_rowDelimiters.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying row offsets");
++    cudaCheck(cudaMemcpy(d_vec, h_vec.data(), h_vec.size() * sizeof(double), cudaMemcpyHostToDevice), "copying input vector");
++
++    int device = 0;
++    cudaDeviceProp props{};
++    cudaCheck(cudaGetDevice(&device), "querying active device");
++    cudaCheck(cudaGetDeviceProperties(&props, device), "querying device properties");
++    constexpr int threads = 256;
++    const uint64_t rowBlocks = (static_cast<uint64_t>(numRows) * 32 + threads - 1) / threads;
++    const int blocks = static_cast<int>(std::min<uint64_t>(rowBlocks, props.multiProcessorCount * 32ull));
++
++    // Warm up runtime initialization and populate GPU caches before timing.
++    spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    cudaCheck(cudaGetLastError(), "launching warm-up kernel");
++    cudaCheck(cudaDeviceSynchronize(), "running warm-up kernel");
++
+     // Perform SpMV computation
+     printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    cudaEvent_t start, end;
++    cudaCheck(cudaEventCreate(&start), "creating start event");
++    cudaCheck(cudaEventCreate(&end), "creating stop event");
++    cudaCheck(cudaEventRecord(start), "recording start event");
+ 
+     for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++        spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+     }
++    cudaCheck(cudaGetLastError(), "launching SpMV kernel");
++    cudaCheck(cudaEventRecord(end), "recording stop event");
++    cudaCheck(cudaEventSynchronize(end), "waiting for SpMV kernels");
++    float elapsedMs = 0.0f;
++    cudaCheck(cudaEventElapsedTime(&elapsedMs, start, end), "measuring kernel time");
++    cudaCheck(cudaMemcpy(h_out.data(), d_out, h_out.size() * sizeof(double), cudaMemcpyDeviceToHost), "copying output vector");
+ 
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+-
+-    printf("Computation time: %ld ms\n", duration.count());
++    printf("Computation time: %.3f ms\n", elapsedMs);
+     
+     // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
++    const double gflops = (2.0 * nItems * iterations) / (elapsedMs * 1e6);
++    const double avgTime = elapsedMs / static_cast<double>(iterations);
+     
+     printf("Average time per iteration: %.3f ms\n", avgTime);
+     printf("Performance: %.3f GFLOPS\n", gflops);
+@@ -243,6 +329,14 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaEventDestroy(start);
++    cudaEventDestroy(end);
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..2f066db20686279bb299d5c5ea54c1ee80be4c4d
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,22 @@
+-cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++cmake_minimum_required(VERSION 3.18)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
++set_target_properties(spmv PROPERTIES
++    CUDA_STANDARD 17
++    CUDA_STANDARD_REQUIRED ON
++    CUDA_ARCHITECTURES native
++)
+ 
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--extra-device-vectorization;-Xcompiler=-Wall,-Wextra>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..4bfa478920656da00610a4da29f8d622e0788916
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -3,8 +3,11 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -60,8 +63,9 @@
+     for (index_t i = 0; i < dim; ++i) {
+         rowDelimiters[i] = nnzAssigned;
+         for (index_t j = 0; j < dim; ++j) {
+-            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+-            index_t needToAssign = n - nnzAssigned;
++            const uint64_t numEntriesLeft = static_cast<uint64_t>(dim) * dim -
++                                            (static_cast<uint64_t>(i) * dim + j);
++            const uint64_t needToAssign = n - nnzAssigned;
+             if (numEntriesLeft <= needToAssign) {
+                 fillRemaining = true;
+             }
+@@ -105,6 +109,40 @@
+     }
+ }
+ 
++// One warp cooperatively evaluates one CSR row.  This layout gives contiguous
++// accesses to val/cols and avoids atomics or intermediate output buffers.
++__global__ void spmvCuda(const double* __restrict__ val,
++                         const index_t* __restrict__ cols,
++                         const index_t* __restrict__ rowDelimiters,
++                         const double* __restrict__ vec,
++                         const index_t dim, double* __restrict__ out) {
++    constexpr unsigned FULL_WARP = 0xffffffffu;
++    const unsigned lane = threadIdx.x & 31u;
++    const index_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
++    const index_t warpStride = (gridDim.x * blockDim.x) >> 5;
++
++    for (index_t row = warp; row < dim; row += warpStride) {
++        double sum = 0.0;
++        const index_t begin = rowDelimiters[row];
++        const index_t end = rowDelimiters[row + 1];
++        for (index_t j = begin + lane; j < end; j += 32)
++            sum += val[j] * vec[cols[j]];
++
++#pragma unroll
++        for (int offset = 16; offset; offset >>= 1)
++            sum += __shfl_down_sync(FULL_WARP, sum, offset);
++        if (lane == 0)
++            out[row] = sum;
++    }
++}
++
++static void cudaCheck(cudaError_t status, const char* operation) {
++    if (status != cudaSuccess) {
++        fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(status));
++        std::exit(EXIT_FAILURE);
++    }
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -184,14 +222,23 @@
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
++    if (numRows == 0 || sparsity == 0 || iterations == 0) {
++        fprintf(stderr, "Matrix size, sparsity, and iterations must be non-zero.\n");
++        return 1;
++    }
++    const uint64_t matrixItems = static_cast<uint64_t>(numRows) * numRows;
++    const uint64_t itemCount = matrixItems / sparsity;
++    if (itemCount > std::numeric_limits<index_t>::max()) {
++        fprintf(stderr, "The requested matrix has too many non-zero elements.\n");
++        return 1;
++    }
++    const index_t nItems = static_cast<index_t>(itemCount);
+ 
+     printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+     printf("Matrix size: %u x %u\n", numRows, numRows);
+     printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+     printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
++           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / matrixItems));
+     printf("Iterations: %u\n", iterations);
+     printf("Max value: %.2f\n", maxVal);
+     printf("Validation: %s\n", validate ? "enabled" : "disabled");
+@@ -217,23 +264,62 @@
+                 h_vec.data(), numRows, h_reference.data());
+     }
+ 
++    double* d_val = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    // CUDA does not accept a zero-byte allocation; keep valid dummy storage for
++    // the legitimate all-zero matrix case.
++    const size_t valueBytes = std::max<size_t>(h_val.size() * sizeof(double), sizeof(double));
++    const size_t columnBytes = std::max<size_t>(h_cols.size() * sizeof(index_t), sizeof(index_t));
++    cudaCheck(cudaMalloc(&d_val, valueBytes), "allocating matrix values");
++    cudaCheck(cudaMalloc(&d_cols, columnBytes), "allocating column indices");
++    cudaCheck(cudaMalloc(&d_rowDelimiters, h_rowDelimiters.size() * sizeof(index_t)), "allocating row offsets");
++    cudaCheck(cudaMalloc(&d_vec, h_vec.size() * sizeof(double)), "allocating input vector");
++    cudaCheck(cudaMalloc(&d_out, h_out.size() * sizeof(double)), "allocating output vector");
++    if (nItems != 0) {
++        cudaCheck(cudaMemcpy(d_val, h_val.data(), h_val.size() * sizeof(double), cudaMemcpyHostToDevice), "copying matrix values");
++        cudaCheck(cudaMemcpy(d_cols, h_cols.data(), h_cols.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying column indices");
++    }
++    cudaCheck(cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), h_rowDelimiters.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying row offsets");
++    cudaCheck(cudaMemcpy(d_vec, h_vec.data(), h_vec.size() * sizeof(double), cudaMemcpyHostToDevice), "copying input vector");
++
++    int device = 0;
++    cudaDeviceProp props{};
++    cudaCheck(cudaGetDevice(&device), "querying active device");
++    cudaCheck(cudaGetDeviceProperties(&props, device), "querying device properties");
++    constexpr int threads = 256;
++    const uint64_t rowBlocks = (static_cast<uint64_t>(numRows) * 32 + threads - 1) / threads;
++    const int blocks = static_cast<int>(std::min<uint64_t>(rowBlocks, props.multiProcessorCount * 32ull));
++
++    // Warm up runtime initialization and populate GPU caches before timing.
++    spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    cudaCheck(cudaGetLastError(), "launching warm-up kernel");
++    cudaCheck(cudaDeviceSynchronize(), "running warm-up kernel");
++
+     // Perform SpMV computation
+     printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    cudaEvent_t start, end;
++    cudaCheck(cudaEventCreate(&start), "creating start event");
++    cudaCheck(cudaEventCreate(&end), "creating stop event");
++    cudaCheck(cudaEventRecord(start), "recording start event");
+ 
+     for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++        spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+     }
++    cudaCheck(cudaGetLastError(), "launching SpMV kernel");
++    cudaCheck(cudaEventRecord(end), "recording stop event");
++    cudaCheck(cudaEventSynchronize(end), "waiting for SpMV kernels");
++    float elapsedMs = 0.0f;
++    cudaCheck(cudaEventElapsedTime(&elapsedMs, start, end), "measuring kernel time");
++    cudaCheck(cudaMemcpy(h_out.data(), d_out, h_out.size() * sizeof(double), cudaMemcpyDeviceToHost), "copying output vector");
+ 
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+-
+-    printf("Computation time: %ld ms\n", duration.count());
++    printf("Computation time: %.3f ms\n", elapsedMs);
+     
+     // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
++    const double gflops = (2.0 * nItems * iterations) / (elapsedMs * 1e6);
++    const double avgTime = elapsedMs / static_cast<double>(iterations);
+     
+     printf("Average time per iteration: %.3f ms\n", avgTime);
+     printf("Performance: %.3f GFLOPS\n", gflops);
+@@ -243,6 +329,14 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaEventDestroy(start);
++    cudaEventDestroy(end);
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+apply patch
+patch: completed
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-sol-low_cuda_r1/spmv/CMakeLists.txt
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-sol-low_cuda_r1/spmv/spmv.cpp
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..35d10393898e0b5c5e8c8f3e92b391e882b61a83
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,22 @@
+-cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++cmake_minimum_required(VERSION 3.24)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
++set_target_properties(spmv PROPERTIES
++    CUDA_STANDARD 17
++    CUDA_STANDARD_REQUIRED ON
++    CUDA_ARCHITECTURES native
++)
+ 
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--extra-device-vectorization;-Xcompiler=-Wall,-Wextra>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..6cbe53e8681e59301f49683e3081743300329182
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -1,10 +1,13 @@
+-#include <chrono>
++#include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -60,8 +63,9 @@
+     for (index_t i = 0; i < dim; ++i) {
+         rowDelimiters[i] = nnzAssigned;
+         for (index_t j = 0; j < dim; ++j) {
+-            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+-            index_t needToAssign = n - nnzAssigned;
++            const uint64_t numEntriesLeft = static_cast<uint64_t>(dim) * dim -
++                                            (static_cast<uint64_t>(i) * dim + j);
++            const uint64_t needToAssign = n - nnzAssigned;
+             if (numEntriesLeft <= needToAssign) {
+                 fillRemaining = true;
+             }
+@@ -105,6 +109,40 @@
+     }
+ }
+ 
++// One warp cooperatively evaluates one CSR row.  This layout gives contiguous
++// accesses to val/cols and avoids atomics or intermediate output buffers.
++__global__ void spmvCuda(const double* __restrict__ val,
++                         const index_t* __restrict__ cols,
++                         const index_t* __restrict__ rowDelimiters,
++                         const double* __restrict__ vec,
++                         const index_t dim, double* __restrict__ out) {
++    constexpr unsigned FULL_WARP = 0xffffffffu;
++    const unsigned lane = threadIdx.x & 31u;
++    const index_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
++    const index_t warpStride = (gridDim.x * blockDim.x) >> 5;
++
++    for (index_t row = warp; row < dim; row += warpStride) {
++        double sum = 0.0;
++        const index_t begin = rowDelimiters[row];
++        const index_t end = rowDelimiters[row + 1];
++        for (index_t j = begin + lane; j < end; j += 32)
++            sum += val[j] * vec[cols[j]];
++
++#pragma unroll
++        for (int offset = 16; offset; offset >>= 1)
++            sum += __shfl_down_sync(FULL_WARP, sum, offset);
++        if (lane == 0)
++            out[row] = sum;
++    }
++}
++
++static void cudaCheck(cudaError_t status, const char* operation) {
++    if (status != cudaSuccess) {
++        fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(status));
++        std::exit(EXIT_FAILURE);
++    }
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -184,14 +222,23 @@
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
++    if (numRows == 0 || sparsity == 0 || iterations == 0) {
++        fprintf(stderr, "Matrix size, sparsity, and iterations must be non-zero.\n");
++        return 1;
++    }
++    const uint64_t matrixItems = static_cast<uint64_t>(numRows) * numRows;
++    const uint64_t itemCount = matrixItems / sparsity;
++    if (itemCount > std::numeric_limits<index_t>::max()) {
++        fprintf(stderr, "The requested matrix has too many non-zero elements.\n");
++        return 1;
++    }
++    const index_t nItems = static_cast<index_t>(itemCount);
+ 
+     printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+     printf("Matrix size: %u x %u\n", numRows, numRows);
+     printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+     printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
++           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / matrixItems));
+     printf("Iterations: %u\n", iterations);
+     printf("Max value: %.2f\n", maxVal);
+     printf("Validation: %s\n", validate ? "enabled" : "disabled");
+@@ -217,23 +264,62 @@
+                 h_vec.data(), numRows, h_reference.data());
+     }
+ 
++    double* d_val = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    // CUDA does not accept a zero-byte allocation; keep valid dummy storage for
++    // the legitimate all-zero matrix case.
++    const size_t valueBytes = std::max<size_t>(h_val.size() * sizeof(double), sizeof(double));
++    const size_t columnBytes = std::max<size_t>(h_cols.size() * sizeof(index_t), sizeof(index_t));
++    cudaCheck(cudaMalloc(&d_val, valueBytes), "allocating matrix values");
++    cudaCheck(cudaMalloc(&d_cols, columnBytes), "allocating column indices");
++    cudaCheck(cudaMalloc(&d_rowDelimiters, h_rowDelimiters.size() * sizeof(index_t)), "allocating row offsets");
++    cudaCheck(cudaMalloc(&d_vec, h_vec.size() * sizeof(double)), "allocating input vector");
++    cudaCheck(cudaMalloc(&d_out, h_out.size() * sizeof(double)), "allocating output vector");
++    if (nItems != 0) {
++        cudaCheck(cudaMemcpy(d_val, h_val.data(), h_val.size() * sizeof(double), cudaMemcpyHostToDevice), "copying matrix values");
++        cudaCheck(cudaMemcpy(d_cols, h_cols.data(), h_cols.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying column indices");
++    }
++    cudaCheck(cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), h_rowDelimiters.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying row offsets");
++    cudaCheck(cudaMemcpy(d_vec, h_vec.data(), h_vec.size() * sizeof(double), cudaMemcpyHostToDevice), "copying input vector");
++
++    int device = 0;
++    cudaDeviceProp props{};
++    cudaCheck(cudaGetDevice(&device), "querying active device");
++    cudaCheck(cudaGetDeviceProperties(&props, device), "querying device properties");
++    constexpr int threads = 256;
++    const uint64_t rowBlocks = (static_cast<uint64_t>(numRows) * 32 + threads - 1) / threads;
++    const int blocks = static_cast<int>(std::min<uint64_t>(rowBlocks, props.multiProcessorCount * 32ull));
++
++    // Warm up runtime initialization and populate GPU caches before timing.
++    spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    cudaCheck(cudaGetLastError(), "launching warm-up kernel");
++    cudaCheck(cudaDeviceSynchronize(), "running warm-up kernel");
++
+     // Perform SpMV computation
+     printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    cudaEvent_t start, end;
++    cudaCheck(cudaEventCreate(&start), "creating start event");
++    cudaCheck(cudaEventCreate(&end), "creating stop event");
++    cudaCheck(cudaEventRecord(start), "recording start event");
+ 
+     for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++        spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+     }
+-
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
++    cudaCheck(cudaGetLastError(), "launching SpMV kernel");
++    cudaCheck(cudaEventRecord(end), "recording stop event");
++    cudaCheck(cudaEventSynchronize(end), "waiting for SpMV kernels");
++    float elapsedMs = 0.0f;
++    cudaCheck(cudaEventElapsedTime(&elapsedMs, start, end), "measuring kernel time");
++    cudaCheck(cudaMemcpy(h_out.data(), d_out, h_out.size() * sizeof(double), cudaMemcpyDeviceToHost), "copying output vector");
+ 
+-    printf("Computation time: %ld ms\n", duration.count());
++    printf("Computation time: %.3f ms\n", elapsedMs);
+     
+     // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
++    const double gflops = (2.0 * nItems * iterations) / (elapsedMs * 1e6);
++    const double avgTime = elapsedMs / static_cast<double>(iterations);
+     
+     printf("Average time per iteration: %.3f ms\n", avgTime);
+     printf("Performance: %.3f GFLOPS\n", gflops);
+@@ -243,6 +329,14 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaEventDestroy(start);
++    cudaEventDestroy(end);
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+exec
+/bin/bash -lc 'cmake --build /tmp/spmv-cuda-build.gVvfkU -j2 && /tmp/spmv-cuda-build.gVvfkU/spmv -n 128 -s 10 -i 3 -v && /tmp/spmv-cuda-build.gVvfkU/spmv -n 8 -s 1000 -i 2 -v && git diff --check && git diff --stat && git diff -- spmv/CMakeLists.txt spmv/spmv.cpp' in /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-sol-low_cuda_r1
+ exited 129 in 7859ms:
+[100%] Linking CUDA executable spmv
+[100%] Built target spmv
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 128 x 128
+Sparsity: 1 out of 10 entries is non-zero
+Non-zero elements: 1638 (90.00% sparse)
+Iterations: 3
+Max value: 1.00
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 0.015 ms
+Average time per iteration: 0.005 ms
+Performance: 0.640 GFLOPS
+Validating result...
+Validation: PASSED
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 8 x 8
+Sparsity: 1 out of 1000 entries is non-zero
+Non-zero elements: 0 (100.00% sparse)
+Iterations: 2
+Max value: 1.00
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 0.012 ms
+Average time per iteration: 0.006 ms
+Performance: 0.000 GFLOPS
+Validating result...
+Validation: PASSED
+warning: Not a git repository. Use --no-index to compare two paths outside a working tree
+usage: git diff --no-index [<options>] <path> <path>
+
+Diff output format options
+    -p, --patch           generate patch
+    -s, --no-patch        suppress diff output
+    -u                    generate patch
+    -U, --unified[=<n>]   generate diffs with <n> lines context
+    -W, --[no-]function-context
+                          generate diffs with <n> lines context
+    --raw                 generate the diff in raw format
+    --patch-with-raw      synonym for '-p --raw'
+    --patch-with-stat     synonym for '-p --stat'
+    --numstat             machine friendly --stat
+    --shortstat           output only the last line of --stat
+    -X, --dirstat[=<param1,param2>...]
+                          output the distribution of relative amount of changes for each sub-directory
+    --cumulative          synonym for --dirstat=cumulative
+    --dirstat-by-file[=<param1,param2>...]
+                          synonym for --dirstat=files,param1,param2...
+    --check               warn if changes introduce conflict markers or whitespace errors
+    --summary             condensed summary such as creations, renames and mode changes
+    --name-only           show only names of changed files
+    --name-status         show only names and status of changed files
+    --stat[=<width>[,<name-width>[,<count>]]]
+                          generate diffstat
+    --stat-width <width>  generate diffstat with a given width
+    --stat-name-width <width>
+                          generate diffstat with a given name width
+    --stat-graph-width <width>
+                          generate diffstat with a given graph width
+    --stat-count <count>  generate diffstat with limited lines
+    --[no-]compact-summary
+                          generate compact summary in diffstat
+    --binary              output a binary diff that can be applied
+    --[no-]full-index     show full pre- and post-image object names on the "index" lines
+    --[no-]color[=<when>] show colored diff
+    --ws-error-highlight <kind>
+                          highlight whitespace errors in the 'context', 'old' or 'new' lines in the diff
+    -z                    do not munge pathnames and use NULs as output field terminators in --raw or --numstat
+    --[no-]abbrev[=<n>]   use <n> digits to display object names
+    --src-prefix <prefix> show the given source prefix instead of "a/"
+    --dst-prefix <prefix> show the given destination prefix instead of "b/"
+    --line-prefix <prefix>
+                          prepend an additional prefix to every line of output
+    --no-prefix           do not show any source or destination prefix
+    --default-prefix      use default prefixes a/ and b/
+    --inter-hunk-context <n>
+                          show context between diff hunks up to the specified number of lines
+    --output-indicator-new <char>
+                          specify the character to indicate a new line instead of '+'
+    --output-indicator-old <char>
+                          specify the character to indicate an old line instead of '-'
+    --output-indicator-context <char>
+                          specify the character to indicate a context instead of ' '
+
+Diff rename options
+    -B, --break-rewrites[=<n>[/<m>]]
+                          break complete rewrite changes into pairs of delete and create
+    -M, --find-renames[=<n>]
+                          detect renames
+    -D, --irreversible-delete
+                          omit the preimage for deletes
+    -C, --find-copies[=<n>]
+                          detect copies
+    --[no-]find-copies-harder
+                          use unmodified files as source to find copies
+    --no-renames          disable rename detection
+    --[no-]rename-empty   use empty blobs as rename source
+    --[no-]follow         continue listing the history of a file beyond renames
+    -l <n>                prevent rename/copy detection if the number of rename/copy targets exceeds given limit
+
+Diff algorithm options
+    --minimal             produce the smallest possible diff
+    -w, --ignore-all-space
+                          ignore whitespace when comparing lines
+    -b, --ignore-space-change
+                          ignore changes in amount of whitespace
+    --ignore-space-at-eol ignore changes in whitespace at EOL
+    --ignore-cr-at-eol    ignore carrier-return at the end of line
+    --ignore-blank-lines  ignore changes whose lines are all blank
+    -I, --[no-]ignore-matching-lines <regex>
+                          ignore changes whose all lines match <regex>
+    --[no-]indent-heuristic
+                          heuristic to shift diff hunk boundaries for easy reading
+    --patience            generate diff using the "patience diff" algorithm
+    --histogram           generate diff using the "histogram diff" algorithm
+    --diff-algorithm <algorithm>
+                          choose a diff algorithm
+    --anchored <text>     generate diff using the "anchored diff" algorithm
+    --word-diff[=<mode>]  show word diff, using <mode> to delimit changed words
+    --word-diff-regex <regex>
+                          use <regex> to decide what a word is
+    --color-words[=<regex>]
+                          equivalent to --word-diff=color --word-diff-regex=<regex>
+    --[no-]color-moved[=<mode>]
+                          moved lines of code are colored differently
+    --[no-]color-moved-ws <mode>
+                          how white spaces are ignored in --color-moved
+
+Other diff options
+    --[no-]relative[=<prefix>]
+                          when run from subdir, exclude changes outside and show relative paths
+    -a, --[no-]text       treat all files as text
+    -R                    swap two inputs, reverse the diff
+    --[no-]exit-code      exit with 1 if there were differences, 0 otherwise
+    --[no-]quiet          disable all output of the program
+    --[no-]ext-diff       allow an external diff helper to be executed
+    --[no-]textconv       run external text conversion filters when comparing binary files
+    --ignore-submodules[=<when>]
+                          ignore changes to submodules in the diff generation
+    --submodule[=<format>]
+                          specify how differences in submodules are shown
+    --ita-invisible-in-index
+                          hide 'git add -N' entries from the index
+    --ita-visible-in-index
+                          treat 'git add -N' entries as real in the index
+    -S <string>           look for differences that change the number of occurrences of the specified string
+    -G <regex>            look for differences that change the number of occurrences of the specified regex
+    --pickaxe-all         show all changes in the changeset with -S or -G
+    --pickaxe-regex       treat <string> in -S as extended POSIX regular expression
+    -O <file>             control the order in which files appear in the output
+    --rotate-to <path>    show the change in the specified path first
+    --skip-to <path>      skip the output to the specified path
+    --find-object <object-id>
+                          look for differences that change the number of occurrences of the specified object
+    --diff-filter [(A|C|D|M|R|T|U|X|B)...[*]]
+                          select files by diff type
+    --output <file>       output to a specific file
+
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..35d10393898e0b5c5e8c8f3e92b391e882b61a83
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,22 @@
+-cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++cmake_minimum_required(VERSION 3.24)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
++set_target_properties(spmv PROPERTIES
++    CUDA_STANDARD 17
++    CUDA_STANDARD_REQUIRED ON
++    CUDA_ARCHITECTURES native
++)
+ 
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--extra-device-vectorization;-Xcompiler=-Wall,-Wextra>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..6cbe53e8681e59301f49683e3081743300329182
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -1,10 +1,13 @@
+-#include <chrono>
++#include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -60,8 +63,9 @@
+     for (index_t i = 0; i < dim; ++i) {
+         rowDelimiters[i] = nnzAssigned;
+         for (index_t j = 0; j < dim; ++j) {
+-            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+-            index_t needToAssign = n - nnzAssigned;
++            const uint64_t numEntriesLeft = static_cast<uint64_t>(dim) * dim -
++                                            (static_cast<uint64_t>(i) * dim + j);
++            const uint64_t needToAssign = n - nnzAssigned;
+             if (numEntriesLeft <= needToAssign) {
+                 fillRemaining = true;
+             }
+@@ -105,6 +109,40 @@
+     }
+ }
+ 
++// One warp cooperatively evaluates one CSR row.  This layout gives contiguous
++// accesses to val/cols and avoids atomics or intermediate output buffers.
++__global__ void spmvCuda(const double* __restrict__ val,
++                         const index_t* __restrict__ cols,
++                         const index_t* __restrict__ rowDelimiters,
++                         const double* __restrict__ vec,
++                         const index_t dim, double* __restrict__ out) {
++    constexpr unsigned FULL_WARP = 0xffffffffu;
++    const unsigned lane = threadIdx.x & 31u;
++    const index_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
++    const index_t warpStride = (gridDim.x * blockDim.x) >> 5;
++
++    for (index_t row = warp; row < dim; row += warpStride) {
++        double sum = 0.0;
++        const index_t begin = rowDelimiters[row];
++        const index_t end = rowDelimiters[row + 1];
++        for (index_t j = begin + lane; j < end; j += 32)
++            sum += val[j] * vec[cols[j]];
++
++#pragma unroll
++        for (int offset = 16; offset; offset >>= 1)
++            sum += __shfl_down_sync(FULL_WARP, sum, offset);
++        if (lane == 0)
++            out[row] = sum;
++    }
++}
++
++static void cudaCheck(cudaError_t status, const char* operation) {
++    if (status != cudaSuccess) {
++        fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(status));
++        std::exit(EXIT_FAILURE);
++    }
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -184,14 +222,23 @@
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
++    if (numRows == 0 || sparsity == 0 || iterations == 0) {
++        fprintf(stderr, "Matrix size, sparsity, and iterations must be non-zero.\n");
++        return 1;
++    }
++    const uint64_t matrixItems = static_cast<uint64_t>(numRows) * numRows;
++    const uint64_t itemCount = matrixItems / sparsity;
++    if (itemCount > std::numeric_limits<index_t>::max()) {
++        fprintf(stderr, "The requested matrix has too many non-zero elements.\n");
++        return 1;
++    }
++    const index_t nItems = static_cast<index_t>(itemCount);
+ 
+     printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+     printf("Matrix size: %u x %u\n", numRows, numRows);
+     printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+     printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
++           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / matrixItems));
+     printf("Iterations: %u\n", iterations);
+     printf("Max value: %.2f\n", maxVal);
+     printf("Validation: %s\n", validate ? "enabled" : "disabled");
+@@ -217,23 +264,62 @@
+                 h_vec.data(), numRows, h_reference.data());
+     }
+ 
++    double* d_val = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    // CUDA does not accept a zero-byte allocation; keep valid dummy storage for
++    // the legitimate all-zero matrix case.
++    const size_t valueBytes = std::max<size_t>(h_val.size() * sizeof(double), sizeof(double));
++    const size_t columnBytes = std::max<size_t>(h_cols.size() * sizeof(index_t), sizeof(index_t));
++    cudaCheck(cudaMalloc(&d_val, valueBytes), "allocating matrix values");
++    cudaCheck(cudaMalloc(&d_cols, columnBytes), "allocating column indices");
++    cudaCheck(cudaMalloc(&d_rowDelimiters, h_rowDelimiters.size() * sizeof(index_t)), "allocating row offsets");
++    cudaCheck(cudaMalloc(&d_vec, h_vec.size() * sizeof(double)), "allocating input vector");
++    cudaCheck(cudaMalloc(&d_out, h_out.size() * sizeof(double)), "allocating output vector");
++    if (nItems != 0) {
++        cudaCheck(cudaMemcpy(d_val, h_val.data(), h_val.size() * sizeof(double), cudaMemcpyHostToDevice), "copying matrix values");
++        cudaCheck(cudaMemcpy(d_cols, h_cols.data(), h_cols.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying column indices");
++    }
++    cudaCheck(cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), h_rowDelimiters.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying row offsets");
++    cudaCheck(cudaMemcpy(d_vec, h_vec.data(), h_vec.size() * sizeof(double), cudaMemcpyHostToDevice), "copying input vector");
++
++    int device = 0;
++    cudaDeviceProp props{};
++    cudaCheck(cudaGetDevice(&device), "querying active device");
++    cudaCheck(cudaGetDeviceProperties(&props, device), "querying device properties");
++    constexpr int threads = 256;
++    const uint64_t rowBlocks = (static_cast<uint64_t>(numRows) * 32 + threads - 1) / threads;
++    const int blocks = static_cast<int>(std::min<uint64_t>(rowBlocks, props.multiProcessorCount * 32ull));
++
++    // Warm up runtime initialization and populate GPU caches before timing.
++    spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    cudaCheck(cudaGetLastError(), "launching warm-up kernel");
++    cudaCheck(cudaDeviceSynchronize(), "running warm-up kernel");
++
+     // Perform SpMV computation
+     printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    cudaEvent_t start, end;
++    cudaCheck(cudaEventCreate(&start), "creating start event");
++    cudaCheck(cudaEventCreate(&end), "creating stop event");
++    cudaCheck(cudaEventRecord(start), "recording start event");
+ 
+     for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++        spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+     }
+-
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
++    cudaCheck(cudaGetLastError(), "launching SpMV kernel");
++    cudaCheck(cudaEventRecord(end), "recording stop event");
++    cudaCheck(cudaEventSynchronize(end), "waiting for SpMV kernels");
++    float elapsedMs = 0.0f;
++    cudaCheck(cudaEventElapsedTime(&elapsedMs, start, end), "measuring kernel time");
++    cudaCheck(cudaMemcpy(h_out.data(), d_out, h_out.size() * sizeof(double), cudaMemcpyDeviceToHost), "copying output vector");
+ 
+-    printf("Computation time: %ld ms\n", duration.count());
++    printf("Computation time: %.3f ms\n", elapsedMs);
+     
+     // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
++    const double gflops = (2.0 * nItems * iterations) / (elapsedMs * 1e6);
++    const double avgTime = elapsedMs / static_cast<double>(iterations);
+     
+     printf("Average time per iteration: %.3f ms\n", avgTime);
+     printf("Performance: %.3f GFLOPS\n", gflops);
+@@ -243,6 +329,14 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaEventDestroy(start);
++    cudaEventDestroy(end);
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+codex
+Implemented CUDA GPU parallelization in the existing files only.
+
+Key changes:
+
+- Added a warp-per-row CSR SpMV CUDA kernel with warp-shuffle reduction.
+- Added GPU memory allocation and transfers.
+- Added warm-up execution and accurate CUDA event timing.
+- Limited grid size based on GPU multiprocessor count for scalability.
+- Added CUDA error checking and edge-case handling.
+- Updated CMake to compile `spmv.cpp` as CUDA while retaining executable name `spmv`.
+- Enabled native GPU architecture and CUDA optimization flags.
+- Fixed integer overflow risks in matrix-size calculations.
+
+Validation passed for both normal and empty sparse matrices:
+
+- `128 × 128`, 1,638 nonzeros: passed.
+- `8 × 8`, zero nonzeros: passed.
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..35d10393898e0b5c5e8c8f3e92b391e882b61a83
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,22 @@
+-cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++cmake_minimum_required(VERSION 3.24)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
++set_target_properties(spmv PROPERTIES
++    CUDA_STANDARD 17
++    CUDA_STANDARD_REQUIRED ON
++    CUDA_ARCHITECTURES native
++)
+ 
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--extra-device-vectorization;-Xcompiler=-Wall,-Wextra>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..6cbe53e8681e59301f49683e3081743300329182
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -1,10 +1,13 @@
+-#include <chrono>
++#include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -60,8 +63,9 @@
+     for (index_t i = 0; i < dim; ++i) {
+         rowDelimiters[i] = nnzAssigned;
+         for (index_t j = 0; j < dim; ++j) {
+-            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+-            index_t needToAssign = n - nnzAssigned;
++            const uint64_t numEntriesLeft = static_cast<uint64_t>(dim) * dim -
++                                            (static_cast<uint64_t>(i) * dim + j);
++            const uint64_t needToAssign = n - nnzAssigned;
+             if (numEntriesLeft <= needToAssign) {
+                 fillRemaining = true;
+             }
+@@ -105,6 +109,40 @@
+     }
+ }
+ 
++// One warp cooperatively evaluates one CSR row.  This layout gives contiguous
++// accesses to val/cols and avoids atomics or intermediate output buffers.
++__global__ void spmvCuda(const double* __restrict__ val,
++                         const index_t* __restrict__ cols,
++                         const index_t* __restrict__ rowDelimiters,
++                         const double* __restrict__ vec,
++                         const index_t dim, double* __restrict__ out) {
++    constexpr unsigned FULL_WARP = 0xffffffffu;
++    const unsigned lane = threadIdx.x & 31u;
++    const index_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
++    const index_t warpStride = (gridDim.x * blockDim.x) >> 5;
++
++    for (index_t row = warp; row < dim; row += warpStride) {
++        double sum = 0.0;
++        const index_t begin = rowDelimiters[row];
++        const index_t end = rowDelimiters[row + 1];
++        for (index_t j = begin + lane; j < end; j += 32)
++            sum += val[j] * vec[cols[j]];
++
++#pragma unroll
++        for (int offset = 16; offset; offset >>= 1)
++            sum += __shfl_down_sync(FULL_WARP, sum, offset);
++        if (lane == 0)
++            out[row] = sum;
++    }
++}
++
++static void cudaCheck(cudaError_t status, const char* operation) {
++    if (status != cudaSuccess) {
++        fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(status));
++        std::exit(EXIT_FAILURE);
++    }
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -184,14 +222,23 @@
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
++    if (numRows == 0 || sparsity == 0 || iterations == 0) {
++        fprintf(stderr, "Matrix size, sparsity, and iterations must be non-zero.\n");
++        return 1;
++    }
++    const uint64_t matrixItems = static_cast<uint64_t>(numRows) * numRows;
++    const uint64_t itemCount = matrixItems / sparsity;
++    if (itemCount > std::numeric_limits<index_t>::max()) {
++        fprintf(stderr, "The requested matrix has too many non-zero elements.\n");
++        return 1;
++    }
++    const index_t nItems = static_cast<index_t>(itemCount);
+ 
+     printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+     printf("Matrix size: %u x %u\n", numRows, numRows);
+     printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+     printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
++           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / matrixItems));
+     printf("Iterations: %u\n", iterations);
+     printf("Max value: %.2f\n", maxVal);
+     printf("Validation: %s\n", validate ? "enabled" : "disabled");
+@@ -217,23 +264,62 @@
+                 h_vec.data(), numRows, h_reference.data());
+     }
+ 
++    double* d_val = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    // CUDA does not accept a zero-byte allocation; keep valid dummy storage for
++    // the legitimate all-zero matrix case.
++    const size_t valueBytes = std::max<size_t>(h_val.size() * sizeof(double), sizeof(double));
++    const size_t columnBytes = std::max<size_t>(h_cols.size() * sizeof(index_t), sizeof(index_t));
++    cudaCheck(cudaMalloc(&d_val, valueBytes), "allocating matrix values");
++    cudaCheck(cudaMalloc(&d_cols, columnBytes), "allocating column indices");
++    cudaCheck(cudaMalloc(&d_rowDelimiters, h_rowDelimiters.size() * sizeof(index_t)), "allocating row offsets");
++    cudaCheck(cudaMalloc(&d_vec, h_vec.size() * sizeof(double)), "allocating input vector");
++    cudaCheck(cudaMalloc(&d_out, h_out.size() * sizeof(double)), "allocating output vector");
++    if (nItems != 0) {
++        cudaCheck(cudaMemcpy(d_val, h_val.data(), h_val.size() * sizeof(double), cudaMemcpyHostToDevice), "copying matrix values");
++        cudaCheck(cudaMemcpy(d_cols, h_cols.data(), h_cols.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying column indices");
++    }
++    cudaCheck(cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), h_rowDelimiters.size() * sizeof(index_t), cudaMemcpyHostToDevice), "copying row offsets");
++    cudaCheck(cudaMemcpy(d_vec, h_vec.data(), h_vec.size() * sizeof(double), cudaMemcpyHostToDevice), "copying input vector");
++
++    int device = 0;
++    cudaDeviceProp props{};
++    cudaCheck(cudaGetDevice(&device), "querying active device");
++    cudaCheck(cudaGetDeviceProperties(&props, device), "querying device properties");
++    constexpr int threads = 256;
++    const uint64_t rowBlocks = (static_cast<uint64_t>(numRows) * 32 + threads - 1) / threads;
++    const int blocks = static_cast<int>(std::min<uint64_t>(rowBlocks, props.multiProcessorCount * 32ull));
++
++    // Warm up runtime initialization and populate GPU caches before timing.
++    spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    cudaCheck(cudaGetLastError(), "launching warm-up kernel");
++    cudaCheck(cudaDeviceSynchronize(), "running warm-up kernel");
++
+     // Perform SpMV computation
+     printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    cudaEvent_t start, end;
++    cudaCheck(cudaEventCreate(&start), "creating start event");
++    cudaCheck(cudaEventCreate(&end), "creating stop event");
++    cudaCheck(cudaEventRecord(start), "recording start event");
+ 
+     for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++        spmvCuda<<<blocks, threads>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+     }
+-
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
++    cudaCheck(cudaGetLastError(), "launching SpMV kernel");
++    cudaCheck(cudaEventRecord(end), "recording stop event");
++    cudaCheck(cudaEventSynchronize(end), "waiting for SpMV kernels");
++    float elapsedMs = 0.0f;
++    cudaCheck(cudaEventElapsedTime(&elapsedMs, start, end), "measuring kernel time");
++    cudaCheck(cudaMemcpy(h_out.data(), d_out, h_out.size() * sizeof(double), cudaMemcpyDeviceToHost), "copying output vector");
+ 
+-    printf("Computation time: %ld ms\n", duration.count());
++    printf("Computation time: %.3f ms\n", elapsedMs);
+     
+     // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
++    const double gflops = (2.0 * nItems * iterations) / (elapsedMs * 1e6);
++    const double avgTime = elapsedMs / static_cast<double>(iterations);
+     
+     printf("Average time per iteration: %.3f ms\n", avgTime);
+     printf("Performance: %.3f GFLOPS\n", gflops);
+@@ -243,6 +329,14 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaEventDestroy(start);
++    cudaEventDestroy(end);
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+tokens used
+27,994
+Implemented CUDA GPU parallelization in the existing files only.
+
+Key changes:
+
+- Added a warp-per-row CSR SpMV CUDA kernel with warp-shuffle reduction.
+- Added GPU memory allocation and transfers.
+- Added warm-up execution and accurate CUDA event timing.
+- Limited grid size based on GPU multiprocessor count for scalability.
+- Added CUDA error checking and edge-case handling.
+- Updated CMake to compile `spmv.cpp` as CUDA while retaining executable name `spmv`.
+- Enabled native GPU architecture and CUDA optimization flags.
+- Fixed integer overflow risks in matrix-size calculations.
+
+Validation passed for both normal and empty sparse matrices:
+
+- `128 × 128`, 1,638 nonzeros: passed.
+- `8 × 8`, zero nonzeros: passed.

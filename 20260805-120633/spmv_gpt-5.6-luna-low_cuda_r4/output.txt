@@ -1,0 +1,2592 @@
+OpenAI Codex v0.146.0
+--------
+workdir: /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4
+model: gpt-5.6-luna
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: low
+reasoning summaries: none
+session id: 019ff8b2-b0bf-7470-a1e9-c25187fada02
+--------
+user
+Parallelize the spmv benchmark code found in ./spmv/ with CUDA for GPU parallelism. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the existing benchmark and build configuration, then implement the CUDA path in the current files and run the available build/tests to verify correctness and performance-oriented choices.
+exec
+/bin/bash -lc "pwd && rg --files -g '"'!build'"' -g '"'!.*'"' | sort && printf '\\n--- CMake ---\\n' && sed -n '1,240p' CMakeLists.txt && printf '\\n--- spmv files ---\\n' && find spmv -maxdepth 2 -type f -print -exec sed -n '1,260p' {} \\;" in /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4
+ exited 2 in 0ms:
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4
+common/hash.hpp
+common/results_output.hpp
+output.txt
+spmv/CMakeLists.txt
+spmv/spmv.cpp
+
+--- CMake ---
+sed: can't read CMakeLists.txt: No such file or directory
+
+exec
+/bin/bash -lc "printf '%s\\n' '--- spmv/CMakeLists.txt ---'; sed -n '1,240p' spmv/CMakeLists.txt; printf '%s\\n' '--- spmv/spmv.cpp ---'; sed -n '1,320p' spmv/spmv.cpp; printf '%s\\n' '--- output.txt ---'; sed -n '1,160p' output.txt; printf '%s\\n' '--- git status ---'; git status --short" in /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4
+ exited 128 in 0ms:
+--- spmv/CMakeLists.txt ---
+cmake_minimum_required(VERSION 3.10)
+project(spmv_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(spmv spmv.cpp)
+
+# Enable optimizations
+target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link math library
+target_link_libraries(spmv m)
+--- spmv/spmv.cpp ---
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+using index_t = uint32_t;
+
+// Constants
+constexpr double MAX_RELATIVE_ERROR = 0.02;
+
+// ****************************************************************************
+// Function: fill
+//
+// Purpose:
+//   Initialize array with random values
+//
+// Arguments:
+//   A: pointer to the array to initialize
+//   n: number of elements in the array
+//   maxVal: specifies range of random values [0, maxVal]
+//
+// ****************************************************************************
+void fill(double* A, const index_t n, const double maxVal) {
+    for (index_t i = 0; i < n; ++i) {
+        A[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+    }
+}
+
+// ****************************************************************************
+// Function: initRandomMatrix
+//
+// Purpose:
+//   Assigns random positions to a given number of elements in a square
+//   matrix. The function encodes these positions in compressed sparse
+//   row (CSR) format.
+//
+// Arguments:
+//   cols:          array for column indexes of elements (size should be = n)
+//   rowDelimiters: array of size dim+1 holding indices to rows;
+//                  last element is the index one past the last element
+//   n:             number of nonzero elements
+//   dim:           number of rows/columns in the matrix
+//
+// ****************************************************************************
+void initRandomMatrix(index_t* cols, index_t* rowDelimiters, const index_t n, const index_t dim) {
+    index_t nnzAssigned = 0;
+
+    // Figure out the probability that a nonzero should be assigned
+    double prob = static_cast<double>(n) / (static_cast<double>(dim) * static_cast<double>(dim));
+
+    // Seed random number generator
+    srand(8675309);
+
+    // Randomly decide whether entry i,j gets a value, but ensure n values are assigned
+    bool fillRemaining = false;
+    for (index_t i = 0; i < dim; ++i) {
+        rowDelimiters[i] = nnzAssigned;
+        for (index_t j = 0; j < dim; ++j) {
+            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+            index_t needToAssign = n - nnzAssigned;
+            if (numEntriesLeft <= needToAssign) {
+                fillRemaining = true;
+            }
+            double randVal = static_cast<double>(rand()) / RAND_MAX;
+            if ((nnzAssigned < n && randVal <= prob) || fillRemaining) {
+                // Assign (i,j) a value
+                cols[nnzAssigned] = j;
+                nnzAssigned++;
+            }
+        }
+    }
+    // Convention: put the number of non-zeroes at the end of the row delimiters array
+    rowDelimiters[dim] = n;
+}
+
+// ****************************************************************************
+// Function: spmvCpu
+//
+// Purpose:
+//   Computes sparse matrix-vector multiplication using CSR format
+//
+// Arguments:
+//   val: array holding the non-zero values for the matrix
+//   cols: array of column indices for each element
+//   rowDelimiters: array of size dim+1 holding indices to rows;
+//                  last element is the index one past the last element
+//   vec: dense vector of size dim to be used for multiplication
+//   dim: number of rows/columns in the matrix
+//   out: output - result from the spmv calculation
+//
+// ****************************************************************************
+void spmvCpu(const double* val, const index_t* cols, const index_t* rowDelimiters,
+             const double* vec, const index_t dim, double* out) {
+    for (index_t i = 0; i < dim; ++i) {
+        double t = 0.0;
+        for (index_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
+            const auto col = cols[j];
+            t += val[j] * vec[col];
+        }
+        out[i] = t;
+    }
+}
+
+// ****************************************************************************
+// Function: verifyResults
+//
+// Purpose:
+//   Verifies correctness of results by comparing to reference solution
+//
+// Arguments:
+//   reference: array holding the reference result vector
+//   result: array holding the result vector to verify
+//   size: number of elements per vector
+//
+// ****************************************************************************
+bool verifyResults(const double* reference, const double* result, const index_t size) {
+    for (index_t i = 0; i < size; ++i) {
+        const double ref = reference[i];
+        const double res = result[i];
+        if (std::abs(ref) < 1e-10) {
+            // For very small values, check absolute error
+            if (std::abs(res) > MAX_RELATIVE_ERROR) {
+                printf("Validation failed at index %u: reference %.10e, got %.10e\n", i, ref, res);
+                return false;
+            }
+        } else {
+            // Check relative error
+            const double relError = std::abs((res - ref) / ref);
+            if (relError > MAX_RELATIVE_ERROR) {
+                printf("Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\n",
+                       i, ref, res, relError);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Number of rows/columns in the matrix (default: 1024)\n");
+    printf("  -s <num>     Sparsity: 1 out of N entries is non-zero (default: 10)\n");
+    printf("  -i <num>     Number of iterations (default: 10)\n");
+    printf("  -m <val>     Maximum value for matrix and vector elements (default: 1.0)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    index_t numRows = 1024;
+    index_t sparsity = 10;
+    index_t iterations = 10;
+    double maxVal = 1.0;
+    bool validate = false;
+    bool printResults = false;
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            numRows = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            sparsity = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            iterations = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            maxVal = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+
+    // Calculate number of non-zero elements
+    const index_t nItems = (numRows * numRows) / sparsity;
+
+    printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+    printf("Matrix size: %u x %u\n", numRows, numRows);
+    printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+    printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
+    printf("Iterations: %u\n", iterations);
+    printf("Max value: %.2f\n", maxVal);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+
+    // Allocate and initialize data structures
+    std::vector<double> h_val(nItems);                  // Non-zero values
+    std::vector<index_t> h_cols(nItems);                // Column indices
+    std::vector<index_t> h_rowDelimiters(numRows + 1);  // Row delimiters
+    std::vector<double> h_vec(numRows);                 // Dense vector
+    std::vector<double> h_out(numRows);                 // Output vector
+
+    printf("Initializing data structures...\n");
+    fill(h_vec.data(), numRows, maxVal);
+    fill(h_val.data(), nItems, maxVal);
+    initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+
+    // For validation, compute reference solution
+    std::vector<double> h_reference;
+    if (validate) {
+        printf("Computing reference solution...\n");
+        h_reference.resize(numRows);
+        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(), 
+                h_vec.data(), numRows, h_reference.data());
+    }
+
+    // Perform SpMV computation
+    printf("Computing SpMV...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (index_t iter = 0; iter < iterations; ++iter) {
+        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+                h_vec.data(), numRows, h_out.data());
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+    printf("Computation time: %ld ms\n", duration.count());
+    
+    // Calculate performance metrics
+    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+    const double avgTime = duration.count() / static_cast<double>(iterations);
+    
+    printf("Average time per iteration: %.3f ms\n", avgTime);
+    printf("Performance: %.3f GFLOPS\n", gflops);
+    
+    // Print results for external validation
+    if (printResults) {
+        print_results(h_out, "OutputVector");
+    }
+
+    // Validation
+    if (validate) {
+        printf("Validating result...\n");
+        const bool valid = verifyResults(h_reference.data(), h_out.data(), numRows);
+
+        if (valid) {
+            printf("Validation: PASSED\n");
+            return 0;
+        } else {
+            printf("Validation: FAILED\n");
+            return 1;
+        }
+    }
+
+    return 0;
+}
+--- output.txt ---
+OpenAI Codex v0.146.0
+--------
+workdir: /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4
+model: gpt-5.6-luna
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: low
+reasoning summaries: none
+session id: 019ff8b2-b0bf-7470-a1e9-c25187fada02
+--------
+user
+Parallelize the spmv benchmark code found in ./spmv/ with CUDA for GPU parallelism. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the existing benchmark and build configuration, then implement the CUDA path in the current files and run the available build/tests to verify correctness and performance-oriented choices.
+exec
+/bin/bash -lc "pwd && rg --files -g '"'!build'"' -g '"'!.*'"' | sort && printf '\\n--- CMake ---\\n' && sed -n '1,240p' CMakeLists.txt && printf '\\n--- spmv files ---\\n' && find spmv -maxdepth 2 -type f -print -exec sed -n '1,260p' {} \\;" in /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4
+ exited 2 in 0ms:
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4
+common/hash.hpp
+common/results_output.hpp
+output.txt
+spmv/CMakeLists.txt
+spmv/spmv.cpp
+
+--- CMake ---
+sed: can't read CMakeLists.txt: No such file or directory
+
+--- git status ---
+fatal: not a git repository (or any parent up to mount point /)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+
+codex
+The benchmark is a single-host-thread CSR implementation, and the executable target is defined in `spmv/CMakeLists.txt`. I’ll preserve its CLI/output semantics while moving the timed SpMV loop to device memory with one CUDA thread per row, using read-only CSR/vector accesses and explicit synchronization around timing.
+exec
+/bin/bash -lc 'command -v nvcc || true; cmake --version | head -1; find . -maxdepth 2 -type d -print' in /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4
+ succeeded in 0ms:
+/usr/bin/nvcc
+cmake version 3.30.2
+.
+./spmv
+./common
+
+apply patch
+patch: completed
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/CMakeLists.txt
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..8a7209900ba552d699234be8a922d80a5b303319
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,23 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..3fe21be0fc7ad3b3cfda82b6075fb9187e9c8ca8
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -257,5 +304,10 @@
+         }
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
+     return 0;
+ }
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..8a7209900ba552d699234be8a922d80a5b303319
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,23 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..3fe21be0fc7ad3b3cfda82b6075fb9187e9c8ca8
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -257,5 +304,10 @@
+         }
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
+     return 0;
+ }
+
+exec
+/bin/bash -lc 'cmake -S spmv -B /tmp/spmv-cuda-build && cmake --build /tmp/spmv-cuda-build -j2' in /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4
+ exited 1 in 0ms:
+CMake Error: The source "/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/CMakeLists.txt" does not match the source "/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-xhigh_cuda_r1/spmv/CMakeLists.txt" used to generate cache.  Re-run cmake with a different source directory.
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..8a7209900ba552d699234be8a922d80a5b303319
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,23 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..3fe21be0fc7ad3b3cfda82b6075fb9187e9c8ca8
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -257,5 +304,10 @@
+         }
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
+     return 0;
+ }
+
+codex
+The CUDA implementation and CMake changes are in place. The first configure attempt hit a pre-existing build-cache path collision from another evaluation directory, so I’m switching to a fresh temporary build directory and will use that result to catch compiler/configuration issues.
+exec
+/bin/bash -lc 'build_dir=$(mktemp -d /tmp/spmv-cuda-build.XXXXXX) && cmake -S spmv -B "$build_dir" && cmake --build "$build_dir" -j2 && "$build_dir/spmv" -n 256 -s 10 -i 3 -v' in /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..8a7209900ba552d699234be8a922d80a5b303319
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,23 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..3fe21be0fc7ad3b3cfda82b6075fb9187e9c8ca8
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -257,5 +304,10 @@
+         }
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
+     return 0;
+ }
+
+ exited 2 in 7126ms:
+-- The CUDA compiler identification is NVIDIA 12.0.140
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Configuring done (5.2s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/spmv-cuda-build.gAljCS
+[ 50%] Building CXX object CMakeFiles/spmv.dir/spmv.cpp.o
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp: In function ‘void spmvKernel(const double*, const index_t*, const index_t*, const double*, index_t, double*)’:
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp:117:46: error: ‘blockIdx’ was not declared in this scope
+  117 |     const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+      |                                              ^~~~~~~~
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp:117:60: error: ‘blockDim’ was not declared in this scope
+  117 |     const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+      |                                                            ^~~~~~~~
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp:117:73: error: ‘threadIdx’ was not declared in this scope
+  117 |     const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+      |                                                                         ^~~~~~~~~
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp: In function ‘int main(int, char**)’:
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp:271:21: error: expected primary-expression before ‘<’ token
+  271 |         spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+      |                     ^
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp:271:47: error: expected primary-expression before ‘>’ token
+  271 |         spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+      |                                               ^
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp:271:49: warning: left operand of comma operator has no effect [-Wunused-value]
+  271 |         spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+      |                                                 ^~~~~
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp:271:64: warning: right operand of comma operator has no effect [-Wunused-value]
+  271 |         spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+      |                                                                ^~~~~~~~~~~~~~~
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp:271:81: warning: right operand of comma operator has no effect [-Wunused-value]
+  271 |         spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+      |                                                                                 ^~~~~
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp:271:88: warning: right operand of comma operator has no effect [-Wunused-value]
+  271 |         spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+      |                                                                                        ^~~~~~~
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp:271:97: warning: right operand of comma operator has no effect [-Wunused-value]
+  271 |         spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
+      |                                                                                                 ^~~~~
+gmake[2]: *** [CMakeFiles/spmv.dir/build.make:76: CMakeFiles/spmv.dir/spmv.cpp.o] Error 1
+gmake[1]: *** [CMakeFiles/Makefile2:83: CMakeFiles/spmv.dir/all] Error 2
+gmake: *** [Makefile:91: all] Error 2
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..8a7209900ba552d699234be8a922d80a5b303319
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,23 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..3fe21be0fc7ad3b3cfda82b6075fb9187e9c8ca8
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -257,5 +304,10 @@
+         }
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
+     return 0;
+ }
+
+apply patch
+patch: completed
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/CMakeLists.txt
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..1cdaa4b957301c4d8f185ce3ac361371155cab77
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,24 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..3fe21be0fc7ad3b3cfda82b6075fb9187e9c8ca8
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -257,5 +304,10 @@
+         }
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
+     return 0;
+ }
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..1cdaa4b957301c4d8f185ce3ac361371155cab77
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,24 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..3fe21be0fc7ad3b3cfda82b6075fb9187e9c8ca8
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -257,5 +304,10 @@
+         }
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
+     return 0;
+ }
+
+exec
+/bin/bash -lc 'build_dir=$(mktemp -d /tmp/spmv-cuda-build.XXXXXX) && cmake -S spmv -B "$build_dir" && cmake --build "$build_dir" -j2 && "$build_dir/spmv" -n 256 -s 10 -i 3 -v' in /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..1cdaa4b957301c4d8f185ce3ac361371155cab77
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,24 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..3fe21be0fc7ad3b3cfda82b6075fb9187e9c8ca8
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -257,5 +304,10 @@
+         }
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
+     return 0;
+ }
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..1cdaa4b957301c4d8f185ce3ac361371155cab77
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,24 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..3fe21be0fc7ad3b3cfda82b6075fb9187e9c8ca8
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -257,5 +304,10 @@
+         }
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
+     return 0;
+ }
+
+ succeeded in 12943ms:
+-- The CUDA compiler identification is NVIDIA 12.0.140
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Configuring done (5.2s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/spmv-cuda-build.7YDfn9
+[ 33%] Building CUDA object CMakeFiles/spmv.dir/spmv.cpp.o
+[ 66%] Linking CUDA device code CMakeFiles/spmv.dir/cmake_device_link.o
+nvlink warning : Skipping incompatible '/usr/lib/x86_64-linux-gnu/librt.a' when searching for -lrt
+nvlink warning : Skipping incompatible '/usr/lib/x86_64-linux-gnu/libpthread.a' when searching for -lpthread
+nvlink warning : Skipping incompatible '/usr/lib/x86_64-linux-gnu/libdl.a' when searching for -ldl
+[100%] Linking CUDA executable spmv
+[100%] Built target spmv
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 256 x 256
+Sparsity: 1 out of 10 entries is non-zero
+Non-zero elements: 6553 (90.00% sparse)
+Iterations: 3
+Max value: 1.00
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 0 ms
+Average time per iteration: 0.000 ms
+Performance: inf GFLOPS
+Validating result...
+Validation: PASSED
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..1cdaa4b957301c4d8f185ce3ac361371155cab77
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,24 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..3fe21be0fc7ad3b3cfda82b6075fb9187e9c8ca8
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -257,5 +304,10 @@
+         }
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
+     return 0;
+ }
+
+codex
+The fresh CUDA build now succeeds, and a validation run passes on the available GPU. I’m making one final correctness-oriented cleanup: removing fast-math from the CUDA flags and ensuring device buffers are released on validation success/failure as well.
+apply patch
+patch: completed
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/CMakeLists.txt
+/home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4/spmv/spmv.cpp
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..60e260dd67fd928df80fa79f048ebd1acec9452a
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,24 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..a7f90796a453f7873387206451717273a8d85414
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -243,6 +290,12 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..60e260dd67fd928df80fa79f048ebd1acec9452a
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,24 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..a7f90796a453f7873387206451717273a8d85414
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -243,6 +290,12 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+exec
+/bin/bash -lc 'build_dir=$(mktemp -d /tmp/spmv-cuda-build.XXXXXX) && cmake -S spmv -B "$build_dir" >/dev/null && cmake --build "$build_dir" -j2 >/dev/null && "$build_dir/spmv" -n 128 -s 7 -i 2 -v | tail -n 4' in /home/llmtest/evals/20260805-120633/spmv_gpt-5.6-luna-low_cuda_r4
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..60e260dd67fd928df80fa79f048ebd1acec9452a
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,24 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..a7f90796a453f7873387206451717273a8d85414
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -243,6 +290,12 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..60e260dd67fd928df80fa79f048ebd1acec9452a
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,24 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..a7f90796a453f7873387206451717273a8d85414
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -243,6 +290,12 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+ succeeded in 12858ms:
+nvlink warning : Skipping incompatible '/usr/lib/x86_64-linux-gnu/librt.a' when searching for -lrt
+nvlink warning : Skipping incompatible '/usr/lib/x86_64-linux-gnu/libpthread.a' when searching for -lpthread
+nvlink warning : Skipping incompatible '/usr/lib/x86_64-linux-gnu/libdl.a' when searching for -ldl
+Average time per iteration: 0.000 ms
+Performance: inf GFLOPS
+Validating result...
+Validation: PASSED
+
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..60e260dd67fd928df80fa79f048ebd1acec9452a
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,24 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..a7f90796a453f7873387206451717273a8d85414
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -243,6 +290,12 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+codex
+Implemented CUDA parallelization in the existing files.
+
+Changes:
+- Added CUDA CSR SpMV kernel with one GPU thread per matrix row.
+- Added device allocation, transfers, synchronization, and result copy-back.
+- Updated CMake to compile the existing `spmv.cpp` as CUDA.
+- Preserved executable name: `spmv`.
+- Preserved CLI and validation semantics.
+- Added CUDA error checking and cleanup.
+
+Verification:
+- CUDA build succeeded with `nvcc`.
+- Validation passed for multiple matrix sizes and sparsity settings.
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..60e260dd67fd928df80fa79f048ebd1acec9452a
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,24 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX CUDA)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
+ 
++set_target_properties(spmv PROPERTIES
++    CUDA_SEPARABLE_COMPILATION ON
++    CUDA_ARCHITECTURES native
++)
++
+ # Enable optimizations
+-target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
++target_compile_options(spmv PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>
++    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
++)
+ 
+ # Link math library
+ target_link_libraries(spmv m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..a7f90796a453f7873387206451717273a8d85414
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <cuda_runtime.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
+@@ -105,6 +107,33 @@
+     }
+ }
+ 
++// One thread owns each output row.  The row's reduction remains serial, which
++// preserves the CPU accumulation order while exposing parallelism across rows.
++__global__ void spmvKernel(const double* __restrict__ val,
++                           const index_t* __restrict__ cols,
++                           const index_t* __restrict__ rowDelimiters,
++                           const double* __restrict__ vec,
++                           const index_t dim, double* __restrict__ out) {
++    const index_t row = static_cast<index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= dim) return;
++
++    double sum = 0.0;
++    const index_t begin = rowDelimiters[row];
++    const index_t end = rowDelimiters[row + 1];
++    for (index_t k = begin; k < end; ++k)
++        sum += val[k] * vec[cols[k]];
++    out[row] = sum;
++}
++
++[[noreturn]] void cudaFailure(const char* operation, cudaError_t error) {
++    fprintf(stderr, "CUDA error during %s: %s\n", operation, cudaGetErrorString(error));
++    std::exit(EXIT_FAILURE);
++}
++
++void checkCuda(const char* operation, cudaError_t error) {
++    if (error != cudaSuccess) cudaFailure(operation, error);
++}
++
+ // ****************************************************************************
+ // Function: verifyResults
+ //
+@@ -208,6 +237,21 @@
+     fill(h_val.data(), nItems, maxVal);
+     initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+ 
++    double* d_val = nullptr;
++    index_t* d_cols = nullptr;
++    index_t* d_rowDelimiters = nullptr;
++    double* d_vec = nullptr;
++    double* d_out = nullptr;
++    checkCuda("allocating device buffers", cudaMalloc(&d_val, nItems * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_cols, nItems * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_rowDelimiters, (numRows + 1) * sizeof(index_t)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_vec, numRows * sizeof(double)));
++    checkCuda("allocating device buffers", cudaMalloc(&d_out, numRows * sizeof(double)));
++    checkCuda("copying inputs to device", cudaMemcpy(d_val, h_val.data(), nItems * sizeof(double), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_cols, h_cols.data(), nItems * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_rowDelimiters, h_rowDelimiters.data(), (numRows + 1) * sizeof(index_t), cudaMemcpyHostToDevice));
++    checkCuda("copying inputs to device", cudaMemcpy(d_vec, h_vec.data(), numRows * sizeof(double), cudaMemcpyHostToDevice));
++
+     // For validation, compute reference solution
+     std::vector<double> h_reference;
+     if (validate) {
+@@ -221,10 +265,13 @@
+     printf("Computing SpMV...\n");
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
+-    }
++    constexpr unsigned threadsPerBlock = 256;
++    const unsigned blocks = (numRows + threadsPerBlock - 1) / threadsPerBlock;
++    for (index_t iter = 0; iter < iterations; ++iter)
++        spmvKernel<<<blocks, threadsPerBlock>>>(d_val, d_cols, d_rowDelimiters, d_vec, numRows, d_out);
++    checkCuda("executing SpMV kernel", cudaGetLastError());
++    checkCuda("synchronizing SpMV", cudaDeviceSynchronize());
++    checkCuda("copying result to host", cudaMemcpy(h_out.data(), d_out, numRows * sizeof(double), cudaMemcpyDeviceToHost));
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+@@ -243,6 +290,12 @@
+         print_results(h_out, "OutputVector");
+     }
+ 
++    cudaFree(d_val);
++    cudaFree(d_cols);
++    cudaFree(d_rowDelimiters);
++    cudaFree(d_vec);
++    cudaFree(d_out);
++
+     // Validation
+     if (validate) {
+         printf("Validating result...\n");
+
+tokens used
+44,272
+Implemented CUDA parallelization in the existing files.
+
+Changes:
+- Added CUDA CSR SpMV kernel with one GPU thread per matrix row.
+- Added device allocation, transfers, synchronization, and result copy-back.
+- Updated CMake to compile the existing `spmv.cpp` as CUDA.
+- Preserved executable name: `spmv`.
+- Preserved CLI and validation semantics.
+- Added CUDA error checking and cleanup.
+
+Verification:
+- CUDA build succeeded with `nvcc`.
+- Validation passed for multiple matrix sizes and sparsity settings.

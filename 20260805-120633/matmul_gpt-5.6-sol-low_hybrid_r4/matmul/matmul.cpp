@@ -1,0 +1,229 @@
+#include <mpi.h>
+#include <cuda_runtime.h>
+#include <omp.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+constexpr double getPseudoRndValue(const size_t N, const size_t i, const size_t j) noexcept {
+    return (((i + 1) * (i + j + 1) * 1299709) % (N * N)) /
+           static_cast<double>(N * N);
+}
+
+static void cudaCheck(cudaError_t error, const char* operation, MPI_Comm comm) {
+    if (error != cudaSuccess) {
+        int rank = -1;
+        MPI_Comm_rank(comm, &rank);
+        std::fprintf(stderr, "Rank %d: %s failed: %s\n", rank, operation,
+                     cudaGetErrorString(error));
+        MPI_Abort(comm, EXIT_FAILURE);
+    }
+}
+
+void initMatrix(std::vector<double>& mat, size_t N, size_t firstRow,
+                size_t rows) {
+#pragma omp parallel for schedule(static)
+    for (long long localI = 0; localI < static_cast<long long>(rows); ++localI) {
+        const size_t globalI = firstRow + static_cast<size_t>(localI);
+        for (size_t j = 0; j < N; ++j)
+            mat[static_cast<size_t>(localI) * N + j] =
+                getPseudoRndValue(N, globalI, j);
+    }
+}
+
+template<int TILE>
+__global__ void matrixMultiplyKernel(const double* __restrict__ A,
+                                     const double* __restrict__ B,
+                                     double* __restrict__ C,
+                                     size_t rows, size_t N) {
+    __shared__ double aTile[TILE][TILE + 1];
+    __shared__ double bTile[TILE][TILE + 1];
+    const size_t row = static_cast<size_t>(blockIdx.y) * TILE + threadIdx.y;
+    const size_t col = static_cast<size_t>(blockIdx.x) * TILE + threadIdx.x;
+    double sum = 0.0;
+
+    for (size_t base = 0; base < N; base += TILE) {
+        const size_t ak = base + threadIdx.x;
+        const size_t bk = base + threadIdx.y;
+        aTile[threadIdx.y][threadIdx.x] =
+            (row < rows && ak < N) ? A[row * N + ak] : 0.0;
+        bTile[threadIdx.y][threadIdx.x] =
+            (bk < N && col < N) ? B[bk * N + col] : 0.0;
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < TILE; ++k)
+            sum = fma(aTile[threadIdx.y][k], bTile[k][threadIdx.x], sum);
+        __syncthreads();
+    }
+    if (row < rows && col < N) C[row * N + col] = sum;
+}
+
+static void matrixMultiply(const std::vector<double>& A,
+                           const std::vector<double>& B,
+                           std::vector<double>& C, size_t rows, size_t N,
+                           MPI_Comm comm) {
+    // MPI permits more ranks than rows; those ranks still participate in all
+    // collectives but have no GPU work (and cudaMalloc(0) is not portable).
+    if (rows == 0) return;
+    double *deviceA = nullptr, *deviceB = nullptr, *deviceC = nullptr;
+    const size_t localBytes = rows * N * sizeof(double);
+    const size_t matrixBytes = N * N * sizeof(double);
+    cudaCheck(cudaMalloc(&deviceA, localBytes), "cudaMalloc(A)", comm);
+    cudaCheck(cudaMalloc(&deviceB, matrixBytes), "cudaMalloc(B)", comm);
+    cudaCheck(cudaMalloc(&deviceC, localBytes), "cudaMalloc(C)", comm);
+    cudaCheck(cudaMemcpy(deviceA, A.data(), localBytes, cudaMemcpyHostToDevice),
+              "copy A to device", comm);
+    cudaCheck(cudaMemcpy(deviceB, B.data(), matrixBytes, cudaMemcpyHostToDevice),
+              "copy B to device", comm);
+
+    constexpr int tile = 32;
+    const dim3 threads(tile, tile);
+    const dim3 blocks(static_cast<unsigned>((N + tile - 1) / tile),
+                      static_cast<unsigned>((rows + tile - 1) / tile));
+    matrixMultiplyKernel<tile><<<blocks, threads>>>(deviceA, deviceB, deviceC,
+                                                    rows, N);
+    cudaCheck(cudaGetLastError(), "matrix multiplication kernel launch", comm);
+    cudaCheck(cudaMemcpy(C.data(), deviceC, localBytes, cudaMemcpyDeviceToHost),
+              "copy C to host", comm);
+    cudaCheck(cudaFree(deviceA), "cudaFree(A)", comm);
+    cudaCheck(cudaFree(deviceB), "cudaFree(B)", comm);
+    cudaCheck(cudaFree(deviceC), "cudaFree(C)", comm);
+}
+
+bool validateResult(const std::vector<double>& C, size_t N) {
+    int valid = 1;
+#pragma omp parallel for collapse(2) reduction(&:valid) schedule(static)
+    for (int ii = 0; ii < 5; ++ii) {
+        for (int jj = 0; jj < 5; ++jj) {
+            const size_t i = static_cast<size_t>(ii) % N;
+            const size_t j = static_cast<size_t>(jj) % N;
+            double expected = 0.0;
+            for (size_t k = 0; k < N; ++k)
+                expected += getPseudoRndValue(N, i, k) *
+                            getPseudoRndValue(N, k, j);
+            const double actual = C[i * N + j];
+            const double relative = std::abs((actual - expected) / (expected + 1e-10));
+            if (!std::isfinite(actual) || relative > 1e-6) valid = 0;
+        }
+    }
+    return valid != 0;
+}
+
+void printUsage(const char* program) {
+    std::printf("Usage: %s [options]\n", program);
+    std::printf("  -n <num>  Matrix size (default: 512)\n");
+    std::printf("  -v        Enable validation\n");
+    std::printf("  -r        Print results for external validation\n");
+    std::printf("  -h        Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    int provided = 0;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+    int rank = 0, ranks = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+
+    size_t N = 512;
+    bool validate = false, printResults = false;
+    int parseStatus = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            char* end = nullptr;
+            const unsigned long long value = std::strtoull(argv[++i], &end, 10);
+            if (!end || *end != '\0' || value == 0) parseStatus = 1;
+            else N = static_cast<size_t>(value);
+        } else if (std::strcmp(argv[i], "-v") == 0) validate = true;
+        else if (std::strcmp(argv[i], "-r") == 0) printResults = true;
+        else if (std::strcmp(argv[i], "-h") == 0) parseStatus = 2;
+        else parseStatus = 1;
+    }
+    if (parseStatus) {
+        if (rank == 0) printUsage(argv[0]);
+        MPI_Finalize();
+        return parseStatus == 2 ? 0 : 1;
+    }
+    if (N > std::numeric_limits<size_t>::max() / N ||
+        N * N > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        if (rank == 0) std::fprintf(stderr, "Matrix is too large for MPI_Gatherv counts\n");
+        MPI_Finalize();
+        return 1;
+    }
+
+    MPI_Comm localComm;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank,
+                        MPI_INFO_NULL, &localComm);
+    int localRank = 0, deviceCount = 0;
+    MPI_Comm_rank(localComm, &localRank);
+    cudaCheck(cudaGetDeviceCount(&deviceCount), "cudaGetDeviceCount", MPI_COMM_WORLD);
+    if (deviceCount == 0) {
+        if (rank == 0) std::fprintf(stderr, "No CUDA devices found\n");
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    }
+    cudaCheck(cudaSetDevice(localRank % deviceCount), "cudaSetDevice", MPI_COMM_WORLD);
+    cudaCheck(cudaFree(nullptr), "CUDA context initialization", MPI_COMM_WORLD);
+
+    const size_t baseRows = N / static_cast<size_t>(ranks);
+    const size_t extra = N % static_cast<size_t>(ranks);
+    const size_t rows = baseRows + (static_cast<size_t>(rank) < extra);
+    const size_t firstRow = static_cast<size_t>(rank) * baseRows +
+                            std::min(static_cast<size_t>(rank), extra);
+
+    std::vector<double> A(rows * N), B(N * N), localC(rows * N);
+    initMatrix(A, N, firstRow, rows);
+    initMatrix(B, N, 0, N);
+
+    if (rank == 0) {
+        std::printf("Matrix Multiplication Benchmark\nMatrix size: %zu x %zu\n", N, N);
+        std::printf("MPI ranks: %d, OpenMP threads/rank: %d\n", ranks, omp_get_max_threads());
+        std::printf("Validation: %s\nComputing matrix multiplication...\n",
+                    validate ? "enabled" : "disabled");
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    const double start = MPI_Wtime();
+    matrixMultiply(A, B, localC, rows, N, MPI_COMM_WORLD);
+    const double localElapsed = MPI_Wtime() - start;
+    double elapsed = 0.0;
+    MPI_Reduce(&localElapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    std::vector<int> counts(ranks), offsets(ranks);
+    for (int r = 0; r < ranks; ++r) {
+        const size_t rr = baseRows + (static_cast<size_t>(r) < extra);
+        const size_t first = static_cast<size_t>(r) * baseRows +
+                             std::min(static_cast<size_t>(r), extra);
+        counts[r] = static_cast<int>(rr * N);
+        offsets[r] = static_cast<int>(first * N);
+    }
+    std::vector<double> C;
+    if (rank == 0) C.resize(N * N);
+    MPI_Gatherv(localC.data(), static_cast<int>(localC.size()), MPI_DOUBLE,
+                rank == 0 ? C.data() : nullptr, counts.data(), offsets.data(),
+                MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    int result = 0;
+    if (rank == 0) {
+        const long long milliseconds = static_cast<long long>(elapsed * 1000.0);
+        const double gflops = elapsed > 0.0 ? 2.0 * static_cast<double>(N) * N * N /
+                                                  elapsed / 1.0e9 : 0.0;
+        std::printf("Computation time: %lld ms\nPerformance: %.3f GFLOPS\n",
+                    milliseconds, gflops);
+        if (printResults) print_results(C, "MatrixC");
+        if (validate) {
+            std::printf("Validating result...\n");
+            const bool valid = validateResult(C, N);
+            std::printf("Validation: %s\n", valid ? "PASSED" : "FAILED");
+            result = valid ? 0 : 1;
+        }
+    }
+    MPI_Bcast(&result, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Comm_free(&localComm);
+    MPI_Finalize();
+    return result;
+}
