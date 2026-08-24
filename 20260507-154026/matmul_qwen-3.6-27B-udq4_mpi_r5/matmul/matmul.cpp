@@ -187,6 +187,7 @@ int main(int argc, char** argv) {
     double t1 = MPI_Wtime();
     MPI_Barrier(MPI_COMM_WORLD);
     double comp_time = t1 - t0;
+    MPI_Allreduce(MPI_IN_PLACE, &comp_time, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
     // ---- Gather C to rank 0 ----
     std::vector<int> recv_counts(num_procs), recv_displs(num_procs);

@@ -489,11 +489,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
-    const double localSeconds = MPI_Wtime() - start;
-    double elapsedSeconds = 0.0;
-    MPI_Reduce(&localSeconds, &elapsedSeconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-
     if (success) {
         constexpr dim3 block(32, 8);
         const dim3 grid((n + block.x - 1) / block.x, (localRows + block.y - 1) / block.y);
@@ -502,6 +497,11 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaGetLastError());
         }
     }
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const double localSeconds = MPI_Wtime() - start;
+    double elapsedSeconds = 0.0;
+    MPI_Reduce(&localSeconds, &elapsedSeconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     std::vector<double> localL(localElements);
     if (success && localElements != 0) {

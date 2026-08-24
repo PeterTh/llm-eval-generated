@@ -235,7 +235,10 @@ int main(int argc, char** argv) {
     // Synchronize all ranks after timing
     MPI_Barrier(MPI_COMM_WORLD);
     
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    const double localDurationUs = static_cast<double>(
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+    double maxDurationUs = 0.0;
+    MPI_Reduce(&localDurationUs, &maxDurationUs, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     
     // Gather counts and displacements for MPI_Gatherv
     std::vector<int> recvcounts(numRanks);
@@ -262,8 +265,8 @@ int main(int argc, char** argv) {
     
     // Output timing and results from rank 0
     if (rank == 0) {
-        printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
-        printf("Options per second: %.0f\n", numOptions / (duration.count() / 1e6));
+        printf("Computation time: %.3f ms\n", maxDurationUs / 1000.0);
+        printf("Options per second: %.0f\n", numOptions / (maxDurationUs / 1e6));
         
         // Print results for external validation
         if (printResults) {

@@ -251,6 +251,9 @@ int main(int argc, char** argv) {
     // Synchronize all processes after computation
     MPI_Barrier(MPI_COMM_WORLD);
     double endTime = MPI_Wtime();
+    double localDuration = endTime - startTime;
+    double maxDuration = 0.0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Build Gatherv parameters for collecting results
     std::vector<int> recvcounts(nprocs), displs(nprocs);
@@ -275,7 +278,7 @@ int main(int argc, char** argv) {
     // Rank 0 reports results
     int exitCode = 0;
     if (rank == 0) {
-        double duration_ms = (endTime - startTime) * 1000.0;
+        double duration_ms = maxDuration * 1000.0;
         printf("Computation time: %ld ms\n", static_cast<long>(duration_ms));
 
         double gflops = (2.0 * N * N * N) / (duration_ms / 1000.0) / 1e9;

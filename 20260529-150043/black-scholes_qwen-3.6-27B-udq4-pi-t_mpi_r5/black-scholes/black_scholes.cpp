@@ -224,7 +224,11 @@ int main(int argc, char** argv) {
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    const long long localDurationUs =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    long long maxDurationUs = 0;
+    MPI_Reduce(&localDurationUs, &maxDurationUs, 1, MPI_LONG_LONG_INT, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     // Gather all results to rank 0
     // Build count and displacement arrays for MPI_Gatherv
@@ -250,10 +254,10 @@ int main(int argc, char** argv) {
                 recvCounts.data(), displacements.data(), MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
 
-    // Compute wall-clock time for printing (use local duration)
+    // Compute wall-clock time for printing (use maximum rank duration)
     if (rank == 0) {
-        printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
-        printf("Options per second: %.0f\n", numOptions / (duration.count() / 1e6));
+        printf("Computation time: %.3f ms\n", maxDurationUs / 1000.0);
+        printf("Options per second: %.0f\n", numOptions / (maxDurationUs / 1e6));
     }
 
     // Print results for external validation

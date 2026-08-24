@@ -379,9 +379,11 @@ int main(int argc, char** argv) {
     
     const std::vector<Cluster> clusters = qtClustering(points, threshold, rank, world_size);
     
-    MPI_Barrier(MPI_COMM_WORLD);
     double end_time = MPI_Wtime();
-    long cluster_time_ms = static_cast<long>((end_time - start_time) * 1000.0);
+    double local_elapsed = end_time - start_time;
+    double global_elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    long cluster_time_ms = static_cast<long>(global_elapsed * 1000.0);
     
     // Only rank 0 outputs results
     if (rank == 0) {

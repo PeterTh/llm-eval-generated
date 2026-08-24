@@ -167,14 +167,16 @@ int main(int argc, char** argv) {
     MPI_Gatherv(localC.data(), static_cast<int>(localElements), MPI_DOUBLE, rank == 0 ? C.data() : nullptr,
                 counts.data(), displacements.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
+    const double localSeconds = std::chrono::duration<double>(end - start).count();
+    double globalSeconds = 0.0;
+    MPI_Reduce(&localSeconds, &globalSeconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 
     int result = 0;
     if (rank == 0) {
-        const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-        std::printf("Computation time: %lld ms\n", static_cast<long long>(millis));
-        const double seconds = std::chrono::duration<double>(end - start).count();
-        std::printf("Performance: %.3f GFLOPS\n", seconds > 0 ? (2.0 * N * N * N) / seconds / 1e9 : 0.0);
+        const auto millis = static_cast<long long>(globalSeconds * 1000.0);
+        std::printf("Computation time: %lld ms\n", millis);
+        std::printf("Performance: %.3f GFLOPS\n", globalSeconds > 0 ? (2.0 * N * N * N) / globalSeconds / 1e9 : 0.0);
         if (printResults) print_results(C, "MatrixC");
         if (validate) { std::printf("Validating result...\n"); result = validateResult(A, B, C, N) ? 0 : 1; std::printf("Validation: %s\n", result ? "FAILED" : "PASSED"); }
     }

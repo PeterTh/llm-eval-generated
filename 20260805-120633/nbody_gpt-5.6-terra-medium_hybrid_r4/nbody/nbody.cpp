@@ -224,9 +224,11 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(deviceGlobalPositions, hostGlobalPositions.data(), sizeof(double) * hostGlobalPositions.size(), cudaMemcpyHostToDevice));
     }
     CUDA_CHECK(cudaDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
-    if (rank == 0) std::printf("Simulation time: %ld ms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    const long long localElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long globalElapsedMs = 0;
+    MPI_Reduce(&localElapsedMs, &globalElapsedMs, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) std::printf("Simulation time: %lld ms\n", globalElapsedMs);
 
     CUDA_CHECK(cudaMemcpy(hostLocalVelocities.data(), deviceLocalVelocities, sizeof(double) * hostLocalVelocities.size(), cudaMemcpyDeviceToHost));
     std::vector<Body> finalBodies;

@@ -334,8 +334,11 @@ int main(int argc, char** argv) {
     bool success = choleskyDecomposition(local_A, n, dist, num_procs, my_rank);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_duration = duration.count();
+    long max_duration = 0;
 
     MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Reduce(&local_duration, &max_duration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (!success) {
         if (my_rank == 0) printf("Cholesky decomposition failed\n");
@@ -344,9 +347,9 @@ int main(int argc, char** argv) {
     }
 
     if (my_rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", max_duration);
         double ops = (double)n * n * n / 3.0;
-        double gflops = ops / (duration.count() / 1000.0) / 1e9;
+        double gflops = ops / (max_duration / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
     }
 

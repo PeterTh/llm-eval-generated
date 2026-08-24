@@ -327,6 +327,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDurationMs = duration.count();
+    long globalDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &globalDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Copy local velocities from GPU for output/validation
     CUDA_CHECK(cudaMemcpy(all_vx.data() + localStart, d_vx,
@@ -350,7 +353,7 @@ int main(int argc, char** argv) {
     }
 
     if (rank == 0) {
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %ld ms\n", globalDurationMs);
 
         if (printResults) {
             std::vector<double> bodyData;

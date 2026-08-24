@@ -456,6 +456,10 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaDeviceSynchronize());
         MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
         const auto end = std::chrono::high_resolution_clock::now();
+        const double local_elapsed_seconds = std::chrono::duration<double>(end - start).count();
+        double elapsed_seconds = 0.0;
+        MPI_CHECK(MPI_Reduce(&local_elapsed_seconds, &elapsed_seconds, 1, MPI_DOUBLE, MPI_MAX, 0,
+                             MPI_COMM_WORLD));
 
         std::vector<val_t> host_energy(local_elements);
         std::vector<val_t> host_flux(local_elements);
@@ -468,7 +472,6 @@ int main(int argc, char** argv) {
         MPI_CHECK(MPI_Reduce(&local_hash, &global_hash, 1, MPI_UINT64_T, MPI_BXOR, 0, MPI_COMM_WORLD));
 
         if (rank == 0) {
-            const double elapsed_seconds = std::chrono::duration<double>(end - start).count();
             const double elapsed_ms = elapsed_seconds * 1000.0;
             const int measured_iterations = std::max(iterations - 1, 1);
             const double time_per_iteration = elapsed_ms / measured_iterations;

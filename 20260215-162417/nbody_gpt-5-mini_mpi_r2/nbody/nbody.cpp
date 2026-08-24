@@ -263,9 +263,12 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     double t1 = MPI_Wtime();
+    double localElapsed = t1 - t0;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&localElapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        long ms = (long)((t1 - t0) * 1000.0);
+        long ms = (long)(maxElapsed * 1000.0);
         printf("Simulation time: %ld ms\n", ms);
     }
 

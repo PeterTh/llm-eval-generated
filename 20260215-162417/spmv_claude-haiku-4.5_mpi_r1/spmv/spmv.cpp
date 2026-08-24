@@ -361,9 +361,10 @@ int main(int argc, char** argv) {
                 h_vec.data(), local_rows, h_out.data());
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const double local_duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    double duration_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather results
     std::vector<index_t> local_rows_per_process(mpi_size);
@@ -385,11 +386,11 @@ int main(int argc, char** argv) {
                    global_out.data(), recvcounts.data(), displs.data(), MPI_DOUBLE,
                    0, MPI_COMM_WORLD);
 
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %.3f ms\n", duration_ms);
         
         // Calculate performance metrics
-        const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
-        const double avgTime = duration.count() / static_cast<double>(iterations);
+        const double gflops = (2.0 * nItems * iterations) / (duration_ms / 1000.0) / 1e9;
+        const double avgTime = duration_ms / static_cast<double>(iterations);
         
         printf("Average time per iteration: %.3f ms\n", avgTime);
         printf("Performance: %.3f GFLOPS\n", gflops);

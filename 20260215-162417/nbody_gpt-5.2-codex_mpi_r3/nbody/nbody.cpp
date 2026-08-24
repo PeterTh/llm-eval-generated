@@ -230,9 +230,11 @@ int main(int argc, char** argv) {
     
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long localDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long globalDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &globalDurationMs, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %lld ms\n", globalDurationMs);
     }
     
     // Print results for external validation

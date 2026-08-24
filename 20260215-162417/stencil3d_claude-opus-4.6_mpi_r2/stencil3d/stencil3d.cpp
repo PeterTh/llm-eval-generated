@@ -190,12 +190,14 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double t_end = MPI_Wtime();
     double elapsed = t_end - t_start;
+    double global_elapsed = 0.0;
+    MPI_Reduce(&elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        long duration_ms = (long)(elapsed * 1000.0);
+        long duration_ms = (long)(global_elapsed * 1000.0);
         printf("Computation time: %ld ms\n", duration_ms);
         double cellUpdates = (double)((nx - 2) * (ny - 2) * (nz - 2)) * iterations;
-        double mcups = cellUpdates / elapsed / 1e6;
+        double mcups = cellUpdates / global_elapsed / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

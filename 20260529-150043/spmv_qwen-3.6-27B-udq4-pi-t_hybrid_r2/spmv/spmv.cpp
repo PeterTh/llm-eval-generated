@@ -511,8 +511,10 @@ int main(int argc, char** argv) {
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long localDuration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long duration = 0;
+    MPI_CHECK(MPI_Reduce(&localDuration, &duration, 1, MPI_LONG_LONG_INT,
+                         MPI_MAX, 0, MPI_COMM_WORLD));
 
     // =========================================================================
     // Gather results back to rank 0
@@ -539,11 +541,11 @@ int main(int argc, char** argv) {
     // Performance reporting
     // =========================================================================
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", duration);
 
         // Calculate performance metrics
-        const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
-        const double avgTime = duration.count() / static_cast<double>(iterations);
+        const double gflops = (2.0 * nItems * iterations) / (duration / 1000.0) / 1e9;
+        const double avgTime = duration / static_cast<double>(iterations);
 
         printf("Average time per iteration: %.3f ms\n", avgTime);
         printf("Performance: %.3f GFLOPS\n", gflops);

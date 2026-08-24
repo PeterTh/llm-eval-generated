@@ -406,10 +406,11 @@ int main(int argc, char** argv) {
         }
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    const double end_time = MPI_Wtime();
-
     cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    const double end_time = MPI_Wtime();
+    const double local_elapsed = end_time - start_time;
+    double global_elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     std::vector<val_t> local_energy(local_elems, 0.0);
     if (local_rows > 0) {
@@ -426,7 +427,7 @@ int main(int argc, char** argv) {
     }
 
     if (rank == 0) {
-        const long duration_ms = static_cast<long>((end_time - start_time) * 1000.0);
+        const long duration_ms = static_cast<long>(global_elapsed * 1000.0);
         printf("Computation time: %ld ms\n", duration_ms);
 
         const int n_measured_iters = std::max(n_iters - 1, 1);

@@ -263,12 +263,14 @@ int main(int argc, char** argv) {
                        MPI_COMM_WORLD);
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
+    long localDuration = static_cast<long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    long duration = 0;
+    MPI_Reduce(&localDuration, &duration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (worldRank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %ld ms\n", duration);
     }
 
     // rank 0 has globalData already

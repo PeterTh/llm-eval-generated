@@ -417,12 +417,14 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     double end_time = MPI_Wtime();
     double duration_ms = (end_time - start_time) * 1000.0;
+    double global_duration_ms = 0.0;
+    MPI_Reduce(&duration_ms, &global_duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %.0f ms\n", duration_ms);
+        printf("Computation time: %.0f ms\n", global_duration_ms);
         size_t gridSize = nx * ny * nz;
         double cellUpdates = (double)gridSize * iterations;
-        double mcups = cellUpdates / (duration_ms / 1000.0) / 1e6;
+        double mcups = cellUpdates / (global_duration_ms / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

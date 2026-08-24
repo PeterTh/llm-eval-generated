@@ -217,9 +217,12 @@ int main(int argc, char** argv) {
     }
     MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
+    const long long localElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long globalElapsed = 0;
+    MPI_Reduce(&localElapsed, &globalElapsed, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {
         printf("N-Body Simulation\nNumber of bodies: %d\nNumber of steps: %d\nValidation: %s\n", n, steps, validate ? "enabled" : "disabled");
-        printf("Simulation time: %ld ms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+        printf("Simulation time: %lld ms\n", globalElapsed);
         if (printResults) { std::vector<double> data; data.reserve(static_cast<size_t>(n) * 6); for (const Body& b : bodies) { data.insert(data.end(), {b.px,b.py,b.pz,b.vx,b.vy,b.vz}); } print_results(data, "Bodies"); }
         if (validate) { printf("Validating simulation results...\n"); if (validateSimulation(bodies)) { printf("Final energy: %.6f\nValidation: PASSED\n", computeTotalEnergy(bodies)); } else { printf("Validation: FAILED\n"); MPI_Abort(MPI_COMM_WORLD, 1); } }
     }

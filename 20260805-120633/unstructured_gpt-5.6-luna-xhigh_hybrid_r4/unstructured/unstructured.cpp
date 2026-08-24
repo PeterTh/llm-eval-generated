@@ -647,7 +647,7 @@ int main(int argc, char** argv) {
     const auto start = std::chrono::steady_clock::now();
     runSimulation(world, n_iters, mpi_rank, mpi_size);
     const auto end = std::chrono::steady_clock::now();
-    const auto local_duration_ns =
+    const long long local_duration_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
     long long duration_ns = 0;
     MPI_Reduce(&local_duration_ns, &duration_ns, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);

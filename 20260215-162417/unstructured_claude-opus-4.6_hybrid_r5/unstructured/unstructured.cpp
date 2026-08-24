@@ -455,7 +455,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long duration_ms = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    MPI_Allreduce(MPI_IN_PLACE, &duration_ms, 1, MPI_LONG_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     // Copy results back from GPU
     CUDA_CHECK(cudaMemcpy(h_energy.data(), d_energy, n_total * sizeof(double), cudaMemcpyDeviceToHost));
@@ -489,7 +491,7 @@ int main(int argc, char** argv) {
                 all_f.data(), counts.data(), offsets.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", (long)duration_ms);
+        printf("Computation time: %lld ms\n", duration_ms);
 
         // Calculate performance metrics
         const int n_measured_iters = std::max(n_iters - 1, 1);

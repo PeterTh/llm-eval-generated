@@ -277,11 +277,13 @@ int main(int argc, char** argv) {
     double end_time = MPI_Wtime();
 
     double duration_ms = (end_time - start_time) * 1000.0;
+    double global_duration_ms = 0.0;
+    MPI_Reduce(&duration_ms, &global_duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", static_cast<long>(duration_ms));
+        printf("Computation time: %ld ms\n", static_cast<long>(global_duration_ms));
         double ops = static_cast<double>(n) * static_cast<double>(n) * static_cast<double>(n);
-        double gflops = ops / (duration_ms / 1000.0) / 1e9;
+        double gflops = ops / (global_duration_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GOPS\n", gflops);
     }
 

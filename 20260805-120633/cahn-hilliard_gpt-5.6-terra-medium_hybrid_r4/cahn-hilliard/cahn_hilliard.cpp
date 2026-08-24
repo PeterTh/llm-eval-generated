@@ -149,7 +149,9 @@ int main(int argc, char** argv) {
         std::swap(cold, cnew); exchangeHalos(cold, plane, localNz, rank, ranks, lowerSend, upperSend, lowerRecv, upperRecv);
     }
     CUDA_CHECK(cudaDeviceSynchronize()); MPI_Barrier(MPI_COMM_WORLD); const auto end = std::chrono::steady_clock::now();
-    if (!rank) { const double seconds = std::chrono::duration<double>(end-start).count(); printf("Computation time: %.3f ms\nPerformance: %.3f MCellUpdates/s\n", seconds*1e3, volume*iterations/seconds/1e6); }
+    const double localSeconds = std::chrono::duration<double>(end-start).count(); double seconds = 0.0;
+    MPI_Reduce(&localSeconds, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (!rank) { printf("Computation time: %.3f ms\nPerformance: %.3f MCellUpdates/s\n", seconds*1e3, volume*iterations/seconds/1e6); }
     std::vector<double> localResult(localCells); CUDA_CHECK(cudaMemcpy(localResult.data(), cold + plane, localCells*sizeof(double), cudaMemcpyDeviceToHost));
     std::vector<int> counts, offsets; std::vector<double> result;
     if (!rank) { counts.resize(ranks); offsets.resize(ranks); for (int r=0; r<ranks; ++r) { const size_t n = nz/ranks + (static_cast<size_t>(r)<nz%ranks); counts[r]=static_cast<int>(n*plane); offsets[r]=r ? offsets[r-1]+counts[r-1] : 0; } result.resize(volume); }

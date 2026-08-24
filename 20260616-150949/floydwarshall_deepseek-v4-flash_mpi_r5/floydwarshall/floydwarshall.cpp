@@ -270,6 +270,8 @@ int main(int argc, char** argv) {
 
     const double t_end = MPI_Wtime();
     const double elapsed_ms = (t_end - t_start) * 1000.0;
+    double max_elapsed_ms = 0.0;
+    MPI_Reduce(&elapsed_ms, &max_elapsed_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // --- Gather results back to rank 0 ---
     MPI_Gatherv(dist_local.data(), scounts[rank], MPI_UNSIGNED,
@@ -283,11 +285,11 @@ int main(int argc, char** argv) {
 
     // --- Output and validation on rank 0 ---
     if (rank == 0) {
-        printf("Computation time: %.0f ms\n", elapsed_ms);
+        printf("Computation time: %.0f ms\n", max_elapsed_ms);
 
         // Calculate operations per second
         double ops = static_cast<double>(numNodes) * numNodes * numNodes;
-        double gflops = ops / (elapsed_ms / 1000.0) / 1.0e9;
+        double gflops = ops / (max_elapsed_ms / 1000.0) / 1.0e9;
         printf("Performance: %.3f GOPS\n", gflops);
 
         if (printResults) {

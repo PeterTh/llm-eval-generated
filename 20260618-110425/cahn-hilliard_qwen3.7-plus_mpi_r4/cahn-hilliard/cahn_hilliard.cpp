@@ -447,6 +447,11 @@ int main(int argc, char** argv) {
     MPI_Barrier(cart_comm);
     double end_time = MPI_Wtime();
     double duration_s = end_time - start_time;
+    double global_duration_s;
+    MPI_Reduce(&duration_s, &global_duration_s, 1, MPI_DOUBLE, MPI_MAX, 0, cart_comm);
+    if (rank == 0) {
+        duration_s = global_duration_s;
+    }
     long duration_ms = static_cast<long>(duration_s * 1000.0);
 
     // Gather results to rank 0 for output/validation

@@ -178,7 +178,10 @@ int main(int argc, char** argv) {
     }
     cudaCheck(cudaDeviceSynchronize(), "simulation sync"); MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
-    if (!rank) { const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count(); printf("Computation time: %ld ms\nPerformance: %.3f MCellUpdates/s\n", ms, (double)(nx*ny*nz)*iterations/(ms/1000.0)/1.e6); }
+    const long local_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count();
+    long ms = 0;
+    MPI_Reduce(&local_ms, &ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (!rank) { printf("Computation time: %ld ms\nPerformance: %.3f MCellUpdates/s\n", ms, (double)(nx*ny*nz)*iterations/(ms/1000.0)/1.e6); }
     std::vector<double> local(local_count), result;
     cudaCheck(cudaMemcpy(local.data(), cold + plane, local_count * sizeof(double), cudaMemcpyDeviceToHost), "copy result");
     std::vector<int> counts, displs;

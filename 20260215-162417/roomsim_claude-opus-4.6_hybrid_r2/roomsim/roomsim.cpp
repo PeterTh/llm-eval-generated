@@ -1074,7 +1074,9 @@ int main(int argc, char** argv) {
     computeFormFactors(state, mpi_rank, mpi_size);
 
     auto endPre = std::chrono::high_resolution_clock::now();
-    auto preDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count();
+    long preDurationLocal = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count());
+    long preDuration = 0;
+    MPI_Reduce(&preDurationLocal, &preDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
         printf("Precomputation time: %ld ms\n", preDuration);
@@ -1089,7 +1091,9 @@ int main(int argc, char** argv) {
     runSimulation(state, mpi_rank, mpi_size);
 
     auto endSim = std::chrono::high_resolution_clock::now();
-    auto simDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count();
+    long simDurationLocal = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count());
+    long simDuration = 0;
+    MPI_Reduce(&simDurationLocal, &simDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
         printf("Simulation time: %ld ms\n", simDuration);
@@ -1104,7 +1108,9 @@ int main(int argc, char** argv) {
     computeDistances(state, mpi_rank, mpi_size);
 
     auto endDist = std::chrono::high_resolution_clock::now();
-    auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
+    long distDurationLocal = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count());
+    long distDuration = 0;
+    MPI_Reduce(&distDurationLocal, &distDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
         printf("Distance computation time: %ld ms\n", distDuration);

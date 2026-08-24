@@ -385,13 +385,16 @@ int main(int argc, char** argv) {
     // Timing & performance (rank 0 only)
     // -----------------------------------------------------------------------
     double elapsed = std::chrono::duration<double>(end - start).count();
-    double elapsed_ms = elapsed * 1.0e3;
+    double global_elapsed = 0.0;
+    MPI_Reduce(&elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     if (rank == 0) {
+        double elapsed_ms = global_elapsed * 1.0e3;
         double cellUpdates =
             static_cast<double>((nx - 2) * (ny - 2) * (nz - 2)) *
             static_cast<double>(iterations);
-        double mcups = cellUpdates / elapsed / 1.0e6;
+        double mcups = cellUpdates / global_elapsed / 1.0e6;
 
         printf("Computation time: %.3f ms\n", elapsed_ms);
         printf("Performance: %.3f MCellUpdates/s\n", mcups);

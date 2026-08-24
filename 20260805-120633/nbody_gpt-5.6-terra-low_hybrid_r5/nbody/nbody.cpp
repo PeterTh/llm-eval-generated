@@ -153,8 +153,11 @@ int main(int argc, char** argv) {
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     const auto end = std::chrono::high_resolution_clock::now();
+    const long localTime = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long simulationTime = 0;
+    MPI_Reduce(&localTime, &simulationTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     CUDA_CHECK(cudaFree(next)); CUDA_CHECK(cudaFree(current));
-    if (!rank) std::printf("Simulation time: %ld ms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    if (!rank) std::printf("Simulation time: %ld ms\n", simulationTime);
     if (!rank && printResults) { std::vector<double> data; data.reserve(numBodies * 6); for (const auto& b : bodies) { data.insert(data.end(), {b.pos.x,b.pos.y,b.pos.z,b.vel.x,b.vel.y,b.vel.z}); } print_results(data, "Bodies"); }
     int result = 0;
     if (!rank && validate) { std::printf("Validating simulation results...\n"); if (validateSimulation(bodies)) std::printf("Final energy: %.6f\nValidation: PASSED\n", computeTotalEnergy(bodies)); else { std::printf("Validation: FAILED\n"); result = 1; } }

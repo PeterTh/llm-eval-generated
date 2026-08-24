@@ -381,7 +381,9 @@ int main(int argc, char** argv) {
     
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    const double duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    const double local_duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    double duration_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     
     // Gather results on rank 0 for hash/validation/output
     const int local_count = local_nx * n_elems_root;

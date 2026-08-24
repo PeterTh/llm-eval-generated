@@ -313,6 +313,10 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    long long localDurationUs = static_cast<long long>(duration.count());
+    long long maxDurationUs = 0;
+    MPI_Reduce(&localDurationUs, &maxDurationUs, 1, MPI_LONG_LONG_INT, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     // Copy results back from GPU
     std::vector<double> localResults(localCount);
@@ -338,8 +342,8 @@ int main(int argc, char** argv) {
     int retCode = 0;
 
     if (rank == 0) {
-        printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
-        printf("Options per second: %.0f\n", numOptions / (duration.count() / 1e6));
+        printf("Computation time: %.3f ms\n", maxDurationUs / 1000.0);
+        printf("Options per second: %.0f\n", numOptions / (maxDurationUs / 1e6));
 
         if (printResults) {
             print_results(results, "OptionPrices");

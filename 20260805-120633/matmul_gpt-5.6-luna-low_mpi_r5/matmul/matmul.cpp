@@ -138,11 +138,11 @@ int main(int argc, char** argv) {
     matrixMultiply(A, B, C, N);
     
     auto end = std::chrono::high_resolution_clock::now();
-    auto localDuration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    long long localDuration = static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
     long long durationUs = 0;
     MPI_Reduce(&localDuration, &durationUs, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     
-    const double seconds = std::max(1.0, static_cast<double>(durationUs)) / 1e6;
+    const double seconds = static_cast<double>(durationUs) / 1e6;
     if (rank == 0) printf("Computation time: %.3f ms\n", seconds * 1000.0);
     
     // Calculate GFLOPS

@@ -112,11 +112,10 @@ long floydWarshall(std::vector<unsigned int>& dist,
     // Buffer for k-th row (numNodes entries)
     std::vector<unsigned int> kth_row(numNodes);
 
-    // Synchronize and start timing on rank 0
+    // Synchronize and start timing on every rank
     MPI_Barrier(MPI_COMM_WORLD);
     long duration_ms = 0;
-    std::chrono::time_point<std::chrono::high_resolution_clock> tstart;
-    if (world_rank == 0) tstart = std::chrono::high_resolution_clock::now();
+    auto tstart = std::chrono::high_resolution_clock::now();
 
     // Main distributed Floyd-Warshall
     for (size_t k = 0; k < numNodes; ++k) {
@@ -159,12 +158,11 @@ long floydWarshall(std::vector<unsigned int>& dist,
         }
     }
 
-    // Finish timing
+    // Finish timing and report the maximum elapsed time across ranks
     MPI_Barrier(MPI_COMM_WORLD);
-    if (world_rank == 0) {
-        auto tend = std::chrono::high_resolution_clock::now();
-        duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tend - tstart).count();
-    }
+    auto tend = std::chrono::high_resolution_clock::now();
+    long local_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tend - tstart).count();
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather updated rows back to root (packed row-major blocks)
     std::vector<unsigned int> recvbuf_dist;

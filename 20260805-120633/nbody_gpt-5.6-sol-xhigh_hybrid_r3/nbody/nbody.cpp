@@ -378,6 +378,10 @@ int runSimulation(const int rank, const int worldSize, const int numBodies, cons
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     const auto end = std::chrono::steady_clock::now();
     const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const long localDurationMilliseconds = static_cast<long>(duration.count());
+    long simulationDurationMilliseconds = 0;
+    MPI_CHECK(MPI_Reduce(&localDurationMilliseconds, &simulationDurationMilliseconds, 1, MPI_LONG,
+                         MPI_MAX, 0, MPI_COMM_WORLD));
 
     if (cudaAwareMpi && rank == 0) {
         CUDA_CHECK(cudaMemcpy(hostGlobalPositions, deviceGlobalPositions,
@@ -398,7 +402,7 @@ int runSimulation(const int rank, const int worldSize, const int numBodies, cons
 
     int exitCode = EXIT_SUCCESS;
     if (rank == 0) {
-        std::printf("Simulation time: %ld ms\n", static_cast<long>(duration.count()));
+        std::printf("Simulation time: %ld ms\n", simulationDurationMilliseconds);
 
         if (printResults) {
             std::vector<double> bodyData(static_cast<size_t>(numBodies) * 6);

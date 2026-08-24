@@ -363,7 +363,9 @@ int main(int argc, char** argv) {
     
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long global_duration = 0;
+    MPI_Reduce(&local_duration, &global_duration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     
     if (!success) {
         if (rank == 0) {
@@ -374,11 +376,11 @@ int main(int argc, char** argv) {
     }
     
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", global_duration);
         
         // Calculate GFLOPS (approximately n³/3 operations for Cholesky)
         double ops = (double)n * n * n / 3.0;
-        double gflops = ops / (duration.count() / 1000.0) / 1e9;
+        double gflops = ops / (global_duration / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
         
         // Print results for external validation

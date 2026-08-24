@@ -215,9 +215,13 @@ int main(int argc, char** argv)
     auto t1 = std::chrono::high_resolution_clock::now();
     auto duration =
         std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0);
+    long localDuration = duration.count();
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     if (rank == 0)
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %ld ms\n", maxDuration);
 
     // ================================================================
     //  POST-SIMULATION (gather → rank 0 for output / validation)

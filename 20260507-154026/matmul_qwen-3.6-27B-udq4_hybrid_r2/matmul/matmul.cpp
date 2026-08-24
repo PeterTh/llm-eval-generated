@@ -220,6 +220,10 @@ int main(int argc, char** argv)
                cudaMemcpyDeviceToHost);
 
     const double t1 = MPI_Wtime();
+    const double localTime = t1 - t0;
+    double maxTime = 0.0;
+    MPI_Reduce(&localTime, &maxTime, 1, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     cudaFree(d_A);
     cudaFree(d_B);
@@ -253,7 +257,7 @@ int main(int argc, char** argv)
     /* ---- rank 0: report, print, validate ---- */
     int exitCode = 0;
     if (rank == 0) {
-        const double tSecs = t1 - t0;
+        const double tSecs = maxTime;
         const double gflops = (2.0 * N * N * N) / tSecs / 1e9;
 
         printf("Computation time: %ld ms\n",

@@ -268,6 +268,9 @@ int main(int argc, char** argv) {
     }
 
     auto t1 = std::chrono::high_resolution_clock::now();
+    double local_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double ms = 0.0;
+    MPI_Reduce(&local_ms, &ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     /* ── copy results back from GPU ─────────────────────────────── */
     if (localSize > 0) {
@@ -307,8 +310,7 @@ int main(int argc, char** argv) {
 
     /* ── timing & results (rank 0) ──────────────────────────────── */
     if (rank == 0) {
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-        printf("Computation time: %ld ms\n", ms);
+        printf("Computation time: %.3f ms\n", ms);
         double ops = (double)numNodes * numNodes * numNodes;
         printf("Performance: %.3f GOPS\n", ops / (ms / 1000.0) / 1e9);
 

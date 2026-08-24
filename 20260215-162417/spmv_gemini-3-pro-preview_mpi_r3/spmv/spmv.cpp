@@ -296,14 +296,17 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const long localDuration = duration.count();
+    long globalDuration = 0;
+    MPI_Reduce(&localDuration, &globalDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     int exitCode = 0;
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", globalDuration);
         
         // Calculate performance metrics
-        const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
-        const double avgTime = duration.count() / static_cast<double>(iterations);
+        const double gflops = (2.0 * nItems * iterations) / (globalDuration / 1000.0) / 1e9;
+        const double avgTime = globalDuration / static_cast<double>(iterations);
         
         printf("Average time per iteration: %.3f ms\n", avgTime);
         printf("Performance: %.3f GFLOPS\n", gflops);

@@ -469,14 +469,17 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double t1 = MPI_Wtime();
+    const double local_elapsed = t1 - t0;
+    double global_elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        const double elapsed_ms = (t1 - t0) * 1000.0;
+        const double elapsed_ms = global_elapsed * 1000.0;
         printf("Computation time: %.3f ms\n", elapsed_ms);
 
         const double gridSize = static_cast<double>(nx) * static_cast<double>(ny) * static_cast<double>(nz);
         const double cellUpdates = gridSize * static_cast<double>(iterations);
-        const double mcups = cellUpdates / ((t1 - t0)) / 1e6;
+        const double mcups = cellUpdates / global_elapsed / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

@@ -58,7 +58,7 @@ int main(int argc,char** argv) {
         die_cuda(cudaMemcpy(local.data(),dl,local.size()*sizeof(Body),cudaMemcpyDeviceToHost),"copy back");
         MPI_Allgatherv(local.data(),counts[rank],MPI_BYTE,all.data(),counts.data(),displs.data(),MPI_BYTE,MPI_COMM_WORLD);
     }
-    cudaEventRecord(finish); cudaEventSynchronize(finish); float ms=0; cudaEventElapsedTime(&ms,start,finish); cudaFree(da); cudaFree(dl);
-    if(!rank){printf("N-Body Simulation\nNumber of bodies: %d\nNumber of steps: %d\nValidation: %s\nSimulation time: %.0f ms\n",n,steps,val?"enabled":"disabled",ms); if(results){std::vector<double>d;d.reserve(n*6);for(auto&x:all){d.insert(d.end(),{x.pos.x,x.pos.y,x.pos.z,x.vel.x,x.vel.y,x.vel.z});}print_results(d,"Bodies");} if(val){printf("Final energy: %.6f\nValidation: %s\n",energy(all),validateSimulation(all)?"PASSED":"FAILED");}}
+    cudaEventRecord(finish); cudaEventSynchronize(finish); float ms=0; cudaEventElapsedTime(&ms,start,finish); float global_ms=0; MPI_Reduce(&ms,&global_ms,1,MPI_FLOAT,MPI_MAX,0,MPI_COMM_WORLD); cudaFree(da); cudaFree(dl);
+    if(!rank){printf("N-Body Simulation\nNumber of bodies: %d\nNumber of steps: %d\nValidation: %s\nSimulation time: %.0f ms\n",n,steps,val?"enabled":"disabled",global_ms); if(results){std::vector<double>d;d.reserve(n*6);for(auto&x:all){d.insert(d.end(),{x.pos.x,x.pos.y,x.pos.z,x.vel.x,x.vel.y,x.vel.z});}print_results(d,"Bodies");} if(val){printf("Final energy: %.6f\nValidation: %s\n",energy(all),validateSimulation(all)?"PASSED":"FAILED");}}
     MPI_Finalize(); return 0;
 }

@@ -144,12 +144,13 @@ int main(int argc, char** argv) {
     }
     cudaCheck(cudaMemcpy(host.data(),dCold+plane,host.size()*sizeof(double),cudaMemcpyDeviceToHost),"final D2H");
     const auto end=std::chrono::steady_clock::now(); const double seconds=std::chrono::duration<double>(end-start).count();
+    double maxSeconds=0.0; MPI_Reduce(&seconds,&maxSeconds,1,MPI_DOUBLE,MPI_MAX,0,activeComm);
     if (rank==0) result.resize(nx*ny*nz);
     std::vector<int> counts(ranks), displs(ranks); for(int r=0;r<ranks;++r){ const size_t n=base+(static_cast<size_t>(r)<rem); counts[r]=static_cast<int>(n*plane); displs[r]=static_cast<int>((static_cast<size_t>(r)*base+std::min<size_t>(r,rem))*plane); }
     MPI_Gatherv(host.data(),static_cast<int>(host.size()),MPI_DOUBLE,rank==0?result.data():nullptr,counts.data(),displs.data(),MPI_DOUBLE,0,activeComm);
     if (rank==0) {
         printf("Cahn-Hilliard Phase Separation Benchmark\nGrid size: %zu x %zu x %zu\nTime steps: %d\nValidation: %s\n",nx,ny,nz,iterations,doValidate?"enabled":"disabled");
-        printf("Running hybrid MPI + OpenMP + CUDA simulation\nComputation time: %.0f ms\nPerformance: %.3f MCellUpdates/s\n",seconds*1000.0,(static_cast<double>(nx)*ny*nz*iterations)/seconds/1e6);
+        printf("Running hybrid MPI + OpenMP + CUDA simulation\nComputation time: %.0f ms\nPerformance: %.3f MCellUpdates/s\n",maxSeconds*1000.0,(static_cast<double>(nx)*ny*nz*iterations)/maxSeconds/1e6);
         if(printResults) print_results(result,"Concentration");
         if(doValidate) { printf("Validating result...\n"); const bool valid = validate(result); printf("Validation: %s\n",valid?"PASSED":"FAILED"); if(!valid) MPI_Abort(MPI_COMM_WORLD,1); }
     }

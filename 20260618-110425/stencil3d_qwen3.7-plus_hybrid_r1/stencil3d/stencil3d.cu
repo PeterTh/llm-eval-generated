@@ -314,6 +314,9 @@ int main(int argc, char** argv) {
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
     long long duration_ms = duration.count();
+    long long max_duration_ms = 0;
+    MPI_CHECK(MPI_Reduce(&duration_ms, &max_duration_ms, 1, MPI_LONG_LONG_INT, MPI_MAX,
+                         0, MPI_COMM_WORLD));
 
     // === Copy result from GPU to CPU ===
     size_t owned_size = nz_local * plane_size;
@@ -350,10 +353,10 @@ int main(int argc, char** argv) {
 
     // === Output results on rank 0 ===
     if (rank == 0) {
-        printf("Computation time: %lld ms\n", duration_ms);
+        printf("Computation time: %lld ms\n", max_duration_ms);
 
         double cellUpdates = (double)((nx - 2) * (ny - 2) * (nz - 2)) * (double)iterations;
-        double mcups = (duration_ms > 0) ? cellUpdates / (duration_ms / 1000.0) / 1e6 : 0.0;
+        double mcups = (max_duration_ms > 0) ? cellUpdates / (max_duration_ms / 1000.0) / 1e6 : 0.0;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
 
         if (printResults) {

@@ -402,9 +402,12 @@ int main(int argc, char** argv) {
         d_cnew_ptr = tmp;
     }
 
-    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     double end_time = MPI_Wtime();
     double elapsed = end_time - start_time;
+    double global_elapsed = 0.0;
+    MPI_CHECK(MPI_Reduce(&elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0,
+                         MPI_COMM_WORLD));
 
     // Copy result from device to host (owned slices only)
     std::vector<double> local_result(local_nz * slice_elems);
@@ -446,11 +449,11 @@ int main(int argc, char** argv) {
 
     // Report timing and performance from rank 0
     if (my_rank == 0) {
-        long duration_ms = (long)(elapsed * 1000.0);
+        long duration_ms = (long)(global_elapsed * 1000.0);
         printf("Computation time: %ld ms\n", duration_ms);
 
         double cellUpdates = (double)global_size * iterations;
-        double mcups = cellUpdates / elapsed / 1e6;
+        double mcups = cellUpdates / global_elapsed / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
 
         // Print results for external validation

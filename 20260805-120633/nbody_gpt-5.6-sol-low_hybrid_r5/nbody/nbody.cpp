@@ -172,9 +172,13 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize()); MPI_Barrier(MPI_COMM_WORLD);
     const auto end=std::chrono::high_resolution_clock::now(); CUDA_CHECK(cudaFree(deviceBodies));
 
+    const long localSimulationMs = (long)std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count();
+    long simulationMs = 0;
+    MPI_Reduce(&localSimulationMs, &simulationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     int rc=0;
     if(rank==0) {
-        std::printf("Simulation time: %ld ms\n", (long)std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count());
+        std::printf("Simulation time: %ld ms\n", simulationMs);
         if(results) {
             std::vector<double> data((std::size_t)n*6);
             #pragma omp parallel for schedule(static)

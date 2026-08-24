@@ -208,6 +208,9 @@ int main(int argc, char** argv) {
     
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    long long localDuration = duration.count();
+    long long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather all results on rank 0
     std::vector<int> recvCounts(nprocs);
@@ -229,8 +232,8 @@ int main(int argc, char** argv) {
                 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
-        printf("Options per second: %.0f\n", numOptions / (duration.count() / 1e6));
+        printf("Computation time: %.3f ms\n", maxDuration / 1000.0);
+        printf("Options per second: %.0f\n", numOptions / (maxDuration / 1e6));
         
         if (printResults) {
             print_results(results, "OptionPrices");

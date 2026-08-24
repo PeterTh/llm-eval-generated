@@ -213,7 +213,9 @@ int main(int argc, char** argv) {
     }
     
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    const long long localDurationUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    long long globalDurationUs = 0;
+    MPI_Reduce(&localDurationUs, &globalDurationUs, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
     
     // Gather all local results into a single vector on rank 0
     std::vector<double> results;
@@ -243,8 +245,8 @@ int main(int argc, char** argv) {
     
     // Output from rank 0 only
     if (rank == 0) {
-        printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
-        printf("Options per second: %.0f\n", numOptions / (duration.count() / 1e6));
+        printf("Computation time: %.3f ms\n", globalDurationUs / 1000.0);
+        printf("Options per second: %.0f\n", numOptions / (globalDurationUs / 1e6));
         
         // Print results for external validation
         if (printResults) {

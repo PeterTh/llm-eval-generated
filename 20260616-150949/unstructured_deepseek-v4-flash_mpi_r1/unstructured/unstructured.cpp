@@ -402,7 +402,9 @@ int main(int argc, char** argv) {
     runSimulationMPI(world, n_iters, my_rank, n_procs);
     const double end_time = MPI_Wtime();
     
-    const double duration_ms = (end_time - start_time) * 1000.0;
+    const double local_duration_ms = (end_time - start_time) * 1000.0;
+    double duration_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     
     // Gather results to rank 0 for output
     const int n_my_rows = world.n_my_rows;

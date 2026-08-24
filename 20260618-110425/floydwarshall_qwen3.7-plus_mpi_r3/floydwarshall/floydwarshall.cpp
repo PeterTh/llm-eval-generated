@@ -275,6 +275,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long duration_ms = duration.count();
+    long max_duration_ms = 0;
+    MPI_Reduce(&duration_ms, &max_duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather results to rank 0
     if (rank == 0) {
@@ -322,11 +325,11 @@ int main(int argc, char** argv) {
             }
         }
 
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", max_duration_ms);
 
         // Calculate operations per second (Floyd-Warshall has O(n³) complexity)
         double ops = (double)numNodes * numNodes * numNodes;
-        double gflops = ops / (duration.count() / 1000.0) / 1e9;
+        double gflops = ops / (max_duration_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GOPS\n", gflops);
 
         // Print results for external validation (integer hash-based)

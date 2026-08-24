@@ -285,6 +285,10 @@ int main(int argc, char** argv) {
     }
 
     const double tEnd = MPI_Wtime();
+    const double localElapsed = tEnd - tStart;
+    double globalElapsed = 0.0;
+    MPI_Reduce(&localElapsed, &globalElapsed, 1, MPI_DOUBLE, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     // -----------------------------------------------------------------------
     // Copy results back to host
@@ -333,10 +337,10 @@ int main(int argc, char** argv) {
     // Rank 0 prints results and optionally validates
     // -----------------------------------------------------------------------
     if (rank == 0) {
-        const double durationMs = (tEnd - tStart) * 1000.0;
+        const double durationMs = globalElapsed * 1000.0;
         printf("Computation time: %.3f ms\n", durationMs);
         printf("Options per second: %.0f\n",
-               numOptions / (tEnd - tStart));
+               numOptions / globalElapsed);
 
         if (printResults && !allResults.empty()) {
             print_results(allResults, "OptionPrices");

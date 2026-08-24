@@ -294,10 +294,12 @@ int main(int argc, char** argv) {
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
-    double endTime = MPI_Wtime();
+    double localElapsed = MPI_Wtime() - startTime;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&localElapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        double simTimeMs = (endTime - startTime) * 1000.0;
+        double simTimeMs = maxElapsed * 1000.0;
         printf("Simulation time: %.0f ms\n", simTimeMs);
     }
 

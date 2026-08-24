@@ -213,7 +213,9 @@ int main(int argc, char** argv) {
     }
     
     const double durationMs = (MPI_Wtime() - start) * 1000.0;
-    if (rank == 0) printf("Simulation time: %ld ms\n", static_cast<long>(durationMs));
+    double globalDurationMs = 0.0;
+    MPI_Reduce(&durationMs, &globalDurationMs, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) printf("Simulation time: %ld ms\n", static_cast<long>(globalDurationMs));
     
     // Print results for external validation
     if (printResults && rank == 0) {

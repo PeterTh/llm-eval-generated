@@ -316,6 +316,7 @@ int main(int argc, char** argv) {
         std::swap(d_in, d_out);
     }
 
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
     const double t1 = MPI_Wtime();
     double local_sec = t1 - t0;

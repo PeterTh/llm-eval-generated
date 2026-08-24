@@ -251,6 +251,8 @@ int main(int argc, char** argv) {
     }
     MPI_Barrier(MPI_COMM_WORLD);
     const double elapsed = MPI_Wtime() - startTime;
+    double globalElapsed = 0.0;
+    MPI_Reduce(&elapsed, &globalElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
 #pragma omp parallel num_threads(usedDevices)
     {
@@ -292,8 +294,8 @@ int main(int argc, char** argv) {
 
     int exitCode = 0;
     if (rank == 0) {
-        printf("Computation time: %.3f ms\n", elapsed * 1000.0);
-        printf("Options per second: %.0f\n", elapsed > 0.0 ? numOptions / elapsed : 0.0);
+        printf("Computation time: %.3f ms\n", globalElapsed * 1000.0);
+        printf("Options per second: %.0f\n", globalElapsed > 0.0 ? numOptions / globalElapsed : 0.0);
         if (printResults) print_results(results, "OptionPrices");
         if (validate) {
             printf("Validating results...\n");

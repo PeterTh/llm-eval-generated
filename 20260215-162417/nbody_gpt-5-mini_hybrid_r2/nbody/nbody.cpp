@@ -269,11 +269,14 @@ int main(int argc, char** argv) {
         // Velocities remain on device across iterations; if needed on host for printing gather later
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_duration_ms = duration.count();
+    long global_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &global_duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    if (rank == 0) printf("Simulation time: %ld ms\n", duration.count());
+    if (rank == 0) printf("Simulation time: %ld ms\n", global_duration_ms);
 
     // Gather final data to root for validation/printing
     std::vector<double> final_posx, final_posy, final_posz, final_velx, final_vely, final_velz;

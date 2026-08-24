@@ -289,14 +289,15 @@ int main(int argc, char** argv) {
         std::swap(cold, cnew);
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t_end = MPI_Wtime();
-    long elapsed_ms = (long)((t_end - t_start) * 1000.0);
+    double local_elapsed = MPI_Wtime() - t_start;
+    double elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
+        long elapsed_ms = (long)(elapsed * 1000.0);
         printf("Computation time: %ld ms\n", elapsed_ms);
         double cellUpdates = (double)(nx * ny * nz) * iterations;
-        double mcups = cellUpdates / (t_end - t_start) / 1e6;
+        double mcups = cellUpdates / elapsed / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

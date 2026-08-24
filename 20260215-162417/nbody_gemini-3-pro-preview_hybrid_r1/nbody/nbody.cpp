@@ -308,8 +308,11 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize();
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_duration_ms = duration.count();
+    long simulation_time_ms = 0;
+    MPI_Reduce(&local_duration_ms, &simulation_time_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     
-    if (rank == 0) printf("Simulation time: %ld ms\n", duration.count());
+    if (rank == 0) printf("Simulation time: %ld ms\n", simulation_time_ms);
     
     // Sync final state to bodies vector for validation/output
     // Need to gather velocities too

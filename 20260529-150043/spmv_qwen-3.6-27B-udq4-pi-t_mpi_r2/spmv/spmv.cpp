@@ -354,7 +354,9 @@ int main(int argc, char** argv) {
         double endTime = MPI_Wtime();
         MPI_Barrier(MPI_COMM_WORLD);
 
-        double duration = endTime - startTime;
+        double localDuration = endTime - startTime;
+        double duration;
+        MPI_Reduce(&localDuration, &duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
         // =========================================================================
         // Gather results back to rank 0
@@ -456,15 +458,18 @@ int main(int argc, char** argv) {
 
             // Synchronize all ranks before timing
             MPI_Barrier(MPI_COMM_WORLD);
-            MPI_Wtime(); // start timing
+            double startTime = MPI_Wtime();
 
             for (index_t iter = 0; iter < iterations; ++iter) {
                 spmvCpu(localVal.data(), localCols.data(), localRowDelimiters.data(),
                         h_vec.data(), localNumRows, localOut.data());
             }
 
-            MPI_Wtime(); // end timing
+            double endTime = MPI_Wtime();
             MPI_Barrier(MPI_COMM_WORLD);
+
+            double localDuration = endTime - startTime;
+            MPI_Reduce(&localDuration, nullptr, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
             // =========================================================================
             // Gather results back to rank 0

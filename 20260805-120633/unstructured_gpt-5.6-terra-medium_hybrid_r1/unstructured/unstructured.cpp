@@ -151,6 +151,9 @@ int main(int argc, char** argv) {
     }
     cudaCheck(cudaDeviceSynchronize(), "synchronize simulation", MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
+    const long long local_ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    long long ms = 0;
+    MPI_Reduce(&local_ms, &ms, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
 
     std::vector<val_t> local_energy(local_cells), local_flux(local_cells);
     if (rows) {
@@ -166,12 +169,11 @@ int main(int argc, char** argv) {
 
     cudaFree(d_energy); cudaFree(d_flux); cudaFree(d_next_energy); cudaFree(d_next_flux);
     if (!rank) {
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
         const double seconds = std::max(ms / 1000.0, 1.0e-9);
         const double geps = static_cast<double>(n) * n * std::max(iters - 1, 1) / seconds / 1.e9;
         std::printf("Unstructured Mesh Energy Transfer Benchmark\n============================================\n");
         std::printf("Grid size: %d x %d = %d elements\nIterations: %d\nMPI ranks: %d, OpenMP threads/rank: %d, CUDA devices: %d\n", n, n, n*n, iters, ranks, omp_get_max_threads(), devices);
-        std::printf("Computation time: %ld ms\nPerformance:\n  Time per iteration: %.4f ms\n  Elements/sec: %.4f GigaElements/s\n  Performance: %.4f GFLOPS\n  Result hash: %016lX\n", ms, static_cast<double>(ms) / std::max(iters - 1, 1), geps, geps * 22.0, hashElements(energy, flux));
+        std::printf("Computation time: %lld ms\nPerformance:\n  Time per iteration: %.4f ms\n  Elements/sec: %.4f GigaElements/s\n  Performance: %.4f GFLOPS\n  Result hash: %016lX\n", ms, static_cast<double>(ms) / std::max(iters - 1, 1), geps, geps * 22.0, hashElements(energy, flux));
         if (print_results_enabled) print_results(energy, "ElementEnergy");
         if (validate) {
             val_t energy_sum = 0, flux_sum = 0, lo = std::numeric_limits<val_t>::max(), hi = std::numeric_limits<val_t>::lowest();

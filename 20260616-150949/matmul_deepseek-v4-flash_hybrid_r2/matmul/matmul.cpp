@@ -270,6 +270,10 @@ int main(int argc, char** argv) {
     }
 
     double end_time = MPI_Wtime();
+    double local_elapsed = end_time - start_time;
+    double max_elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     // Gather the result matrix C back to rank 0
     std::vector<double> full_C;
@@ -283,15 +287,14 @@ int main(int argc, char** argv) {
 
     // Rank 0: report results and optionally validate
     if (rank == 0) {
-        double elapsed = end_time - start_time;
-        double elapsed_ms = elapsed * 1000.0;
+        double elapsed_ms = max_elapsed * 1000.0;
 
         printf("Computation time: %.0f ms\n", elapsed_ms);
 
         // Calculate GFLOPS: 2*N^3 operations / time_in_seconds / 1e9
         double gflops = (2.0 * static_cast<double>(N) *
                          static_cast<double>(N) * static_cast<double>(N)) /
-                        elapsed / 1e9;
+                        max_elapsed / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
 
         if (printResults) {

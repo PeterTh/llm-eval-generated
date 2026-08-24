@@ -178,16 +178,18 @@ int main(int argc, char** argv) {
     if (!rank) std::printf("Computing shortest paths...\n");
     MPI_Barrier(MPI_COMM_WORLD); const double start = MPI_Wtime();
     floydWarshall(localDist, localPath, n, firstRow, rank, ranks);
-    MPI_Barrier(MPI_COMM_WORLD); const double elapsed = MPI_Wtime() - start;
+    const double elapsed = MPI_Wtime() - start;
+    double globalElapsed = 0.0;
+    MPI_Reduce(&elapsed, &globalElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Gatherv(localDist.data(), counts[rank], MPI_UNSIGNED, rank ? nullptr : dist.data(),
                 counts.data(), offsets.data(), MPI_UNSIGNED, 0, MPI_COMM_WORLD);
     MPI_Gatherv(localPath.data(), counts[rank], MPI_UNSIGNED, rank ? nullptr : path.data(),
                 counts.data(), offsets.data(), MPI_UNSIGNED, 0, MPI_COMM_WORLD);
     int result = 0;
     if (!rank) {
-        const long ms = static_cast<long>(elapsed * 1000.0);
+        const long ms = static_cast<long>(globalElapsed * 1000.0);
         std::printf("Computation time: %ld ms\nPerformance: %.3f GOPS\n", ms,
-                    static_cast<double>(n) * n * n / elapsed / 1e9);
+                    static_cast<double>(n) * n * n / globalElapsed / 1e9);
         if (printResults) print_results_int(dist, "DistanceMatrix");
         if (validate) { std::printf("Validating result...\n"); result = validateResult(dist, n) ? 0 : 1; std::printf("Validation: %s\n", result ? "FAILED" : "PASSED"); }
     }

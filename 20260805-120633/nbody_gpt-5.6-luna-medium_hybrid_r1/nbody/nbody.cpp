@@ -181,7 +181,7 @@ int main(int argc, char** argv) {
     }
     cudaFree(deviceBodies);
     const auto end = std::chrono::high_resolution_clock::now();
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    const long long ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
     long long maxMs = 0;
     MPI_Reduce(&ms, &maxMs, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {

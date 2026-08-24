@@ -240,6 +240,10 @@ int main(int argc, char** argv) {
     }
 
     auto end = std::chrono::high_resolution_clock::now();
+    auto local_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long local_duration_ms = static_cast<long long>(local_duration.count());
+    long long max_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &max_duration_ms, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather all bodies back to rank 0 for output / validation
     std::vector<Body> gathered_bodies;
@@ -251,8 +255,7 @@ int main(int argc, char** argv) {
                 bytes_counts.data(), bytes_displs.data(), MPI_BYTE, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %lld ms\n", max_duration_ms);
 
         // Print results for external validation
         if (printResults) {

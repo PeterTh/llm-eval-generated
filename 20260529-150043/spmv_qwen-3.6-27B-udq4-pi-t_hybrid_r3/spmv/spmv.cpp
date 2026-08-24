@@ -586,6 +586,10 @@ int main(int argc, char** argv) {
     float milliseconds = 0;
     CUDA_CHECK(cudaEventElapsedTime(&milliseconds, startEvent, stopEvent));
 
+    float globalMilliseconds = 0;
+    MPI_CHECK(MPI_Reduce(&milliseconds, &globalMilliseconds, 1, MPI_FLOAT, MPI_MAX,
+                         0, MPI_COMM_WORLD));
+
     CUDA_CHECK(cudaEventDestroy(startEvent));
     CUDA_CHECK(cudaEventDestroy(stopEvent));
 
@@ -616,10 +620,10 @@ int main(int argc, char** argv) {
 
     // Calculate performance metrics (rank 0)
     if (rank == 0) {
-        const double gflops = (2.0 * nItems * iterations) / (milliseconds / 1000.0) / 1e9;
-        const double avgTime = milliseconds / static_cast<double>(iterations);
+        const double gflops = (2.0 * nItems * iterations) / (globalMilliseconds / 1000.0) / 1e9;
+        const double avgTime = globalMilliseconds / static_cast<double>(iterations);
 
-        printf("Computation time: %.2f ms\n", milliseconds);
+        printf("Computation time: %.2f ms\n", globalMilliseconds);
         printf("Average time per iteration: %.3f ms\n", avgTime);
         printf("Performance: %.3f GFLOPS\n", gflops);
 

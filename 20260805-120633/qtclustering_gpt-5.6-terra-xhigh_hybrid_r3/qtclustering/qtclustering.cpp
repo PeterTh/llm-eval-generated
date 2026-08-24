@@ -631,9 +631,12 @@ int main(int argc, char** argv) {
     std::vector<Cluster> clusters = qtClustering(points, threshold, mpi_rank, mpi_size);
     MPI_Barrier(MPI_COMM_WORLD);
     const double clustering_time = MPI_Wtime() - clustering_start;
+    double global_clustering_time = 0.0;
+    MPI_Reduce(&clustering_time, &global_clustering_time, 1, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
-        std::printf("Clustering time: %.3f ms\n", clustering_time * 1000.0);
+        std::printf("Clustering time: %.3f ms\n", global_clustering_time * 1000.0);
         std::printf("Clusters found: %zu\n", clusters.size());
 
         int total_clustered = 0;
@@ -650,7 +653,7 @@ int main(int argc, char** argv) {
         std::printf("Average cluster size: %.2f\n", average_cluster_size);
         std::printf("Maximum cluster size: %d\n", maximum_cluster_size);
 
-        const double elapsed_seconds = std::max(clustering_time, 1.0e-9);
+        const double elapsed_seconds = std::max(global_clustering_time, 1.0e-9);
         std::printf("Performance: %.1f clusters/s, %.1f points/s\n",
                     clusters.size() / elapsed_seconds, num_points / elapsed_seconds);
 

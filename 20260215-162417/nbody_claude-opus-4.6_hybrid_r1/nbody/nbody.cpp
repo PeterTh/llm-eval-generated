@@ -297,6 +297,10 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long localDurationMs = static_cast<long long>(duration.count());
+    long long simulationTimeMs = 0;
+    MPI_Reduce(&localDurationMs, &simulationTimeMs, 1, MPI_LONG_LONG_INT,
+               MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather final velocities for output/validation
     CUDA_CHECK(cudaMemcpy(h_vx + localStart, d_vx + localStart,
@@ -317,7 +321,7 @@ int main(int argc, char** argv) {
                    MPI_DOUBLE, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %lld ms\n", simulationTimeMs);
 
         if (printResults) {
             std::vector<double> bodyData;

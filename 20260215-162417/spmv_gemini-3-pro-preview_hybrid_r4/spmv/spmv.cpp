@@ -383,8 +383,10 @@ int main(int argc, char** argv) {
         cudaDeviceSynchronize();
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
+    const long local_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long duration = 0;
+    MPI_Reduce(&local_duration, &duration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     
     // Copy result back
     CUDA_CHECK(cudaMemcpy(local_out.data(), d_out, local_rows * sizeof(double), cudaMemcpyDeviceToHost));
@@ -411,12 +413,11 @@ int main(int argc, char** argv) {
                 0, MPI_COMM_WORLD);
 
     if (world_rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", duration);
         
         // Calculate performance metrics
-        const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
-        const double avgTime = duration.count() / static_cast<double>(iterations);
+        const double gflops = (2.0 * nItems * iterations) / (duration / 1000.0) / 1e9;
+        const double avgTime = duration / static_cast<double>(iterations);
         
         printf("Average time per iteration: %.3f ms\n", avgTime);
         printf("Performance: %.3f GFLOPS\n", gflops);

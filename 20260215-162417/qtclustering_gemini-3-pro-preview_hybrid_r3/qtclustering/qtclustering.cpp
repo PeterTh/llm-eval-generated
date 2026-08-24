@@ -558,10 +558,15 @@ int main(int argc, char** argv) {
     const std::vector<Cluster> clusters = qtClustering(points, threshold);
     
     auto cluster_end = std::chrono::high_resolution_clock::now();
+    const long long local_cluster_time_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(cluster_end - cluster_start).count();
+    long long global_cluster_time_ns = 0;
+    MPI_Reduce(&local_cluster_time_ns, &global_cluster_time_ns, 1,
+               MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
         auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-            cluster_end - cluster_start);
+            std::chrono::nanoseconds(global_cluster_time_ns));
         
         printf("Clustering time: %ld ms\n", cluster_time.count());
         printf("Clusters found: %zu\n", clusters.size());

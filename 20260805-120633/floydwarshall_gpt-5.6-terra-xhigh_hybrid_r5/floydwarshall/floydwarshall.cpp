@@ -501,6 +501,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     const double durationSeconds = MPI_Wtime() - start;
+    double globalDurationSeconds = 0.0;
+    MPI_CHECK(MPI_Reduce(&durationSeconds, &globalDurationSeconds, 1, MPI_DOUBLE, MPI_MAX, 0,
+                         MPI_COMM_WORLD));
 
     if (localElements != 0) {
         CUDA_CHECK(cudaMemcpy(localDistance.data(), deviceDistance,
@@ -532,10 +535,12 @@ int main(int argc, char** argv) {
             }
         }
 
-        const long long milliseconds = static_cast<long long>(durationSeconds * 1000.0);
+        const long long milliseconds = static_cast<long long>(globalDurationSeconds * 1000.0);
         std::printf("Computation time: %lld ms\n", milliseconds);
         const double operations = static_cast<double>(numNodes) * numNodes * numNodes;
-        const double gops = durationSeconds > 0.0 ? operations / durationSeconds / 1.0e9 : 0.0;
+        const double gops = globalDurationSeconds > 0.0
+                                ? operations / globalDurationSeconds / 1.0e9
+                                : 0.0;
         std::printf("Performance: %.3f GOPS\n", gops);
 
         if (printResults) {

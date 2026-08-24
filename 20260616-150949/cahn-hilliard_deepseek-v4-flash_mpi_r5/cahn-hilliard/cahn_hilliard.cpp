@@ -332,14 +332,17 @@ int main(int argc, char** argv) {
         }
     }
 
-    const double t_end        = MPI_Wtime();
-    const double elapsed_ms   = (t_end - t_start) * 1000.0;
+    const double t_end = MPI_Wtime();
+    const double local_elapsed_s = t_end - t_start;
+    double max_elapsed_s = 0.0;
+    MPI_Reduce(&local_elapsed_s, &max_elapsed_s, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
+        const double elapsed_ms = max_elapsed_s * 1000.0;
         printf("Computation time: %.0f ms\n", elapsed_ms);
 
         const double cell_updates = static_cast<double>(vol) * iterations;
-        const double mcups = cell_updates / (t_end - t_start) / 1.0e6;
+        const double mcups = cell_updates / max_elapsed_s / 1.0e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

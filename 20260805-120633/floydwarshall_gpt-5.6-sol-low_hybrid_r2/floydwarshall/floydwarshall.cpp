@@ -218,6 +218,9 @@ int main(int argc, char** argv) {
     floydWarshall(dDist, dPath, dPivot, hostPivot, n, firstRow, localRows, ranks);
     mpiCheck(MPI_Barrier(MPI_COMM_WORLD), "finish barrier");
     const double elapsed = MPI_Wtime() - start;
+    double globalElapsed = 0.0;
+    mpiCheck(MPI_Reduce(&elapsed, &globalElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD),
+             "reduce computation time");
     cudaCheck(cudaMemcpy(localDist.data(), dDist, localElements * sizeof(unsigned int), cudaMemcpyDeviceToHost), "download distances");
     mpiCheck(MPI_Gatherv(localDist.data(), counts[rank], MPI_UNSIGNED, rank == 0 ? fullDist.data() : nullptr,
                          counts.data(), displacements.data(), MPI_UNSIGNED, 0, MPI_COMM_WORLD), "gather matrix");
@@ -225,8 +228,8 @@ int main(int argc, char** argv) {
 
     int status = 0;
     if (rank == 0) {
-        std::printf("Computation time: %.3f ms\nPerformance: %.3f GOPS\n", elapsed * 1000.0,
-                    static_cast<double>(n) * n * n / elapsed / 1e9);
+        std::printf("Computation time: %.3f ms\nPerformance: %.3f GOPS\n", globalElapsed * 1000.0,
+                    static_cast<double>(n) * n * n / globalElapsed / 1e9);
         if (printResults) print_results_int(fullDist, "DistanceMatrix");
         if (validate) {
             std::printf("Validating result...\n");

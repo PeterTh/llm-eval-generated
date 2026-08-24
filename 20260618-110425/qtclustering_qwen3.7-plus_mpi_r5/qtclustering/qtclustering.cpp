@@ -401,6 +401,7 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double cluster_end = MPI_Wtime();
     long cluster_time_ms = static_cast<long>((cluster_end - cluster_start) * 1000.0);
+    MPI_Allreduce(MPI_IN_PLACE, &cluster_time_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
     
     if (rank == 0) {
         printf("Clustering time: %ld ms\n", cluster_time_ms);

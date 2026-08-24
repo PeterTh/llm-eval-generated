@@ -256,16 +256,18 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_duration_ms = static_cast<long>(duration.count());
+    long duration_ms = 0;
 
-    // Synchronize timing across ranks
-    MPI_Barrier(MPI_COMM_WORLD);
+    // Aggregate timing across ranks
+    MPI_Allreduce(&local_duration_ms, &duration_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     // Calculate performance metrics (use global grid size)
     double cellUpdates = (double)((nx - 2) * (ny - 2) * (nz - 2)) * iterations;
-    double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
+    double mcups = cellUpdates / (duration_ms / 1000.0) / 1e6;
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", duration_ms);
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

@@ -117,11 +117,13 @@ int main(int argc, char** argv) {
     const double start = MPI_Wtime();
     const bool success = choleskyDecomposition(local, n, first, local_rows, rank, size);
     const double elapsed = MPI_Wtime() - start;
+    double max_elapsed;
+    MPI_Allreduce(&elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     int ok = success ? 1 : 0; MPI_Allreduce(MPI_IN_PLACE, &ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     if (!ok) { if (rank == 0) std::printf("Cholesky decomposition failed\n"); MPI_Finalize(); return 1; }
     std::vector<double> result;
     if (rank == 0) result.resize(n*n);
     MPI_Gatherv(local.data(), counts[rank], MPI_DOUBLE, rank == 0 ? result.data() : nullptr, counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    if (rank == 0) { const double time = elapsed; std::printf("Computation time: %.0f ms\nPerformance: %.3f GFLOPS\n", time*1000.0, (n*n*n/3.0)/time/1e9); if (printResults) print_results(result, "CholeskyL"); if (validate) { std::printf("Validating result...\nValidation: %s\n", validateCholesky(result, original, n) ? "PASSED" : "FAILED"); } }
+    if (rank == 0) { const double time = max_elapsed; std::printf("Computation time: %.0f ms\nPerformance: %.3f GFLOPS\n", time*1000.0, (n*n*n/3.0)/time/1e9); if (printResults) print_results(result, "CholeskyL"); if (validate) { std::printf("Validating result...\nValidation: %s\n", validateCholesky(result, original, n) ? "PASSED" : "FAILED"); } }
     MPI_Finalize(); return 0;
 }

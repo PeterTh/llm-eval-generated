@@ -296,8 +296,10 @@ int main(int argc, char** argv) {
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
+    double localDurationMs = std::chrono::duration<double, std::milli>(end - start).count();
+    double durationMs = 0.0;
+    MPI_Reduce(&localDurationMs, &durationMs, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Copy results back from GPU
     CUDA_CHECK(cudaMemcpy(localDist.data(), d_dist, localSize, cudaMemcpyDeviceToHost));
@@ -328,11 +330,10 @@ int main(int argc, char** argv) {
     }
 
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %.3f ms\n", durationMs);
 
         double ops = (double)numNodes * numNodes * numNodes;
-        double gflops = ops / (duration.count() / 1000.0) / 1e9;
+        double gflops = ops / (durationMs / 1000.0) / 1e9;
         printf("Performance: %.3f GOPS\n", gflops);
 
         if (printResults) {

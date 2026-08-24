@@ -324,6 +324,11 @@ int main(int argc, char** argv) {
     }
 
     auto end = std::chrono::high_resolution_clock::now();
+    long long localDurationMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long durationMs = 0;
+    MPI_Reduce(&localDurationMs, &durationMs, 1, MPI_LONG_LONG,
+               MPI_MAX, 0, MPI_COMM_WORLD);
 
     // ----  Copy results back  ----------------------------------------------
     CUDA_CHECK(cudaMemcpy(h_localDist.data(), d_localDist,
@@ -346,14 +351,12 @@ int main(int argc, char** argv) {
 
     // ----  Report  ---------------------------------------------------------
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            end - start);
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", durationMs);
 
         double ops = static_cast<double>(numNodes) *
                      static_cast<double>(numNodes) *
                      static_cast<double>(numNodes);
-        double perf = ops / (static_cast<double>(duration.count()) / 1000.0) / 1.0e9;
+        double perf = ops / (static_cast<double>(durationMs) / 1000.0) / 1.0e9;
         printf("Performance: %.3f GOPS\n", perf);
 
         if (printResults) {

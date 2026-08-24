@@ -231,6 +231,10 @@ int main(int argc, char** argv) {
     }
     
     const double end_time = MPI_Wtime();
+    const double local_duration = end_time - start_time;
+    double duration = 0.0;
+    MPI_Reduce(&local_duration, &duration, 1, MPI_DOUBLE, MPI_MAX,
+               0, MPI_COMM_WORLD);
     
     // Gather results back to rank 0
     MPI_Gatherv(local_dist.data(), local_count, MPI_UNSIGNED,
@@ -244,7 +248,6 @@ int main(int argc, char** argv) {
     
     // Rank 0 handles all output and validation
     if (world_rank == 0) {
-        const double duration = end_time - start_time;
         printf("Computation time: %.0f ms\n", duration * 1000.0);
         
         // Floyd-Warshall has O(n³) complexity

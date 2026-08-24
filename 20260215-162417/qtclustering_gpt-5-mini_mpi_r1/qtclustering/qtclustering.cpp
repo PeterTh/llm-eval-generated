@@ -410,7 +410,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     double t1 = MPI_Wtime();
-    double elapsed_ms = (t1 - t0) * 1000.0;
+    double local_elapsed_ms = (t1 - t0) * 1000.0;
+    double elapsed_ms = 0.0;
+    MPI_Reduce(&local_elapsed_ms, &elapsed_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (world_rank == 0) {
         printf("Clustering time: %.0f ms\n", elapsed_ms);

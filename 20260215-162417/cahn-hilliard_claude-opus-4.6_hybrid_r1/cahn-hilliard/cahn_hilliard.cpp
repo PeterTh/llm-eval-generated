@@ -293,9 +293,10 @@ int main(int argc, char** argv) {
         std::swap(d_cold, d_cnew);
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto tend = std::chrono::high_resolution_clock::now();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(tend - tstart).count();
+    double local_ms = std::chrono::duration<double, std::milli>(tend - tstart).count();
+    double ms = 0.0;
+    MPI_Reduce(&local_ms, &ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Copy result back to host (skip ghost offset)
     CUDA_CHECK(cudaMemcpy(h_c.data(), d_cold + slice,
@@ -317,7 +318,7 @@ int main(int argc, char** argv) {
                 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", ms);
+        printf("Computation time: %.3f ms\n", ms);
         double cellUpdates = (double)vol * iterations;
         double mcups = cellUpdates / (ms / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);

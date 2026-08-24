@@ -231,10 +231,12 @@ int main(int argc, char** argv) {
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long localDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long durationMs = 0;
+    MPI_Reduce(&localDurationMs, &durationMs, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %lld ms\n", durationMs);
     }
 
     // Gather all bodies back to rank 0 for results / validation.

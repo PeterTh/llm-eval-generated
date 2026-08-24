@@ -244,9 +244,10 @@ int main(int argc, char **argv) {
     MPI_Barrier(MPI_COMM_WORLD); const double start=MPI_Wtime();
     const bool localSuccess=decompose(a,n,first,rows,rank,ranks,MPI_COMM_WORLD);
     MPI_Barrier(MPI_COMM_WORLD); const double elapsed=MPI_Wtime()-start;
+    double maxElapsed=0.0; MPI_Reduce(&elapsed,&maxElapsed,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     int success=localSuccess?1:0, allSuccess=0; MPI_Allreduce(&success,&allSuccess,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD);
     if(!allSuccess) { if(!rank) std::printf("Cholesky decomposition failed\n"); MPI_Finalize(); return 1; }
-    if(!rank) std::printf("Computation time: %ld ms\nPerformance: %.3f GFLOPS\n",static_cast<long>(elapsed*1000.0),(static_cast<double>(n)*n*n/3.0)/elapsed/1e9);
+    if(!rank) std::printf("Computation time: %ld ms\nPerformance: %.3f GFLOPS\n",static_cast<long>(maxElapsed*1000.0),(static_cast<double>(n)*n*n/3.0)/maxElapsed/1e9);
     if(printResults) { auto full=gatherMatrix(a,n,rank,ranks,MPI_COMM_WORLD); if(!rank) print_results(full,"CholeskyL"); }
     int valid=1;
     if(doValidate) { if(!rank) std::printf("Validating result...\n"); valid=validate(a,original,n,first,rows,rank,ranks,MPI_COMM_WORLD)?1:0; MPI_Bcast(&valid,1,MPI_INT,0,MPI_COMM_WORLD); if(!rank) std::printf("Validation: %s\n",valid?"PASSED":"FAILED"); }

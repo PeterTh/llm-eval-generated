@@ -225,9 +225,9 @@ int main(int argc, char** argv) {
     std::vector<double> recvBuf(recvCount);
 
     // Synchronize and time the distributed computation
-    MPI_Barrier(MPI_COMM_WORLD);
     std::chrono::high_resolution_clock::time_point start_time;
     if (world_rank == 0) start_time = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     // Scatter the serialized option parameters
     MPI_Scatterv(flatParams.empty() ? nullptr : flatParams.data(), counts.data(), displs.data(), MPI_DOUBLE,

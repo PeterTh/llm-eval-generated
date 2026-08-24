@@ -403,7 +403,9 @@ int main(int argc, char** argv) {
     double t0 = MPI_Wtime();
     runSimulation(world, n_iters, n_elems_root);
     MPI_Barrier(MPI_COMM_WORLD);
-    double duration_ms = (MPI_Wtime() - t0) * 1000.0;
+    const double local_duration_ms = (MPI_Wtime() - t0) * 1000.0;
+    double duration_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // ---- performance (rank 0) ----
     if (mpi_rank == 0) {

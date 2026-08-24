@@ -99,7 +99,9 @@ int main(int argc, char** argv) {
         MPI_Allgatherv(MPI_IN_PLACE,0,MPI_DATATYPE_NULL,vz.data(),counts.data(),displs.data(),MPI_DOUBLE,MPI_COMM_WORLD);
     }
     auto endtime=std::chrono::high_resolution_clock::now(); for(double* p:{dx,dy,dz,dvx,dvy,dvz}) cudaFree(p);
-    if(rank==0) { printf("N-Body Simulation\nNumber of bodies: %d\nNumber of steps: %d\nSimulation time: %ld ms\n",n,steps,(long)std::chrono::duration_cast<std::chrono::milliseconds>(endtime-start).count());
+    long local_time=(long)std::chrono::duration_cast<std::chrono::milliseconds>(endtime-start).count(), simulation_time=0;
+    MPI_Reduce(&local_time,&simulation_time,1,MPI_LONG,MPI_MAX,0,MPI_COMM_WORLD);
+    if(rank==0) { printf("N-Body Simulation\nNumber of bodies: %d\nNumber of steps: %d\nSimulation time: %ld ms\n",n,steps,simulation_time);
         if(results){std::vector<double>d;d.reserve(6*n);for(int i=0;i<n;++i){d.insert(d.end(),{x[i],y[i],z[i],vx[i],vy[i],vz[i]});}print_results(d,"Bodies");}
         if(validate){bool ok=valid(x,y,z,vx,vy,vz);if(ok)printf("Final energy: %.6f\nValidation: PASSED\n",energy(x,y,z,vx,vy,vz));else printf("Validation: FAILED\n"); MPI_Finalize();return ok?0:1;}}
     MPI_Finalize(); return 0;

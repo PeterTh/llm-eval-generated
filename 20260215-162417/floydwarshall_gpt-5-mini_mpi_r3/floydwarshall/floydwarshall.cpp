@@ -237,6 +237,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto t1 = std::chrono::high_resolution_clock::now();
+    long long local_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    long long duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather results back to rank 0
     MPI_Gatherv(localDist.data(), static_cast<int>(localDist.size()), MPI_UNSIGNED,
@@ -248,12 +251,11 @@ int main(int argc, char** argv) {
                 0, MPI_COMM_WORLD);
 
     if (world_rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0);
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", duration_ms);
 
         // Calculate operations per second
         double ops = (double)numNodes * numNodes * numNodes;
-        double gflops = ops / (duration.count() / 1000.0) / 1e9;
+        double gflops = ops / (duration_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GOPS\n", gflops);
 
         if (printResults) {

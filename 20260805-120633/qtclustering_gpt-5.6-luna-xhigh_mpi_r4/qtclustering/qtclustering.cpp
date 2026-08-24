@@ -405,7 +405,9 @@ int main(int argc, char** argv) {
         points, threshold, rank, process_count, MPI_COMM_WORLD);
 
     MPI_Barrier(MPI_COMM_WORLD);
-    const long cluster_time_ms = static_cast<long>((MPI_Wtime() - cluster_start) * 1000.0);
+    long cluster_time_ms = static_cast<long>((MPI_Wtime() - cluster_start) * 1000.0);
+    MPI_Allreduce(MPI_IN_PLACE, &cluster_time_ms, 1, MPI_LONG, MPI_MAX,
+                  MPI_COMM_WORLD);
 
     if (rank == 0) {
         printf("Clustering time: %ld ms\n", cluster_time_ms);

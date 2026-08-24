@@ -327,9 +327,12 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
 
+    double localDurationMs = std::chrono::duration<double, std::milli>(end - start).count();
+    double globalDurationMs = 0.0;
+    MPI_Reduce(&localDurationMs, &globalDurationMs, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %.3f ms\n", globalDurationMs);
     }
 
     // ---- Gather results to rank 0 for output and validation ----

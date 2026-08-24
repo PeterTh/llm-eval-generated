@@ -635,6 +635,7 @@ int main(int argc, char** argv) {
         const double clustering_start = MPI_Wtime();
         const std::vector<Cluster> clusters =
             qtClustering(points, threshold, engine, rank, world_size);
+        CUDA_CHECK(cudaDeviceSynchronize());
         const double local_elapsed = MPI_Wtime() - clustering_start;
         double elapsed = 0.0;
         MPI_CHECK(MPI_Reduce(&local_elapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0,

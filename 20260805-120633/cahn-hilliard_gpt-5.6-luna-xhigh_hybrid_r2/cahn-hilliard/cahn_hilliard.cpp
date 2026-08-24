@@ -462,7 +462,9 @@ int main(int argc, char** argv) {
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
     MPI_Barrier(comm);
-    const double elapsedSeconds = MPI_Wtime() - start;
+    const double localElapsedSeconds = MPI_Wtime() - start;
+    double elapsedSeconds = 0.0;
+    MPI_Reduce(&localElapsedSeconds, &elapsedSeconds, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
     if (rank == 0) {
         const long long durationMs = static_cast<long long>(elapsedSeconds * 1000.0);
         std::printf("Computation time: %lld ms\n", durationMs);

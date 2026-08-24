@@ -389,7 +389,10 @@ int main(int argc, char** argv) {
                                                        world_rank, world_size);
     
     const double cluster_end = MPI_Wtime();
-    const double cluster_time_ms = (cluster_end - cluster_start) * 1000.0;
+    const double local_cluster_time_ms = (cluster_end - cluster_start) * 1000.0;
+    double cluster_time_ms = 0.0;
+    MPI_Reduce(&local_cluster_time_ms, &cluster_time_ms, 1, MPI_DOUBLE,
+               MPI_MAX, 0, MPI_COMM_WORLD);
     
     // Only rank 0 prints results
     if (world_rank == 0) {

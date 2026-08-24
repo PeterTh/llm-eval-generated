@@ -466,7 +466,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
 
     size_t gridSize = nx * ny * nz;
-    double elapsed = t_end - t_start;
+    double local_elapsed = t_end - t_start;
+    double elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     double cellUpdates = static_cast<double>(gridSize) * iterations;
     double mcups = (elapsed > 0.0) ? cellUpdates / elapsed / 1e6 : 0.0;
 

@@ -299,12 +299,14 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double t_end = MPI_Wtime();
     long duration_ms = static_cast<long>((t_end - t_start) * 1000.0);
+    long max_duration_ms = 0;
+    MPI_Reduce(&duration_ms, &max_duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration_ms);
+        printf("Computation time: %ld ms\n", max_duration_ms);
 
         double cellUpdates = static_cast<double>(nx * ny * nz) * iterations;
-        double mcups = cellUpdates / (duration_ms / 1000.0) / 1e6;
+        double mcups = cellUpdates / (max_duration_ms / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

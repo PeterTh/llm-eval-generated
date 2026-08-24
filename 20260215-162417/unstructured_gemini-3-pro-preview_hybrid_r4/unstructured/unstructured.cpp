@@ -647,12 +647,13 @@ int main(int argc, char** argv) {
     
     runSimulation(world, n_iters);
     
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    double local_duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    double duration_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration_ms);
+        printf("Computation time: %.3f ms\n", duration_ms);
         
         // Calculate performance metrics
         const int n_measured_iters = std::max(n_iters, 1);

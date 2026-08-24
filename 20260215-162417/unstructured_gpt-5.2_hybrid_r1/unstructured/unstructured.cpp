@@ -524,11 +524,12 @@ int main(int argc, char** argv) {
 
     const double t0 = MPI_Wtime();
     runSimulationHybridMPI_CUDA(n_elems_root, n_iters, energy_global, flux_global, rank, size, MPI_COMM_WORLD);
-    MPI_Barrier(MPI_COMM_WORLD);
-    const double t1 = MPI_Wtime();
+    const double local_elapsed = MPI_Wtime() - t0;
+    double max_elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        const long duration_ms = static_cast<long>((t1 - t0) * 1000.0);
+        const long duration_ms = static_cast<long>(max_elapsed * 1000.0);
         printf("Computation time: %ld ms\n", duration_ms);
 
         // Build a World-like view for existing hashing/validation logic.

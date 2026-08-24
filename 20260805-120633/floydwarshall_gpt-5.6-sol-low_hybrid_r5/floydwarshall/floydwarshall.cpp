@@ -181,12 +181,13 @@ int main(int argc, char** argv) {
     if (!rank) std::printf("Computing shortest paths...\n");
     const double start = MPI_Wtime();
     distributedFloydWarshall(localDist, localPath, n, first, rank, ranks);
-    MPI_Barrier(MPI_COMM_WORLD);
     const double elapsed = MPI_Wtime() - start;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&elapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Gatherv(localDist.data(), counts[rank], MPI_UNSIGNED, rank ? nullptr : dist.data(), counts.data(), displs.data(), MPI_UNSIGNED, 0, MPI_COMM_WORLD);
     int ok = 0;
     if (!rank) {
-        std::printf("Computation time: %ld ms\nPerformance: %.3f GOPS\n", static_cast<long>(elapsed * 1000.0), static_cast<double>(n) * n * n / elapsed / 1e9);
+        std::printf("Computation time: %ld ms\nPerformance: %.3f GOPS\n", static_cast<long>(maxElapsed * 1000.0), static_cast<double>(n) * n * n / maxElapsed / 1e9);
         if (printResults) print_results_int(dist, "DistanceMatrix");
         if (validate) {
             std::printf("Validating result...\n");

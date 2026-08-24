@@ -217,6 +217,9 @@ int main(int argc, char** argv) {
     // Barrier after computation
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
+    double localDurationMs = std::chrono::duration<double, std::milli>(end - start).count();
+    double maxDurationMs = 0.0;
+    MPI_Reduce(&localDurationMs, &maxDurationMs, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     
     // Gather all results to rank 0
     std::vector<int> recvCounts(size);
@@ -238,9 +241,8 @@ int main(int argc, char** argv) {
                 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
-        printf("Options per second: %.0f\n", numOptions / (duration.count() / 1e6));
+        printf("Computation time: %.3f ms\n", maxDurationMs);
+        printf("Options per second: %.0f\n", numOptions / (maxDurationMs / 1000.0));
         
         // Print results for external validation
         if (printResults) {

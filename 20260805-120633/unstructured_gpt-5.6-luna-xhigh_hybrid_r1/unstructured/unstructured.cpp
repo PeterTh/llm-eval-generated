@@ -691,16 +691,14 @@ int main(int argc, char** argv) {
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     const auto start = std::chrono::high_resolution_clock::now();
     runSimulation(world, n_iters, rank, world_size, stream);
-    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     const auto end = std::chrono::high_resolution_clock::now();
 
+    const long long local_duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
+            .count();
     long long duration_ms = 0;
-    if (rank == 0) {
-        duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          end - start)
-                          .count();
-    }
-    MPI_CHECK(MPI_Bcast(&duration_ms, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD));
+    MPI_CHECK(MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG_LONG,
+                         MPI_MAX, 0, MPI_COMM_WORLD));
 
     const bool need_global_results = validate || printResults;
     std::vector<ElementDynamic> global_elements;

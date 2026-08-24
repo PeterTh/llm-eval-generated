@@ -215,8 +215,10 @@ int main(int argc, char** argv) {
         local_results[i] = blackScholes(options[local_start + i]);
     }
     
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
+    const double local_duration = std::chrono::duration<double>(end - start).count();
+    double max_duration = 0.0;
+    MPI_Reduce(&local_duration, &max_duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     
     // Gather all results to rank 0
     std::vector<double> results;
@@ -241,10 +243,10 @@ int main(int argc, char** argv) {
     
     // Rank 0 handles timing and output
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
         
-        printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
-        printf("Options per second: %.0f\n", numOptions / (duration.count() / 1e6));
+        printf("Computation time: %.3f ms\n", max_duration * 1000.0);
+        printf("Options per second: %.0f\n", numOptions / max_duration);
         
         // Print results for external validation
         if (printResults) {

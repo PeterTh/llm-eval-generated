@@ -424,6 +424,10 @@ int main(int argc, char** argv) {
     auto cluster_end = std::chrono::high_resolution_clock::now();
     auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
         cluster_end - cluster_start);
+    long local_cluster_time_ms = cluster_time.count();
+    long global_cluster_time_ms = 0;
+    MPI_Reduce(&local_cluster_time_ms, &global_cluster_time_ms, 1, MPI_LONG,
+               MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Calculate statistics and performance metrics
     int total_clustered = 0;
@@ -440,7 +444,7 @@ int main(int argc, char** argv) {
 
     // Print results (rank 0 only)
     if (rank == 0) {
-        printf("Clustering time: %ld ms\n", cluster_time.count());
+        printf("Clustering time: %ld ms\n", global_cluster_time_ms);
         printf("Clusters found: %zu\n", clusters.size());
         printf("Points clustered: %d / %d (%.1f%%)\n",
                total_clustered, num_points,
@@ -449,7 +453,7 @@ int main(int argc, char** argv) {
         printf("Maximum cluster size: %d\n", max_cluster_size);
 
         // Performance metrics
-        const double time_sec = cluster_time.count() / 1000.0;
+        const double time_sec = global_cluster_time_ms / 1000.0;
         if (time_sec > 0) {
             const double clusters_per_sec = clusters.size() / time_sec;
             const double points_per_sec = num_points / time_sec;

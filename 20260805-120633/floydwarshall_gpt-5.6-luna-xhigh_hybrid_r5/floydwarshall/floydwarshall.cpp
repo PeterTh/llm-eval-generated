@@ -452,12 +452,15 @@ int main(int argc, char** argv) {
     const auto end = std::chrono::high_resolution_clock::now();
     const auto duration =
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    const long long milliseconds = std::max<long long>(1, duration.count());
+    const long long localMilliseconds = std::max<long long>(1, duration.count());
+    long long globalMilliseconds = 0;
+    MPI_Reduce(&localMilliseconds, &globalMilliseconds, 1, MPI_LONG_LONG_INT,
+               MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        std::printf("Computation time: %lld ms\n", milliseconds);
+        std::printf("Computation time: %lld ms\n", globalMilliseconds);
         const double ops = static_cast<double>(numNodes) * numNodes * numNodes;
-        const double gflops = ops / (static_cast<double>(milliseconds) / 1000.0) / 1e9;
+        const double gflops = ops / (static_cast<double>(globalMilliseconds) / 1000.0) / 1e9;
         std::printf("Performance: %.3f GOPS\n", gflops);
     }
 

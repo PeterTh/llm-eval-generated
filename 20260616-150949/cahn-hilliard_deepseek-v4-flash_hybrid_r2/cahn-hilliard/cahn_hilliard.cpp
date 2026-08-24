@@ -426,12 +426,16 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
-    const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const double local_duration_ms =
+        std::chrono::duration<double, std::milli>(end - start).count();
+    double duration_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     if (mpi_rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %.3f ms\n", duration_ms);
         const double total_cells = (double)nx * ny * nz * iterations;
-        const double mcups = total_cells / (duration.count() / 1000.0) / 1e6;
+        const double mcups = total_cells / (duration_ms / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

@@ -251,9 +251,12 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long localDuration = static_cast<long long>(duration.count());
+    long long globalDuration = 0;
+    MPI_Reduce(&localDuration, &globalDuration, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %lld ms\n", globalDuration);
     }
     
     // Gather all bodies to rank 0 for final output

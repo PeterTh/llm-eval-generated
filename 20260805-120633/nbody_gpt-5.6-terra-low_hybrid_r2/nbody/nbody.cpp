@@ -188,7 +188,10 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
-    if (!rank) std::printf("Simulation time: %ld ms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    const long long localMilliseconds = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    long long simulationMilliseconds = 0;
+    MPI_Reduce(&localMilliseconds, &simulationMilliseconds, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (!rank) std::printf("Simulation time: %lld ms\n", simulationMilliseconds);
 
     if (!rank && printResults) {
         std::vector<double> data; data.reserve(static_cast<size_t>(numBodies) * STATE_WIDTH);

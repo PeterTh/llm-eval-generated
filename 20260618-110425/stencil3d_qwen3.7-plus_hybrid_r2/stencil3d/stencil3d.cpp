@@ -259,6 +259,8 @@ int main(int argc, char** argv) {
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start);
     long duration_ms = duration.count();
+    long global_duration_ms = 0;
+    MPI_Reduce(&duration_ms, &global_duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Copy result back to host (owned planes only, skip ghost plane 0)
     double* d_final = (iterations % 2 == 0) ? d_grid1 : d_grid2;
@@ -286,10 +288,10 @@ int main(int argc, char** argv) {
 
     // Output results on rank 0
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration_ms);
+        printf("Computation time: %ld ms\n", global_duration_ms);
 
         double cellUpdates = (double)((nx-2) * (ny-2) * (nz-2)) * iterations;
-        double mcups = (duration_ms > 0) ? cellUpdates / (duration_ms / 1000.0) / 1e6 : 0.0;
+        double mcups = (global_duration_ms > 0) ? cellUpdates / (global_duration_ms / 1000.0) / 1e6 : 0.0;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
 
         if (printResults) {

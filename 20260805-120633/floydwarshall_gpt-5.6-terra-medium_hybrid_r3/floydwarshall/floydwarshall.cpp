@@ -183,8 +183,10 @@ int main(int argc, char** argv) {
         checkCuda(cudaGetLastError(), "launch relaxPivot", rank);
     }
     checkCuda(cudaDeviceSynchronize(), "synchronize computation", rank);
-    checkMpi(MPI_Barrier(MPI_COMM_WORLD), "MPI_Barrier", rank);
     const auto end = std::chrono::steady_clock::now();
+    const long long localMilliseconds = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    long long milliseconds = 0;
+    checkMpi(MPI_Reduce(&localMilliseconds, &milliseconds, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD), "MPI_Reduce computation time", rank);
 
     checkCuda(cudaMemcpy(localDist.data(), deviceDist, localDist.size() * sizeof(unsigned int), cudaMemcpyDeviceToHost), "copy result from device", rank);
     checkCuda(cudaFree(devicePivot), "free pivot", rank);
@@ -204,7 +206,6 @@ int main(int argc, char** argv) {
             for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(rows); ++i)
                 for (size_t j = 0; j < n; ++j) globalDist[idx2(j, begin + static_cast<size_t>(i), n)] = packed[static_cast<size_t>(i) * n + j];
         }
-        const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
         std::printf("Computation time: %lld ms\nPerformance: %.3f GOPS\n", static_cast<long long>(milliseconds), static_cast<double>(n) * n * n / (static_cast<double>(milliseconds) / 1000.0) / 1e9);
         if (printResults) print_results_int(globalDist, "DistanceMatrix");
         if (validate) {

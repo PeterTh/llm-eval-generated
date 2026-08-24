@@ -145,13 +145,16 @@ int main(int argc, char** argv) {
             cudaCheck(cudaGetLastError(), "launching Floyd-Warshall kernel");
         }
     }
+    cudaCheck(cudaDeviceSynchronize(), "synchronizing final computation");
     const double elapsed = MPI_Wtime() - start;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&elapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     cudaCheck(cudaMemcpy(localDist.data(), dDist, localRows*n*sizeof(*dDist), cudaMemcpyDeviceToHost), "downloading final distances");
     MPI_Gatherv(localDist.data(), static_cast<int>(localRows*n), MPI_UNSIGNED, rank ? nullptr : packedDist.data(), counts.data(), displs.data(), MPI_UNSIGNED, 0, MPI_COMM_WORLD);
     if (!rank) {
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < n; ++i) for (size_t j = 0; j < n; ++j) canonicalDist[idx2(j,i,n)] = packedDist[i*n+j];
-        std::printf("Computation time: %.3f ms\nPerformance: %.3f GOPS\n", elapsed*1000.0, (double(n)*n*n)/elapsed/1e9);
+        std::printf("Computation time: %.3f ms\nPerformance: %.3f GOPS\n", maxElapsed*1000.0, (double(n)*n*n)/maxElapsed/1e9);
         if (printResults) print_results_int(canonicalDist, "DistanceMatrix");
         if (validate) {
             const bool valid = validateResult(canonicalDist, n);

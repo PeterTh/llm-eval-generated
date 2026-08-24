@@ -264,8 +264,11 @@ int main(int argc, char** argv) {
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
+    long long local_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long max_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &max_duration_ms, 1, MPI_LONG_LONG_INT,
+               MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Copy results back from GPU
     CUDA_CHECK(cudaMemcpy(local_dist.data(), d_dist, local_bytes, cudaMemcpyDeviceToHost));
@@ -284,12 +287,11 @@ int main(int argc, char** argv) {
 
     int ret = 0;
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", max_duration_ms);
 
         // Floyd-Warshall has O(n^3) complexity
         double ops = static_cast<double>(numNodes) * numNodes * numNodes;
-        double gflops = ops / (duration.count() / 1000.0) / 1e9;
+        double gflops = ops / (max_duration_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GOPS\n", gflops);
 
         // Print results for external validation (integer hash-based)

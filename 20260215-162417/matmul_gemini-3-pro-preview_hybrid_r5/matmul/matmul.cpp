@@ -213,6 +213,9 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    long long local_duration_us = duration.count();
+    long long max_duration_us = 0;
+    MPI_Reduce(&local_duration_us, &max_duration_us, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Copy result back
     CUDA_CHECK(cudaMemcpy(local_C.data(), d_C, local_rows * N * sizeof(double), cudaMemcpyDeviceToHost));
@@ -257,9 +260,9 @@ int main(int argc, char** argv) {
     }
 
     if (world_rank == 0) {
-        printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
+        printf("Computation time: %.3f ms\n", max_duration_us / 1000.0);
         
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000000.0) / 1e9;
+        double gflops = (2.0 * N * N * N) / (max_duration_us / 1000000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
         
         if (printResults) {

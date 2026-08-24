@@ -344,20 +344,15 @@ int main(int argc, char** argv) {
 
     double endTime = MPI_Wtime();
 
-    // Get the maximum time across all ranks (wall-clock parallel time)
-    double maxTime;
-    MPI_Reduce(&endTime, &maxTime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    double localElapsed = endTime - startTime;
 
-    // Also get min start time for accurate wall-clock duration
-    double minStart;
-    MPI_Reduce(&startTime, &minStart, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-
+    // Get the maximum complete elapsed time across all ranks
     double elapsedSec = 0.0;
+    MPI_Reduce(&localElapsed, &elapsedSec, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     double gflops = 0.0;
     double avgTime = 0.0;
 
     if (rank == 0) {
-        elapsedSec = maxTime - minStart;
         const long elapsedMs = static_cast<long>(elapsedSec * 1000.0);
         printf("Computation time: %ld ms\n", elapsedMs);
 

@@ -187,8 +187,10 @@ int main(int argc, char** argv) {
     }
     int bad = 0; int local_bad = local_ok ? 0 : 1; MPI_Allreduce(&local_bad, &bad, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     const double elapsed = MPI_Wtime() - start;
+    double global_elapsed = 0.0;
+    MPI_Reduce(&elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    if (rank == 0) std::printf("Computing Cholesky decomposition...\nComputation time: %.0f ms\nPerformance: %.3f GFLOPS\n", elapsed * 1000.0, (double)n * n * n / 3.0 / elapsed / 1e9);
+    if (rank == 0) std::printf("Computing Cholesky decomposition...\nComputation time: %.0f ms\nPerformance: %.3f GFLOPS\n", global_elapsed * 1000.0, (double)n * n * n / 3.0 / global_elapsed / 1e9);
     if (rank == 0) {
         for (const Tile& t : tiles) { int rows = std::min<int>(TILE_SIZE, n - size_t(t.row) * TILE_SIZE), cols = std::min<int>(TILE_SIZE, n - size_t(t.col) * TILE_SIZE); for (int r = 0; r < rows; ++r) for (int c = 0; c < cols; ++c) a[size_t(t.row)*TILE_SIZE*n + size_t(r)*n + t.col*TILE_SIZE+c] = t.x[size_t(r)*cols+c]; }
         for (int src = 1; src < nranks; ++src) { size_t count=0; for(int bi=0;bi<nb;++bi)for(int bj=0;bj<=bi;++bj)if((bi%nprow)*npcol+(bj%npcol)==src) count+=size_t(std::min<int>(TILE_SIZE,n-size_t(bi)*TILE_SIZE))*std::min<int>(TILE_SIZE,n-size_t(bj)*TILE_SIZE); std::vector<double> p(count); MPI_Recv(p.data(),(int)count,MPI_DOUBLE,src,8,MPI_COMM_WORLD,MPI_STATUS_IGNORE); size_t q=0; for(int bi=0;bi<nb;++bi)for(int bj=0;bj<=bi;++bj)if((bi%nprow)*npcol+(bj%npcol)==src){int rr=std::min<int>(TILE_SIZE,n-size_t(bi)*TILE_SIZE),cc=std::min<int>(TILE_SIZE,n-size_t(bj)*TILE_SIZE);for(int r=0;r<rr;++r)for(int c=0;c<cc;++c)a[size_t(bi)*TILE_SIZE*n+size_t(r)*n+bj*TILE_SIZE+c]=p[q++];} }

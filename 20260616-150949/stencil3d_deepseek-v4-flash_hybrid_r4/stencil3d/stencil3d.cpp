@@ -374,10 +374,12 @@ int main(int argc, char** argv) {
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
     const auto t_end = std::chrono::high_resolution_clock::now();
-    const auto duration =
-        std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start);
+    const long long local_duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+    long long duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1,
+               MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // ---- Gather results to rank 0 ----------------------------------------
     const Real* d_final = (iterations % 2 == 0) ? d_grid1 : d_grid2;
@@ -414,13 +416,13 @@ int main(int argc, char** argv) {
 
     // ---- Print timing & performance --------------------------------------
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", duration_ms);
 
         const double cell_updates =
             static_cast<double>((nx - 2) * (ny - 2) * (nz - 2)) *
             static_cast<double>(iterations);
         const double mcups = cell_updates /
-                             (static_cast<double>(duration.count()) / 1000.0) /
+                             (static_cast<double>(duration_ms) / 1000.0) /
                              1.0e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }

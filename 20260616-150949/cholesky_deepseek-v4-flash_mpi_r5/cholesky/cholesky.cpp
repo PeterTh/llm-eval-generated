@@ -237,7 +237,9 @@ int main(int argc, char** argv) {
     bool success = choleskyDecomposition(A, n, world_rank, world_size);
     const double t_end = MPI_Wtime();
     
-    const long duration_ms = static_cast<long>((t_end - t_start) * 1000.0);
+    const long local_duration_ms = static_cast<long>((t_end - t_start) * 1000.0);
+    long duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     
     if (!success) {
         if (world_rank == 0) {

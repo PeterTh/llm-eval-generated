@@ -197,6 +197,9 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
     MPI_Barrier(MPI_COMM_WORLD);
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDuration = static_cast<long>(duration.count());
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // ---- Gather distance matrix back to rank 0 ----
     if (rank == 0) {
@@ -205,10 +208,10 @@ int main(int argc, char** argv) {
                     globalDist.data(), counts.data(), displs.data(), MPI_UNSIGNED,
                     0, MPI_COMM_WORLD);
 
-        printf("Computation time: %ld ms\n", static_cast<long>(duration.count()));
+        printf("Computation time: %ld ms\n", maxDuration);
 
         double ops = static_cast<double>(numNodes) * numNodes * numNodes;
-        double gflops = ops / (duration.count() / 1000.0) / 1e9;
+        double gflops = ops / (maxDuration / 1000.0) / 1e9;
         printf("Performance: %.3f GOPS\n", gflops);
 
         if (printResults) {

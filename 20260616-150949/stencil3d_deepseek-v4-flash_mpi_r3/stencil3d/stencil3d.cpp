@@ -490,14 +490,17 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_duration_ms = static_cast<long>(duration.count());
+    long global_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &global_duration_ms, 1, MPI_LONG, MPI_MAX, 0, cart_comm);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", global_duration_ms);
 
         // Calculate performance metrics (using global interior cell count)
         double cellUpdates = static_cast<double>(nx - 2) * static_cast<double>(ny - 2) *
                              static_cast<double>(nz - 2) * static_cast<double>(iterations);
-        double mcups = cellUpdates / (static_cast<double>(duration.count()) / 1000.0) / 1e6;
+        double mcups = cellUpdates / (static_cast<double>(global_duration_ms) / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

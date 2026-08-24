@@ -180,7 +180,10 @@ int main(int argc, char** argv) {
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     const auto end = std::chrono::high_resolution_clock::now();
-    if (!rank) std::printf("Simulation time: %ld ms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    const long localElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long globalElapsedMs = 0;
+    MPI_Reduce(&localElapsedMs, &globalElapsedMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (!rank) std::printf("Simulation time: %ld ms\n", globalElapsedMs);
 
     if (printResults && !rank) { std::vector<double> data(6 * static_cast<std::size_t>(numBodies));
         #pragma omp parallel for schedule(static)

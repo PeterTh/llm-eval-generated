@@ -456,6 +456,11 @@ int main(int argc, char** argv) {
 
     CUDA_CHECK(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
+    long long local_duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long duration_ms = 0;
+    MPI_CHECK(MPI_Reduce(&local_duration_ms, &duration_ms, 1,
+                         MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD));
 
     // ---- copy result to host ----
     std::vector<double> h_local(local_alloc);
@@ -482,12 +487,10 @@ int main(int argc, char** argv) {
 
     // ---- report timing (rank 0) ----
     if (mpi_rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            end - start);
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", duration_ms);
         size_t gridSize = nx * ny * nz;
         double cellUpdates = (double)gridSize * iterations;
-        double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
+        double mcups = cellUpdates / (duration_ms / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

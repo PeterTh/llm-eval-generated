@@ -438,16 +438,19 @@ int main(int argc, char** argv) {
                   columnCommunicator);
     MPI_Barrier(MPI_COMM_WORLD);
     const double elapsedSeconds = MPI_Wtime() - start;
-    const long durationMilliseconds =
-        static_cast<long>(elapsedSeconds * 1000.0);
+    double maxElapsedSeconds = 0.0;
+    MPI_Reduce(&elapsedSeconds, &maxElapsedSeconds, 1, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     if (worldRank == 0) {
+        const long durationMilliseconds =
+            static_cast<long>(maxElapsedSeconds * 1000.0);
         std::printf("Computation time: %ld ms\n", durationMilliseconds);
         const double operations = static_cast<double>(numNodes) *
                                   static_cast<double>(numNodes) *
                                   static_cast<double>(numNodes);
-        const double gflops = elapsedSeconds > 0.0
-                                  ? operations / elapsedSeconds / 1.0e9
+        const double gflops = maxElapsedSeconds > 0.0
+                                  ? operations / maxElapsedSeconds / 1.0e9
                                   : 0.0;
         std::printf("Performance: %.3f GOPS\n", gflops);
     }

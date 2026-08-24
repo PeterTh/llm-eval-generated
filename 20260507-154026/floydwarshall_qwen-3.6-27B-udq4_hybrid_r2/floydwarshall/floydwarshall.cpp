@@ -316,6 +316,10 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize();
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long localDurationMs = static_cast<long long>(duration.count());
+    long long globalDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &globalDurationMs, 1, MPI_LONG_LONG, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     // ---- copy results back from GPU --------------------------------------
     cudaMemcpy(localDist.data(), d_dist, localSize * sizeof(unsigned int),
@@ -345,10 +349,10 @@ int main(int argc, char** argv) {
 
     // ---- rank-0 output / validation --------------------------------------
     if (mpiRank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", globalDurationMs);
 
         double ops = static_cast<double>(numNodes) * numNodes * numNodes;
-        double gflops = ops / (duration.count() / 1000.0) / 1e9;
+        double gflops = ops / (globalDurationMs / 1000.0) / 1e9;
         printf("Performance: %.3f GOPS\n", gflops);
 
         if (printResults) {

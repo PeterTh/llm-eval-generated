@@ -219,7 +219,9 @@ int main(int argc, char** argv) {
     floydWarshall(dist, path, numNodes);
     
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long maxDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &maxDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     
     // Since all processes have replicated the full matrix, synchronize results
     // Use MPI_Allreduce to ensure all processes have the minimum distances
@@ -231,12 +233,12 @@ int main(int argc, char** argv) {
     MPI_Bcast(path.data(), numNodes * numNodes, MPI_UNSIGNED, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", maxDurationMs);
         
         // Calculate operations per second
         // Floyd-Warshall has O(n³) complexity
         double ops = (double)numNodes * numNodes * numNodes;
-        double gflops = ops / (duration.count() / 1000.0) / 1e9;
+        double gflops = ops / (maxDurationMs / 1000.0) / 1e9;
         printf("Performance: %.3f GOPS\n", gflops);
         
         // Print results for external validation (integer hash-based)

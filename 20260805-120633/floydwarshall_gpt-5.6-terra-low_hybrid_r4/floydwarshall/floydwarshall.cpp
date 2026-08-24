@@ -169,10 +169,12 @@ int main(int argc, char** argv) {
     MPI_Gatherv(localDist.data(), static_cast<int>(localEntries), MPI_UNSIGNED, rank ? nullptr : globalDist.data(), counts.data(), displacements.data(), MPI_UNSIGNED, 0, MPI_COMM_WORLD);
     MPI_Gatherv(localPath.data(), static_cast<int>(localEntries), MPI_UNSIGNED, rank ? nullptr : globalPath.data(), counts.data(), displacements.data(), MPI_UNSIGNED, 0, MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
+    const long localMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long milliseconds = 0;
+    MPI_Reduce(&localMilliseconds, &milliseconds, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     CUDA_CHECK(cudaFree(devicePivot)); CUDA_CHECK(cudaFree(devicePath)); CUDA_CHECK(cudaFree(deviceDist));
     if (!rank) {
-        const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
         std::printf("Computation time: %ld ms\nPerformance: %.3f GOPS\n", milliseconds,
                     milliseconds ? static_cast<double>(n) * n * n / milliseconds / 1.0e6 : 0.0);
         if (printResults) print_results_int(globalDist, "DistanceMatrix");

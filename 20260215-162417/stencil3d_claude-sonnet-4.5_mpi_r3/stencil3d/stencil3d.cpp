@@ -227,11 +227,10 @@ int main(int argc, char** argv) {
     if (rank == 0) printf("Initializing grid...\n");
     initializeGrid(grid1, nx, ny, local_nz, z_offset, nz);
     
-    MPI_Barrier(MPI_COMM_WORLD);
-    
     // Run stencil iterations
     if (rank == 0) printf("Running stencil computation...\n");
     auto start = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
     
     for (int iter = 0; iter < iterations; ++iter) {
         if (iter % 2 == 0) {

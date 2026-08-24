@@ -213,7 +213,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     double t_end = MPI_Wtime();
-    double elapsed = t_end - t_start;
+    double local_elapsed = t_end - t_start;
+    double elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather result to root
     if (rank == 0) A_full.assign(n * n, 0.0);

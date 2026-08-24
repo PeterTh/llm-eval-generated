@@ -309,15 +309,17 @@ int main(int argc, char** argv) {
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const double local_duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    double duration_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %.3f ms\n", duration_ms);
 
         // Calculate performance using full grid cell count
         const size_t gridSize = nx * ny * nz;
         double cellUpdates = static_cast<double>(gridSize) * iterations;
-        double mcups = cellUpdates / (static_cast<double>(duration.count()) / 1000.0) / 1e6;
+        double mcups = cellUpdates / (duration_ms / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

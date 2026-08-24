@@ -167,6 +167,8 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD); const double start = MPI_Wtime();
     auto local = runSimulation(n, iters, part, rank, size);
     MPI_Barrier(MPI_COMM_WORLD); const double elapsed = MPI_Wtime() - start;
+    double global_elapsed = 0.0;
+    MPI_Reduce(&elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     std::vector<int> counts(size), displs(size);
     #pragma omp parallel for schedule(static)
@@ -176,7 +178,7 @@ int main(int argc, char** argv) {
                 rank ? nullptr : all.data(), counts.data(), displs.data(), MPI_BYTE, 0, MPI_COMM_WORLD);
     int rc = 0;
     if (!rank) {
-        const double ms = elapsed*1000., measured=std::max(iters-1,1), ge=(measured*n*n)/elapsed/1e9;
+        const double ms = global_elapsed*1000., measured=std::max(iters-1,1), ge=(measured*n*n)/global_elapsed/1e9;
         std::printf("Computation time: %.0f ms\nPerformance:\n  Time per iteration: %.4f ms\n  Elements/sec: %.4f GigaElements/s\n  Performance: %.4f GFLOPS\n  Result hash: %016lX\n\n",
                     ms, ms/measured, ge, ge*22., (unsigned long)computeHash(all));
         if (results) {

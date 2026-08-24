@@ -277,10 +277,13 @@ int main(int argc, char** argv) {
                       (duration.count() / 1000.0) / 1e9;
     }
     MPI_Reduce(&localGflops, &totalGflops, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    long localDurationMs = duration.count();
+    long maxDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &maxDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     
     // Print results only from rank 0
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", maxDurationMs);
         printf("Performance: %.3f GFLOPS\n", totalGflops);
         
         // Print results for external validation

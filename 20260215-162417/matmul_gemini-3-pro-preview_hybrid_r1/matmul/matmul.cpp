@@ -211,6 +211,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long local_duration_ms = static_cast<long long>(duration.count());
+    long long global_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &global_duration_ms, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Cleanup
     cublasDestroy(handle);
@@ -219,8 +222,8 @@ int main(int argc, char** argv) {
     cudaFree(d_C);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        printf("Computation time: %lld ms\n", global_duration_ms);
+        double gflops = (2.0 * N * N * N) / (global_duration_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
     }
 

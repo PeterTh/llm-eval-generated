@@ -197,13 +197,14 @@ int main(int argc, char **argv) {
     MPI_Barrier(MPI_COMM_WORLD); double start=MPI_Wtime();
     bool ok=distributed_cholesky(local,n,first,rows,rank);
     MPI_Barrier(MPI_COMM_WORLD); double elapsed=MPI_Wtime()-start;
+    double max_elapsed=0.0; MPI_Reduce(&elapsed,&max_elapsed,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     int all_ok=0, local_ok=ok; MPI_Allreduce(&local_ok,&all_ok,1,MPI_INT,MPI_LAND,MPI_COMM_WORLD);
     MPI_Gatherv(local.data(),counts[rank],MPI_DOUBLE,rank?nullptr:full.data(),counts.data(),displs.data(),MPI_DOUBLE,0,MPI_COMM_WORLD);
     if (!rank) {
         if (!all_ok) { fprintf(stderr,"Cholesky decomposition failed: matrix is not positive definite\n"); status=1; }
         else {
-            printf("Computation time: %.3f ms\nPerformance: %.3f GFLOPS\n",elapsed*1000.0,
-                   (static_cast<double>(n)*n*n/3.0)/elapsed/1e9);
+            printf("Computation time: %.3f ms\nPerformance: %.3f GFLOPS\n",max_elapsed*1000.0,
+                   (static_cast<double>(n)*n*n/3.0)/max_elapsed/1e9);
             if (results) print_results(full,"CholeskyL");
             if (do_validate) { printf("Validating result...\n"); bool valid=validate(full,original,n);
                 printf("Validation: %s\n",valid?"PASSED":"FAILED"); if(!valid) status=1; }

@@ -172,7 +172,11 @@ int main(int argc, char** argv) {
     matrixMultiplyTiled(A, B, C, local_M, N);
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const long long local_duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long max_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &max_duration_ms, 1, MPI_LONG_LONG_INT, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     // Precompute Gatherv counts/displacements for C (and A if needed)
     std::vector<int> counts(num_ranks);
@@ -203,10 +207,10 @@ int main(int argc, char** argv) {
     }
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", max_duration_ms);
 
         // Calculate GFLOPS (total operations / wall-clock time)
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        double gflops = (2.0 * N * N * N) / (max_duration_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
 
         // Print results for external validation

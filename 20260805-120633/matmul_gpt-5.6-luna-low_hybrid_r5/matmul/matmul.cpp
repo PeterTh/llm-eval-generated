@@ -94,11 +94,11 @@ int main(int argc, char** argv) {
     dim3 block(32,32), grid((N+31)/32,(rows+31)/32); matmulKernel<<<grid,block>>>(dA,dB,dC,rows,N);
     cudaCheck(cudaGetLastError(), "kernel launch"); cudaCheck(cudaDeviceSynchronize(), "kernel");
     cudaCheck(cudaMemcpy(C.data(),dC,C.size()*sizeof(double),cudaMemcpyDeviceToHost), "copy C");
-    const auto end=std::chrono::high_resolution_clock::now(); cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    const auto end=std::chrono::high_resolution_clock::now(); double localSec=std::chrono::duration<double>(end-start).count(), sec=0.0; MPI_Reduce(&localSec,&sec,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD); cudaFree(dA); cudaFree(dB); cudaFree(dC);
     std::vector<int> counts(world), displs(world); for(int r=0;r<world;++r){size_t rr=base+(r<static_cast<int>(extra)); counts[r]=static_cast<int>(rr*N); displs[r]=static_cast<int>((r*base+(r<static_cast<int>(extra)?r:extra))*N);}
     if(rank==0) allC.resize(N*N); MPI_Gatherv(C.data(),counts[rank],MPI_DOUBLE,rank==0?allC.data():nullptr,counts.data(),displs.data(),MPI_DOUBLE,0,MPI_COMM_WORLD);
     int validationStatus = 0;
-    if(rank==0){ double sec=std::chrono::duration<double>(end-start).count(); std::printf("Matrix Multiplication Benchmark\nMatrix size: %zu x %zu\nComputation time: %.0f ms\nPerformance: %.3f GFLOPS\n",N,N,sec*1000,2.0*N*N*N/sec/1e9); if(printResults) print_results(allC,"MatrixC"); if(validate) { const bool valid=validateResult(allA,B,allC,N); std::printf("Validation: %s\n",valid?"PASSED":"FAILED"); validationStatus=valid?0:1; } }
+    if(rank==0){ std::printf("Matrix Multiplication Benchmark\nMatrix size: %zu x %zu\nComputation time: %.0f ms\nPerformance: %.3f GFLOPS\n",N,N,sec*1000,2.0*N*N*N/sec/1e9); if(printResults) print_results(allC,"MatrixC"); if(validate) { const bool valid=validateResult(allA,B,allC,N); std::printf("Validation: %s\n",valid?"PASSED":"FAILED"); validationStatus=valid?0:1; } }
     MPI_Bcast(&validationStatus, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Finalize(); return validationStatus;
 }

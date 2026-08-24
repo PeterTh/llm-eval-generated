@@ -484,6 +484,11 @@ int main(int argc, char** argv) {
     const auto end = std::chrono::high_resolution_clock::now();
     const auto duration =
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const long long localDurationMilliseconds =
+        static_cast<long long>(duration.count());
+    long long globalDurationMilliseconds = 0;
+    MPI_CHECK(MPI_Reduce(&localDurationMilliseconds, &globalDurationMilliseconds,
+                         1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD));
 
     copyDeviceToHost(localDistance, localPath, buffers, rank);
     MPI_CHECK(MPI_Gatherv(localDistance.data(),
@@ -500,9 +505,9 @@ int main(int argc, char** argv) {
     releaseCudaBuffers(buffers, rank);
 
     if (rank == 0) {
-        std::printf("Computation time: %ld ms\n", duration.count());
+        std::printf("Computation time: %lld ms\n", globalDurationMilliseconds);
 
-        const double seconds = duration.count() / 1000.0;
+        const double seconds = globalDurationMilliseconds / 1000.0;
         const double operations = static_cast<double>(numNodes) *
                                   static_cast<double>(numNodes) *
                                   static_cast<double>(numNodes);

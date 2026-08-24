@@ -259,7 +259,9 @@ int main(int argc, char **argv) {
     const auto start = std::chrono::steady_clock::now();
     const auto clusters = qtClustering(points, threshold, rank, ranks);
     MPI_Barrier(MPI_COMM_WORLD);
-    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+    const double local_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+    double elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     int total=0, maximum=0;
 #pragma omp parallel for reduction(+:total) reduction(max:maximum) schedule(static)

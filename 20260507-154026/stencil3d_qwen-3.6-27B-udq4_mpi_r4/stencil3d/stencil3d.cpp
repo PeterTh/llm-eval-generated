@@ -358,13 +358,15 @@ int main(int argc, char** argv) {
 
     double t1 = MPI_Wtime();
     double dur_ms = (t1 - t0) * 1000.0;
+    double max_dur_ms;
+    MPI_Allreduce(&dur_ms, &max_dur_ms, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
     double cellUpdates =
         static_cast<double>((nx - 2) * (ny - 2) * (nz - 2)) * iterations;
-    double mcups = cellUpdates / (dur_ms / 1000.0) / 1e6;
+    double mcups = cellUpdates / (max_dur_ms / 1000.0) / 1e6;
 
     if (MPI_RANK == 0) {
-        printf("Computation time: %.0f ms\n", dur_ms);
+        printf("Computation time: %.0f ms\n", max_dur_ms);
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

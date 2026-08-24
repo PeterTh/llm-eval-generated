@@ -579,6 +579,7 @@ int main(int argc, char** argv) {
         std::printf("Computing SpMV...\n");
     }
     checkMpi(MPI_Barrier(MPI_COMM_WORLD), rank, "synchronizing benchmark start");
+    const double rankStartTime = MPI_Wtime();
 
     CudaFailure executionFailure;
 #pragma omp parallel for schedule(static) num_threads(static_cast<int>(workers.size()))
@@ -605,10 +606,7 @@ int main(int argc, char** argv) {
         abortRun(rank, "CUDA execution failed");
     }
 
-    double localElapsedMs = 0.0;
-    for (const GpuWorker& worker : workers) {
-        localElapsedMs = std::max(localElapsedMs, static_cast<double>(worker.elapsedMs));
-    }
+    const double localElapsedMs = (MPI_Wtime() - rankStartTime) * 1000.0;
     double elapsedMs = 0.0;
     checkMpi(MPI_Reduce(&localElapsedMs, &elapsedMs, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD), rank,
              "reducing benchmark time");

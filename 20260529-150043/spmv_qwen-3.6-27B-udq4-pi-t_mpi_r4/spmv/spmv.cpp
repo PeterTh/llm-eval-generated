@@ -311,6 +311,9 @@ int main(int argc, char** argv) {
     // Synchronize all ranks after timing
     MPI_Barrier(MPI_COMM_WORLD);
     double endTime = MPI_Wtime();
+    const double elapsed = endTime - startTime;
+    double globalElapsed = 0.0;
+    MPI_Reduce(&elapsed, &globalElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // =========================================================================
     // Gather results to rank 0
@@ -338,11 +341,10 @@ int main(int argc, char** argv) {
     // Performance reporting (rank 0)
     // =========================================================================
     if (rank == 0) {
-        const double elapsed = endTime - startTime;
-        const double gflops = (2.0 * nItems * iterations) / elapsed / 1e9;
-        const double avgTime = elapsed / static_cast<double>(iterations) * 1000.0;
+        const double gflops = (2.0 * nItems * iterations) / globalElapsed / 1e9;
+        const double avgTime = globalElapsed / static_cast<double>(iterations) * 1000.0;
 
-        printf("Computation time: %.3f s\n", elapsed);
+        printf("Computation time: %.3f s\n", globalElapsed);
         printf("Average time per iteration: %.3f ms\n", avgTime);
         printf("Performance: %.3f GFLOPS\n", gflops);
 

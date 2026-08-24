@@ -365,13 +365,12 @@ int main(int argc, char** argv) {
                 h_vec.data(), numRows, h_reference.data());
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    
     // Perform SpMV computation
     if (rank == 0) {
         printf("Computing SpMV...\n");
     }
-    
+
+    MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
 
     for (index_t iter = 0; iter < iterations; ++iter) {
@@ -379,9 +378,10 @@ int main(int argc, char** argv) {
                 h_vec.data(), numRows, localRowStart, localNumRows, local_out.data());
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    double localDurationMs = std::chrono::duration<double, std::milli>(end - start).count();
+    double durationMs = 0.0;
+    MPI_Reduce(&localDurationMs, &durationMs, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather results to rank 0
     MPI_Gatherv(local_out.data(), localNumRows, MPI_DOUBLE,
@@ -389,11 +389,11 @@ int main(int argc, char** argv) {
                 MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %.3f ms\n", durationMs);
         
         // Calculate performance metrics
-        const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
-        const double avgTime = duration.count() / static_cast<double>(iterations);
+        const double gflops = (2.0 * nItems * iterations) / (durationMs / 1000.0) / 1e9;
+        const double avgTime = durationMs / static_cast<double>(iterations);
         
         printf("Average time per iteration: %.3f ms\n", avgTime);
         printf("Performance: %.3f GFLOPS\n", gflops);

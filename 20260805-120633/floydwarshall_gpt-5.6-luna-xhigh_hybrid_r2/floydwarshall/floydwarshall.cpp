@@ -319,6 +319,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
     const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const long localDuration = static_cast<long>(duration.count());
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (localElements > 0) {
         CUDA_CHECK(cudaMemcpy(localDist.data(), deviceDist,
@@ -332,11 +335,11 @@ int main(int argc, char** argv) {
                 MPI_UNSIGNED, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", maxDuration);
 
         // Floyd-Warshall performs one min-plus operation per matrix element per k.
         const double ops = static_cast<double>(numNodes) * numNodes * numNodes;
-        const double seconds = duration.count() / 1000.0;
+        const double seconds = maxDuration / 1000.0;
         const double gflops = seconds > 0.0 ? ops / seconds / 1e9 : 0.0;
         printf("Performance: %.3f GOPS\n", gflops);
 

@@ -421,6 +421,9 @@ int main(int argc, char** argv) {
     
     double cluster_end = MPI_Wtime();
     double cluster_time_sec = cluster_end - cluster_start;
+    double max_cluster_time_sec = 0.0;
+    MPI_Reduce(&cluster_time_sec, &max_cluster_time_sec, 1, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
     
     // Calculate statistics and performance metrics (same on all ranks)
     int total_clustered = 0;
@@ -437,7 +440,7 @@ int main(int argc, char** argv) {
     
     // Only rank 0 prints results
     if (rank == 0) {
-        const long cluster_time_ms = static_cast<long>(cluster_time_sec * 1000.0);
+        const long cluster_time_ms = static_cast<long>(max_cluster_time_sec * 1000.0);
         
         printf("Clustering time: %ld ms\n", cluster_time_ms);
         printf("Clusters found: %zu\n", clusters.size());
@@ -448,8 +451,8 @@ int main(int argc, char** argv) {
         printf("Maximum cluster size: %d\n", max_cluster_size);
         
         // Performance metrics
-        const double clusters_per_sec = clusters.size() / cluster_time_sec;
-        const double points_per_sec = num_points / cluster_time_sec;
+        const double clusters_per_sec = clusters.size() / max_cluster_time_sec;
+        const double points_per_sec = num_points / max_cluster_time_sec;
         printf("Performance: %.1f clusters/s, %.1f points/s\n", 
                clusters_per_sec, points_per_sec);
         

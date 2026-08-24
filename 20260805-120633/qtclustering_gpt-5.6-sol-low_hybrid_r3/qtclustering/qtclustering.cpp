@@ -164,7 +164,7 @@ int main(int argc,char** argv) {
   std::vector<Point> points(n); if(!rank) generateSyntheticData(points,n);
   MPI_Bcast(points.data(),n*sizeof(Point),MPI_BYTE,0,MPI_COMM_WORLD);
   if(!rank) printf("QT Clustering Benchmark\nNumber of points: %d\nDistance threshold: %.2f\nValidation: %s\nMPI ranks: %d, OpenMP threads/rank: %d\n",n,threshold,validate?"enabled":"disabled",ranks,omp_get_max_threads());
-  MPI_Barrier(MPI_COMM_WORLD); double start=MPI_Wtime(); auto cs=qtClustering(points,rank,ranks,threshold); MPI_Barrier(MPI_COMM_WORLD); double sec=MPI_Wtime()-start;
+  MPI_Barrier(MPI_COMM_WORLD); double start=MPI_Wtime(); auto cs=qtClustering(points,rank,ranks,threshold); double local_sec=MPI_Wtime()-start,sec=0.; MPI_Reduce(&local_sec,&sec,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
   int rc=0;
   if(!rank) {
     int total=0,mx=0; for(auto& c:cs){total+=c.members.size();mx=std::max(mx,(int)c.members.size());}

@@ -243,12 +243,15 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDuration = static_cast<long>(duration.count());
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", maxDuration);
         
         double ops = static_cast<double>(numNodes) * numNodes * numNodes;
-        double gflops = ops / (static_cast<double>(duration.count()) / 1000.0) / 1.0e9;
+        double gflops = ops / (static_cast<double>(maxDuration) / 1000.0) / 1.0e9;
         printf("Performance: %.3f GOPS\n", gflops);
     }
     

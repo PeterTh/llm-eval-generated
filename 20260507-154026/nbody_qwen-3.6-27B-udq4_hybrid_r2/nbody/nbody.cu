@@ -248,6 +248,10 @@ int main(int argc, char** argv) {
 
     auto t1 = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0);
+    long long local_duration_ms = static_cast<long long>(duration.count());
+    long long simulation_time_ms = 0;
+    MPI_Reduce(&local_duration_ms, &simulation_time_ms, 1,
+               MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
 
     /* ---- Gather final state to rank 0 ---------------------------- */
     MPI_Gatherv(local_bodies.data(), local_n * body_sz, MPI_BYTE,
@@ -256,7 +260,7 @@ int main(int argc, char** argv) {
 
     /* ---- Output (rank 0 only) ------------------------------------ */
     if (rank == 0) {
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %lld ms\n", simulation_time_ms);
 
         if (printResults) {
             std::vector<double> bodyData;

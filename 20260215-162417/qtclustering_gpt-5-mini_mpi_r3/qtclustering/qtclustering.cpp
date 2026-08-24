@@ -341,10 +341,9 @@ int main(int argc, char** argv) {
     unclustered_indices.reserve(N);
     for (int i = 0; i < N; ++i) unclustered_indices.push_back(i);
 
-    // Start timing on rank 0 after synchronization
+    // Start timing on every rank after synchronization
     MPI_Barrier(MPI_COMM_WORLD);
-    std::chrono::high_resolution_clock::time_point cluster_start;
-    if (world_rank == 0) cluster_start = std::chrono::high_resolution_clock::now();
+    const auto cluster_start = std::chrono::high_resolution_clock::now();
 
     while (true) {
         // Locally prune clustered indices
@@ -415,18 +414,15 @@ int main(int argc, char** argv) {
         // Next iteration will prune clustered points
     }
 
-    // Finish timing
-    MPI_Barrier(MPI_COMM_WORLD);
-    std::chrono::high_resolution_clock::time_point cluster_end;
-    std::chrono::milliseconds cluster_time_ms(0);
-    if (world_rank == 0) {
-        cluster_end = std::chrono::high_resolution_clock::now();
-        cluster_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(cluster_end - cluster_start);
-    }
+    // Finish timing and obtain the maximum complete per-rank duration
+    const auto cluster_end = std::chrono::high_resolution_clock::now();
+    const long long local_cluster_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(cluster_end - cluster_start).count();
+    long long cluster_time_ms = 0;
+    MPI_Reduce(&local_cluster_time_ms, &cluster_time_ms, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Rank 0 prints results
     if (world_rank == 0) {
-        printf("Clustering time: %ld ms\n", cluster_time_ms.count());
+        printf("Clustering time: %lld ms\n", cluster_time_ms);
         printf("Clusters found: %zu\n", clusters.size());
 
         // Calculate statistics and performance metrics
@@ -445,7 +441,7 @@ int main(int argc, char** argv) {
         printf("Average cluster size: %.2f\n", avg_cluster_size);
         printf("Maximum cluster size: %d\n", max_cluster_size);
 
-        const double time_sec = cluster_time_ms.count() / 1000.0;
+        const double time_sec = cluster_time_ms / 1000.0;
         const double clusters_per_sec = clusters.size() / (time_sec > 0 ? time_sec : 1.0);
         const double points_per_sec = num_points / (time_sec > 0 ? time_sec : 1.0);
         printf("Performance: %.1f clusters/s, %.1f points/s\n", clusters_per_sec, points_per_sec);

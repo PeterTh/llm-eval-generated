@@ -193,6 +193,9 @@ int main(int argc, char** argv) {
     matrixMultiply(local_A, B, local_C, local_rows_s, N);
 
     const double end_time = MPI_Wtime();
+    const double local_elapsed = end_time - start_time;
+    double elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Barrier(MPI_COMM_WORLD);
 
     // ---- Gather results to root ----
@@ -207,7 +210,6 @@ int main(int argc, char** argv) {
 
     // ---- Root: output, validation ----
     if (rank == 0) {
-        const double elapsed = end_time - start_time;
         const long duration_ms = static_cast<long>(elapsed * 1000.0);
         printf("Computation time: %ld ms\n", duration_ms);
 

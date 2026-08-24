@@ -464,7 +464,7 @@ int main(int argc, char** argv) {
 
     const double local_sec = std::chrono::duration<double>(t1 - t0).count();
     double max_sec = 0.0;
-    MPI_Reduce(&local_sec, &max_sec, 1, MPI_DOUBLE, MPI_MAX, 0, cart_comm);
+    MPI_Allreduce(&local_sec, &max_sec, 1, MPI_DOUBLE, MPI_MAX, cart_comm);
 
     if (world_rank == 0) {
         printf("Computation time: %ld ms\n", static_cast<long>(max_sec * 1000.0));

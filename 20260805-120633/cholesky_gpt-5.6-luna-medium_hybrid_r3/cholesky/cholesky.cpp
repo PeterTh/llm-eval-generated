@@ -194,9 +194,11 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_diag)); CUDA_CHECK(cudaFree(d_col)); CUDA_CHECK(cudaFree(d_a));
     MPI_Allreduce(MPI_IN_PLACE, &success, 1, MPI_C_BOOL, MPI_LAND, MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
+    const double local_seconds = std::chrono::duration<double>(end - start).count();
+    double seconds = 0.0;
+    MPI_Reduce(&local_seconds, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!success) { if (rank == 0) printf("Cholesky decomposition failed\n"); MPI_Finalize(); return 1; }
     if (rank == 0) {
-        const double seconds = std::chrono::duration<double>(end - start).count();
         printf("Computation time: %ld ms\nPerformance: %.3f GFLOPS\n", static_cast<long>(seconds * 1000.0), (n * n * n / 3.0) / seconds / 1e9);
     }
     if (print_results_flag) {

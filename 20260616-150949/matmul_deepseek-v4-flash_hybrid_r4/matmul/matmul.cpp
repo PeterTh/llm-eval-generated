@@ -289,13 +289,17 @@ int main(int argc, char** argv) {
     matrixMultiply(A, B, C, N);
 
     auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDurationMs = static_cast<long>(duration.count());
+    long globalDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &globalDurationMs, 1, MPI_LONG, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", globalDurationMs);
 
         // Calculate GFLOPS: 2*N^3 operations divided by time in seconds, converted to GFLOPS
-        double elapsedSec = static_cast<double>(duration.count()) / 1000.0;
+        double elapsedSec = static_cast<double>(globalDurationMs) / 1000.0;
         double gflops = (2.0 * static_cast<double>(N) * N * N) / elapsedSec / 1.0e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
 

@@ -292,11 +292,15 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long localDurationMs = static_cast<long long>(duration.count());
+    long long maxDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &maxDurationMs, 1, MPI_LONG_LONG_INT,
+               MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Report timing and performance (root only)
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        printf("Computation time: %lld ms\n", maxDurationMs);
+        double gflops = (2.0 * N * N * N) / (maxDurationMs / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
     }
 

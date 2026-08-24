@@ -194,10 +194,12 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double end_time = MPI_Wtime();
     double duration_sec = end_time - start_time;
+    double global_duration_sec = 0.0;
+    MPI_Reduce(&duration_sec, &global_duration_sec, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
-        printf("Computation time: %.0f ms\n", duration_sec * 1000.0);
-        double gflops = (2.0 * N * N * N) / duration_sec / 1e9;
+        printf("Computation time: %.0f ms\n", global_duration_sec * 1000.0);
+        double gflops = (2.0 * N * N * N) / global_duration_sec / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
     }
 

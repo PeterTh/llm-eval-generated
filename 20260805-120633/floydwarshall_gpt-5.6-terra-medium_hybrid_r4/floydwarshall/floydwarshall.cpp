@@ -199,6 +199,9 @@ int main(int argc, char** argv) {
     cudaCheck(cudaDeviceSynchronize(), "CUDA synchronization");
     MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::steady_clock::now();
+    const double localSeconds = std::chrono::duration<double>(end - start).count();
+    double seconds = 0.0;
+    MPI_Reduce(&localSeconds, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     cudaCheck(cudaMemcpy(localDist.data(), dDist, localDist.size() * sizeof(unsigned int), cudaMemcpyDeviceToHost), "download distance");
     cudaFree(dDist); cudaFree(dPath); cudaFree(dPivot);
 
@@ -210,8 +213,7 @@ int main(int argc, char** argv) {
         #pragma omp parallel for schedule(static)
         for (long long i = 0; i < static_cast<long long>(n); ++i)
             for (size_t j = 0; j < n; ++j) global[idx2(j, static_cast<size_t>(i), n)] = packed[static_cast<size_t>(i) * n + j];
-        const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-        const double seconds = std::chrono::duration<double>(end - start).count();
+        const auto milliseconds = static_cast<long long>(seconds * 1000.0);
         std::printf("Computation time: %lld ms\nPerformance: %.3f GOPS\n", static_cast<long long>(milliseconds),
                     seconds > 0.0 ? static_cast<double>(n) * n * n / seconds / 1e9 : 0.0);
         if (printResults) print_results_int(global, "DistanceMatrix");

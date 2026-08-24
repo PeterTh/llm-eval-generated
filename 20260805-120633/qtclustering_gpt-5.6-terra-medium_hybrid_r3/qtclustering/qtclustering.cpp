@@ -239,8 +239,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     const auto start = std::chrono::high_resolution_clock::now();
     const std::vector<Cluster> clusters = qtClustering(points, threshold, rank, ranks);
-    MPI_Barrier(MPI_COMM_WORLD);
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - start).count();
+    const long local_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - start).count();
+    long elapsed = 0;
+    MPI_Reduce(&local_elapsed, &elapsed, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     int exit_code = 0;
     if (!rank) {
         printf("Clustering time: %ld ms\nClusters found: %zu\n", elapsed, clusters.size());

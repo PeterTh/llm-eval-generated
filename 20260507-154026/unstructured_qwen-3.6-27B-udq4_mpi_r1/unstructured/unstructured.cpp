@@ -373,10 +373,12 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
     MPI_Barrier(MPI_COMM_WORLD);
 
-    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    const long long local_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long duration_ms;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration_ms);
+        printf("Computation time: %lld ms\n", duration_ms);
 
         const int n_measured_iters = std::max(n_iters - 1, 1);
         const double time_per_iter = static_cast<double>(duration_ms) / n_measured_iters;

@@ -407,16 +407,19 @@ int main(int argc, char** argv) {
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
-    const auto duration =
+    MPI_Barrier(MPI_COMM_WORLD);
+    const auto localDuration =
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    const double elapsedSeconds =
-        std::chrono::duration<double>(end - start).count();
+    const long localDurationMilliseconds = localDuration.count();
+    long globalDurationMilliseconds = 0;
+    MPI_Reduce(&localDurationMilliseconds, &globalDurationMilliseconds, 1,
+               MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (g_mpiRank == 0) {
-        std::printf("Computation time: %ld ms\n", duration.count());
-        const double seconds = std::max(elapsedSeconds, 1.0e-9);
+        std::printf("Computation time: %ld ms\n", globalDurationMilliseconds);
+        const double seconds =
+            std::max(static_cast<double>(globalDurationMilliseconds) / 1000.0, 1.0e-9);
         const double ops = static_cast<double>(numNodes) * numNodes * numNodes;
         std::printf("Performance: %.3f GOPS\n", ops / seconds / 1.0e9);
     }

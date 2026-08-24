@@ -292,17 +292,19 @@ int main(int argc, char** argv) {
 
     floydWarshallHybrid(dist, path, numNodes, partition.local_rows, partition.row_offset, rank, size);
 
-    MPI_Barrier(MPI_COMM_WORLD);
     const double end = MPI_Wtime();
+    const double local_duration = end - start;
+    double global_duration = 0.0;
+    MPI_Reduce(&local_duration, &global_duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        const double duration_ms = (end - start) * 1000.0;
+        const double duration_ms = global_duration * 1000.0;
         printf("Computation time: %.3f ms\n", duration_ms);
 
         // Calculate operations per second
         // Floyd-Warshall has O(n³) complexity
         const double ops = static_cast<double>(numNodes) * numNodes * numNodes;
-        const double gflops = ops / (end - start) / 1e9;
+        const double gflops = ops / global_duration / 1e9;
         printf("Performance: %.3f GOPS\n", gflops);
     }
 

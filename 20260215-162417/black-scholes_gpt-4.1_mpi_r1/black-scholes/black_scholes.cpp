@@ -202,16 +202,16 @@ int main(int argc, char** argv) {
         results[i] = blackScholes(options[i]);
     }
     auto end_time = std::chrono::high_resolution_clock::now();
-    auto local_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+    double local_duration_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+    double global_duration_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &global_duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Reduce results to root
     MPI_Reduce(world_rank == 0 ? MPI_IN_PLACE : results.data(), results.data(), numOptions, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (world_rank == 0) {
-        auto total_end = std::chrono::high_resolution_clock::now();
-        auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(total_end - start_time);
-        printf("Computation time: %.3f ms\n", total_duration.count() / 1000.0);
-        printf("Options per second: %.0f\n", numOptions / (total_duration.count() / 1e6));
+        printf("Computation time: %.3f ms\n", global_duration_ms);
+        printf("Options per second: %.0f\n", numOptions / (global_duration_ms / 1000.0));
 
         // Print results for external validation
         if (printResults) {

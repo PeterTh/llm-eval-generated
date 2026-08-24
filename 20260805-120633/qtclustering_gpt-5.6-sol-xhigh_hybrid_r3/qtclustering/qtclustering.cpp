@@ -746,16 +746,22 @@ int main(int argc, char** argv) {
             qtClusteringHybrid(points, threshold, gpu, rank, world_size);
         MPI_Barrier(MPI_COMM_WORLD);
         const auto cluster_end = std::chrono::steady_clock::now();
+        const long long local_cluster_nanoseconds =
+            static_cast<long long>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    cluster_end - cluster_start).count());
+        long long global_cluster_nanoseconds = 0;
+        MPI_Reduce(&local_cluster_nanoseconds, &global_cluster_nanoseconds, 1,
+                   MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
         if (rank == 0) {
-            const auto cluster_milliseconds =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    cluster_end - cluster_start);
+            const long long cluster_milliseconds =
+                global_cluster_nanoseconds / 1000000LL;
             const double cluster_seconds =
-                std::chrono::duration<double>(cluster_end - cluster_start).count();
+                static_cast<double>(global_cluster_nanoseconds) / 1.0e9;
 
             std::printf("Clustering time: %lld ms\n",
-                        static_cast<long long>(cluster_milliseconds.count()));
+                        cluster_milliseconds);
             std::printf("Clusters found: %zu\n", clusters.size());
 
             int total_clustered = 0;

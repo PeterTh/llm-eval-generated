@@ -173,6 +173,10 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long localDurationMs = static_cast<long long>(duration.count());
+    long long maxDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &maxDurationMs, 1, MPI_LONG_LONG_INT, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     // Gather C rows back to rank 0
     std::vector<double> C_full(N * N);
@@ -182,12 +186,12 @@ int main(int argc, char** argv) {
 
     // Output results from rank 0 only
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", maxDurationMs);
 
         // Calculate GFLOPS
         double gflops = 0.0;
-        if (duration.count() > 0) {
-            gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        if (maxDurationMs > 0) {
+            gflops = (2.0 * N * N * N) / (maxDurationMs / 1000.0) / 1e9;
         }
         printf("Performance: %.3f GFLOPS\n", gflops);
 

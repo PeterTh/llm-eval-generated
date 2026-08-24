@@ -215,6 +215,10 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     double t1 = MPI_Wtime();
+    double local_elapsed = t1 - t0;
+    double global_elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     // Gather results to rank 0
     std::vector<int> recvcounts(nprocs);
@@ -233,7 +237,7 @@ int main(int argc, char** argv) {
                 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        double elapsed_us = (t1 - t0) * 1e6;
+        double elapsed_us = global_elapsed * 1e6;
         printf("Pricing options...\n");
         printf("Computation time: %.3f ms\n", elapsed_us / 1000.0);
         printf("Options per second: %.0f\n", numOptions / (elapsed_us / 1e6));

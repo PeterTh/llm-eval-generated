@@ -230,6 +230,7 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double endTime = MPI_Wtime();
     double duration = endTime - startTime;
+    MPI_Allreduce(MPI_IN_PLACE, &duration, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
     // Build receive counts and displacements for MPI_Gatherv
     std::vector<int> recvCounts(size);

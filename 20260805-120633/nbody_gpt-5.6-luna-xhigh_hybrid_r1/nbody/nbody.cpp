@@ -467,9 +467,12 @@ int main(int argc, char** argv) {
     }
     MPI_Barrier(MPI_COMM_WORLD);
     const double end = MPI_Wtime();
+    const double localElapsedSeconds = end - start;
+    double maxElapsedSeconds = 0.0;
+    MPI_Reduce(&localElapsedSeconds, &maxElapsedSeconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        const long long elapsedMilliseconds = static_cast<long long>((end - start) * 1000.0);
+        const long long elapsedMilliseconds = static_cast<long long>(maxElapsedSeconds * 1000.0);
         std::printf("Simulation time: %lld ms\n", elapsedMilliseconds);
     }
 

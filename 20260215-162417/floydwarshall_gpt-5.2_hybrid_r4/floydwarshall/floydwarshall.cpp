@@ -336,11 +336,14 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
 
+    const double local_duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    double duration_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %.3f ms\n", duration_ms);
         double ops = static_cast<double>(numNodes) * static_cast<double>(numNodes) * static_cast<double>(numNodes);
-        double gops = ops / (duration.count() / 1000.0) / 1e9;
+        double gops = ops / (duration_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GOPS\n", gops);
     }
 

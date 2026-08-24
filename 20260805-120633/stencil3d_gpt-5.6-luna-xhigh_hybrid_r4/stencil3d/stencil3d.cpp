@@ -560,7 +560,10 @@ int main(int argc, char** argv) {
 
         MPI_CHECK_COMM(MPI_Barrier(active_comm), active_comm);
         const double elapsed = MPI_Wtime() - start;
-        const long long milliseconds = static_cast<long long>(std::llround(elapsed * 1000.0));
+        double max_elapsed = 0.0;
+        MPI_CHECK_COMM(MPI_Reduce(&elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0,
+                                  active_comm), active_comm);
+        const long long milliseconds = static_cast<long long>(std::llround(max_elapsed * 1000.0));
 
         if (world_rank == 0) {
             std::printf("Computation time: %lld ms\n", milliseconds);
@@ -568,7 +571,7 @@ int main(int argc, char** argv) {
                                          static_cast<double>(options.ny - 2) *
                                          static_cast<double>(options.nz - 2) *
                                          static_cast<double>(options.iterations);
-            const double mcups = cell_updates / std::max(elapsed, 1.0e-12) / 1.0e6;
+            const double mcups = cell_updates / std::max(max_elapsed, 1.0e-12) / 1.0e6;
             std::printf("Performance: %.3f MCellUpdates/s\n", mcups);
         }
 

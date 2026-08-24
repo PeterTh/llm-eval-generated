@@ -411,8 +411,11 @@ int main(int argc, char** argv) {
     const std::vector<Cluster> clusters = qtClusteringMPI(points, threshold,
                                                           mpi_rank, mpi_size);
     
-    double cluster_end = MPI_Wtime();
-    long cluster_time_ms = static_cast<long>((cluster_end - cluster_start) * 1000.0);
+    const double local_cluster_time = MPI_Wtime() - cluster_start;
+    double global_cluster_time = 0.0;
+    MPI_Reduce(&local_cluster_time, &global_cluster_time, 1, MPI_DOUBLE,
+               MPI_MAX, 0, MPI_COMM_WORLD);
+    long cluster_time_ms = static_cast<long>(global_cluster_time * 1000.0);
     
     if (mpi_rank == 0) {
         printf("Clustering time: %ld ms\n", cluster_time_ms);

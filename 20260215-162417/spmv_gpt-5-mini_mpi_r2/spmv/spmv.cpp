@@ -274,6 +274,8 @@ int main(int argc, char** argv) {
     double t1 = MPI_Wtime();
 
     double duration_sec = t1 - t0;
+    double max_duration_sec = 0.0;
+    MPI_Reduce(&duration_sec, &max_duration_sec, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather local_out to root
     std::vector<int> rowsCountsInt(world_size);
@@ -289,9 +291,9 @@ int main(int argc, char** argv) {
                 0, MPI_COMM_WORLD);
 
     if (world_rank == 0) {
-        printf("Computation time: %.3f ms\n", duration_sec * 1000.0);
-        const double gflops = (2.0 * static_cast<double>(nItems) * iterations) / (duration_sec) / 1e9;
-        const double avgTime = (duration_sec * 1000.0) / static_cast<double>(iterations);
+        printf("Computation time: %.3f ms\n", max_duration_sec * 1000.0);
+        const double gflops = (2.0 * static_cast<double>(nItems) * iterations) / (max_duration_sec) / 1e9;
+        const double avgTime = (max_duration_sec * 1000.0) / static_cast<double>(iterations);
         printf("Average time per iteration: %.3f ms\n", avgTime);
         printf("Performance: %.3f GFLOPS\n", gflops);
 

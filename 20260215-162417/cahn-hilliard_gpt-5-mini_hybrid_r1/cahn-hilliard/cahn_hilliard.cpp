@@ -247,8 +247,7 @@ int main(int argc, char** argv) {
 
     // Start timing (global)
     MPI_Barrier(MPI_COMM_WORLD);
-    double t_start = 0.0;
-    if (rank == 0) t_start = MPI_Wtime();
+    double t_start = MPI_Wtime();
 
     const size_t inner_nz = local_nz - 2;
     const size_t inner_size = nx * ny * inner_nz;
@@ -286,16 +285,17 @@ int main(int argc, char** argv) {
         cold_local.swap(cnew_local);
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t_end = 0.0;
-    if (rank == 0) t_end = MPI_Wtime();
+    double t_end = MPI_Wtime();
+    double local_duration = t_end - t_start;
+    double global_duration = 0.0;
+    MPI_Reduce(&local_duration, &global_duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        double duration = (t_end - t_start) * 1000.0; // ms
+        double duration = global_duration * 1000.0; // ms
         printf("Computation time: %ld ms\n", (long)duration);
 
         double cellUpdates = (double) (nx * ny * nz) * iterations;
-        double mcups = cellUpdates / ((t_end - t_start)) / 1e6;
+        double mcups = cellUpdates / global_duration / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

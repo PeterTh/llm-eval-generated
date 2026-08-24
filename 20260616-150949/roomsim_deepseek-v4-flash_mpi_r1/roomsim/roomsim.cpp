@@ -1025,13 +1025,17 @@ int main(int argc, char** argv) {
     auto endDist = std::chrono::high_resolution_clock::now();
     auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
 
+    long localTotalTime = std::chrono::duration_cast<std::chrono::milliseconds>(
+        (endPre - startPre) + (endSim - startSim) + (endDist - startDist)).count();
+    long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     // Only rank 0 does output
     if (state.mpi_rank == 0) {
         printf("Distance computation time: %ld ms\n", distDuration);
         printf("\n");
 
         // Total time
-        long totalTime = preDuration + simDuration + distDuration;
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

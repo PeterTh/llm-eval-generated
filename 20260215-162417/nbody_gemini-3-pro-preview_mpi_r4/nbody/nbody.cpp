@@ -285,9 +285,11 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double end_time = MPI_Wtime();
     double duration_ms = (end_time - start_time) * 1000.0;
+    double max_duration_ms = 0.0;
+    MPI_Reduce(&duration_ms, &max_duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
-        printf("Simulation time: %ld ms\n", (long)duration_ms);
+        printf("Simulation time: %ld ms\n", (long)max_duration_ms);
     }
     
     // Gather results for output if requested

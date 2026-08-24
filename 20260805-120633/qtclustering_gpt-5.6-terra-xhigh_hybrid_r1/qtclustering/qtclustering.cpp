@@ -703,11 +703,13 @@ int main(int argc, char** argv) {
     const std::vector<Cluster> clusters = qtClusteringHybrid(points, threshold, context);
     MPI_Barrier(MPI_COMM_WORLD);
     const auto cluster_end = std::chrono::steady_clock::now();
+    const long local_cluster_time = static_cast<long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(cluster_end - cluster_start).count());
+    long cluster_time = 0;
+    MPI_Reduce(&local_cluster_time, &cluster_time, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (context.rank == 0) {
-        const auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-            cluster_end - cluster_start);
-        std::printf("Clustering time: %ld ms\n", static_cast<long>(cluster_time.count()));
+        std::printf("Clustering time: %ld ms\n", cluster_time);
         std::printf("Clusters found: %zu\n", clusters.size());
 
         int total_clustered = 0;
@@ -725,7 +727,7 @@ int main(int argc, char** argv) {
         std::printf("Average cluster size: %.2f\n", average_cluster_size);
         std::printf("Maximum cluster size: %d\n", max_cluster_size);
 
-        const double seconds = cluster_time.count() / 1000.0;
+        const double seconds = cluster_time / 1000.0;
         const double rate_denominator = (seconds > 0.0) ? seconds : 1.0e-9;
         std::printf("Performance: %.1f clusters/s, %.1f points/s\n",
                     clusters.size() / rate_denominator, num_points / rate_denominator);

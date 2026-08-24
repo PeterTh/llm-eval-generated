@@ -459,7 +459,10 @@ int main(int argc, char** argv) {
 
     CUDA_CHECK(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long global_duration = 0;
+    MPI_CHECK(MPI_Reduce(&local_duration, &global_duration, 1, MPI_LONG,
+                         MPI_MAX, 0, MPI_COMM_WORLD));
 
     // ------------------------------------------------------------------
     // Gather results to rank 0 for output / validation
@@ -500,10 +503,10 @@ int main(int argc, char** argv) {
     int exit_code = 0;
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", global_duration);
 
         double cellUpdates = (double)(nx * ny * nz_global) * iterations;
-        double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
+        double mcups = cellUpdates / (global_duration / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
 
         if (printResults) {

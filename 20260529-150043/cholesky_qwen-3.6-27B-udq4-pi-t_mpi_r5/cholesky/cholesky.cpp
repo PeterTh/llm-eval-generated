@@ -271,6 +271,10 @@ int main(int argc, char** argv) {
     // Synchronize after timing
     MPI_Barrier(MPI_COMM_WORLD);
 
+    long long local_duration_ms = static_cast<long long>(duration.count());
+    long long max_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &max_duration_ms, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     // Check success across all processes
     int success_all = success ? 1 : 0;
     int success_all_gathered = 0;
@@ -287,11 +291,11 @@ int main(int argc, char** argv) {
 
     // Calculate performance metrics (on rank 0)
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", max_duration_ms);
 
         // Calculate GFLOPS (approximately n^3/3 operations for Cholesky)
         double ops = (double)n * n * n / 3.0;
-        double gflops = ops / (duration.count() / 1000.0) / 1e9;
+        double gflops = ops / (max_duration_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
     }
 

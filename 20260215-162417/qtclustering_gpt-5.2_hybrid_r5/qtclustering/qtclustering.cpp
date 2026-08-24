@@ -609,13 +609,15 @@ int main(int argc, char** argv) {
 
     const std::vector<Cluster> clusters = qtClusteringHybridMPI(points, threshold, MPI_COMM_WORLD);
 
-    MPI_Barrier(MPI_COMM_WORLD);
     const double t1 = MPI_Wtime();
+    const double local_time_sec = t1 - t0;
+    double global_time_sec = 0.0;
+    MPI_Reduce(&local_time_sec, &global_time_sec, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     int rc = 0;
 
     if (rank == 0) {
-        const double ms = (t1 - t0) * 1000.0;
+        const double ms = global_time_sec * 1000.0;
         printf("Clustering time: %ld ms\n", (long)ms);
         printf("Clusters found: %zu\n", clusters.size());
 
@@ -634,7 +636,7 @@ int main(int argc, char** argv) {
         printf("Average cluster size: %.2f\n", avg_cluster_size);
         printf("Maximum cluster size: %d\n", max_cluster_size);
 
-        const double time_sec = (t1 - t0);
+        const double time_sec = global_time_sec;
         const double clusters_per_sec = time_sec > 0.0 ? (clusters.size() / time_sec) : 0.0;
         const double points_per_sec = time_sec > 0.0 ? ((double)num_points / time_sec) : 0.0;
         printf("Performance: %.1f clusters/s, %.1f points/s\n",

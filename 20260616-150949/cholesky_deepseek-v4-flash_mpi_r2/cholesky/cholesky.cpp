@@ -348,13 +348,17 @@ int main(int argc, char **argv) {
 
     const auto duration =
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const long localDurationMs = duration.count();
+    long maxDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &maxDurationMs, 1, MPI_LONG, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", maxDurationMs);
 
         // ~ n³/3 flops for Cholesky
         const double ops   = static_cast<double>(n) * n * n / 3.0;
-        const double secs  = duration.count() / 1000.0;
+        const double secs  = maxDurationMs / 1000.0;
         const double gflops = ops / secs / 1.0e9;
         printf("Performance:     %.3f GFLOPS\n", gflops);
         fflush(stdout);

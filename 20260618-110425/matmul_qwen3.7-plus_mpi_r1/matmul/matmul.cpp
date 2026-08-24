@@ -214,6 +214,9 @@ int main(int argc, char** argv) {
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
+    long long local_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+    long long max_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &max_duration_ms, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather C to rank 0
     std::vector<double> fullC;
@@ -240,9 +243,8 @@ int main(int argc, char** argv) {
 
     int result = 0;
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start);
-        printf("Computation time: %ld ms\n", duration.count());
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        printf("Computation time: %lld ms\n", max_duration_ms);
+        double gflops = (2.0 * N * N * N) / (max_duration_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
 
         if (printResults) {

@@ -947,6 +947,7 @@ int main(int argc, char** argv) {
     printf("\n");
 
     // Precomputation
+    auto startTotal = std::chrono::high_resolution_clock::now();
     auto startPre = std::chrono::high_resolution_clock::now();
 
     computeTimeDelays(state);
@@ -981,7 +982,9 @@ int main(int argc, char** argv) {
     printf("\n");
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long localTotalTime = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startTotal).count());
+    long totalTime = 0;
+    MPI_Allreduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
     printf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics

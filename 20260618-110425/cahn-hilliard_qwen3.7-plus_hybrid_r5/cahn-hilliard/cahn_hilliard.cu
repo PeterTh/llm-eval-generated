@@ -450,6 +450,8 @@ int main(int argc, char** argv) {
     MPI_CHECK(MPI_Barrier(comm));
     double end_time = MPI_Wtime();
     double elapsed_ms = (end_time - start_time) * 1000.0;
+    double global_elapsed_ms;
+    MPI_CHECK(MPI_Reduce(&elapsed_ms, &global_elapsed_ms, 1, MPI_DOUBLE, MPI_MAX, 0, comm));
 
     // Copy result from device to host (data region only, excluding ghost zones)
     size_t local_data_elems = nx * ny * local_nz;
@@ -486,10 +488,10 @@ int main(int argc, char** argv) {
     int return_code = 0;
 
     if (rank == 0) {
-        printf("Computation time: %.0f ms\n", elapsed_ms);
+        printf("Computation time: %.0f ms\n", global_elapsed_ms);
 
         double cellUpdates = (double)total_vol * iterations;
-        double mcups = cellUpdates / (elapsed_ms / 1000.0) / 1e6;
+        double mcups = cellUpdates / (global_elapsed_ms / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
 
         if (printResults) {

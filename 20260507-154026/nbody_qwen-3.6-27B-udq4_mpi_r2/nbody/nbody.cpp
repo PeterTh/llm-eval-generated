@@ -196,7 +196,10 @@ int main(int argc, char** argv) {
     }
 
     double t_end = MPI_Wtime();
-    double duration_ms = (t_end - t_start) * 1000.0;
+    double local_duration_ms = (t_end - t_start) * 1000.0;
+    double duration_ms;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     if (rank == 0) {
         printf("Simulation time: %.0f ms\n", duration_ms);

@@ -264,9 +264,13 @@ int main(int argc, char** argv) {
 
     checkMpi(MPI_Barrier(MPI_COMM_WORLD), "final MPI_Barrier", rank);
     const auto end = std::chrono::high_resolution_clock::now();
+    const long long localMs = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    long long maxMs = 0;
+    checkMpi(MPI_Reduce(&localMs, &maxMs, 1, MPI_LONG_LONG_INT, MPI_MAX, 0,
+                        MPI_COMM_WORLD), "timing MPI_Reduce", rank);
     if (rank == 0) {
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-        std::printf("Simulation time: %lld ms\n", static_cast<long long>(ms));
+        std::printf("Simulation time: %lld ms\n", maxMs);
 
         if (printResults) {
             std::vector<double> data(static_cast<size_t>(numBodies) * 6);

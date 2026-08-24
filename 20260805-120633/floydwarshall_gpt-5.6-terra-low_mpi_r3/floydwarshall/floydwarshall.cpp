@@ -217,13 +217,16 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long localDuration = static_cast<long long>(duration.count());
+    long long globalDuration = 0;
+    MPI_Allreduce(&localDuration, &globalDuration, 1, MPI_LONG_LONG, MPI_MAX, MPI_COMM_WORLD);
     
-    if (rank == 0) printf("Computation time: %ld ms\n", duration.count());
+    if (rank == 0) printf("Computation time: %lld ms\n", globalDuration);
     
     // Calculate operations per second
     // Floyd-Warshall has O(n³) complexity
     double ops = (double)numNodes * numNodes * numNodes;
-    double gflops = ops / (duration.count() / 1000.0) / 1e9;
+    double gflops = ops / (globalDuration / 1000.0) / 1e9;
     if (rank == 0) printf("Performance: %.3f GOPS\n", gflops);
 
     if (printResults || validate) {

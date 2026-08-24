@@ -208,6 +208,9 @@ int main(int argc, char** argv) {
     }
     mpiCheck(MPI_Barrier(MPI_COMM_WORLD), "post-simulation barrier");
     const double elapsed = MPI_Wtime() - start;
+    double max_elapsed = 0.0;
+    mpiCheck(MPI_Reduce(&elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD),
+             "reduce computation time");
 
     cudaCheck(cudaMemcpy(host.data() + n, device_a + n,
                          static_cast<size_t>(local_rows) * n * sizeof(ElementDynamic),
@@ -231,11 +234,11 @@ int main(int argc, char** argv) {
              "gather results");
 
     if (rank == 0) {
-        const double giga = iterations > 0 && elapsed > 0.0
-            ? (static_cast<double>(iterations) * n * n) / elapsed / 1e9 : 0.0;
-        std::printf("Computation time: %.3f ms\nPerformance:\n", elapsed * 1000.0);
+        const double giga = iterations > 0 && max_elapsed > 0.0
+            ? (static_cast<double>(iterations) * n * n) / max_elapsed / 1e9 : 0.0;
+        std::printf("Computation time: %.3f ms\nPerformance:\n", max_elapsed * 1000.0);
         std::printf("  Time per iteration: %.4f ms\n  Elements/sec: %.4f GigaElements/s\n  Performance: %.4f GFLOPS\n",
-                    iterations ? elapsed * 1000.0 / iterations : 0.0, giga, giga * 22.0);
+                    iterations ? max_elapsed * 1000.0 / iterations : 0.0, giga, giga * 22.0);
 
         uint64_t hash = 0;
         for (size_t i = 0; i < global.size(); ++i) {

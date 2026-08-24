@@ -222,13 +222,15 @@ int main(int argc, char** argv) {
         cudaFree(dOptions); cudaFree(dResults);
     }
     const double elapsed = MPI_Wtime() - start;
+    double globalElapsed = 0.0;
+    MPI_Reduce(&elapsed, &globalElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     std::vector<double> results(numOptions);
     std::vector<int> counts(world), displacements(world);
     const int localCount = static_cast<int>(options.size());
     MPI_Gather(&localCount, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
     if (rank == 0) for (int i = 1; i < world; ++i) displacements[i] = displacements[i-1] + counts[i-1];
     MPI_Gatherv(localResults.data(), localCount, MPI_DOUBLE, results.data(), counts.data(), displacements.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    if (rank == 0) printf("Computation time: %.3f ms\nOptions per second: %.0f\n", elapsed * 1000.0, numOptions / elapsed);
+    if (rank == 0) printf("Computation time: %.3f ms\nOptions per second: %.0f\n", globalElapsed * 1000.0, numOptions / globalElapsed);
     
     // Print results for external validation
     if (rank == 0 && printResults) {

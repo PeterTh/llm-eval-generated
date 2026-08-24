@@ -1641,8 +1641,11 @@ int main(int argc, char** argv) {
     destroyGPUContext(state.gpu);
 
     // Rank 0: report results
+    long localTotalTime = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        (endPre - startPre) + (endSim - startSim) + (endDist - startDist)).count());
+    long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (mpiRank == 0) {
-        long totalTime = preDuration + simDuration + distDuration;
         printf("Total computation time: %ld ms\n", totalTime);
 
         size_t n = state.numTriangles;

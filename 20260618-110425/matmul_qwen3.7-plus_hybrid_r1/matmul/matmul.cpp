@@ -246,6 +246,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long local_dur_ms = static_cast<long long>(duration.count());
+    long long dur_ms = 0;
+    MPI_Reduce(&local_dur_ms, &dur_ms, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Cleanup CUDA resources
     if (cublasH) {
@@ -261,7 +264,6 @@ int main(int argc, char** argv) {
     // Output results on rank 0
     int exitCode = 0;
     if (rank == 0) {
-        long long dur_ms = static_cast<long long>(duration.count());
         printf("Computation time: %lld ms\n", dur_ms);
 
         double gflops = (2.0 * static_cast<double>(N) * static_cast<double>(N) *

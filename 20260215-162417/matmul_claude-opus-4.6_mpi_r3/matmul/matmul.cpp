@@ -195,9 +195,10 @@ int main(int argc, char** argv) {
 
     matrixMultiplyLocal(local_A.data(), Bt.data(), local_C.data(), my_rows, N);
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long max_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &max_duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather C rows back to rank 0
     MPI_Gatherv(local_C.data(), static_cast<int>(my_rows * N), MPI_DOUBLE,
@@ -205,10 +206,10 @@ int main(int argc, char** argv) {
                 MPI_DOUBLE, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", max_duration_ms);
         
         // Calculate GFLOPS
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        double gflops = (2.0 * N * N * N) / (max_duration_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
         
         // Print results for external validation

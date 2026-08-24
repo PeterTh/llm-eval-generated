@@ -387,8 +387,12 @@ int main(int argc, char** argv) {
         std::swap(d_cold, d_cnew);
     }
 
-    auto end     = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    auto end = std::chrono::high_resolution_clock::now();
+    long long local_duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long global_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &global_duration_ms, 1, MPI_LONG_LONG_INT,
+               MPI_MAX, 0, MPI_COMM_WORLD);
 
     // ---- copy owned cells GPU -> host ----
     std::vector<double> local_data(local_nz * row_size);
@@ -419,10 +423,10 @@ int main(int argc, char** argv) {
 
     // ---- post-processing on rank 0 ----
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", global_duration_ms);
 
         double cellUpdates = static_cast<double>(gridSize) * iterations;
-        double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
+        double mcups = cellUpdates / (global_duration_ms / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
 
         if (printResults) {

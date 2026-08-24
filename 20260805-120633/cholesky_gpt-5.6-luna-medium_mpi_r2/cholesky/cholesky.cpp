@@ -187,6 +187,8 @@ int main(int argc, char** argv) {
     const int local_flag = local_success ? 1 : 0;
     MPI_Allreduce(&local_flag, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     const double elapsed = MPI_Wtime() - start;
+    double global_elapsed = 0.0;
+    MPI_Reduce(&elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!global_success) { MPI_Finalize(); return 1; }
 
     std::vector<int> counts(size), displacements(size);
@@ -202,8 +204,8 @@ int main(int argc, char** argv) {
         MPI_Gatherv(original.data(), counts[rank], MPI_DOUBLE, full_original.data(), counts.data(),
                     displacements.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (rank == 0) {
-        std::printf("Computation time: %.3f ms\n", elapsed * 1000.0);
-        std::printf("Performance: %.3f GFLOPS\n", (n * n * n / 3.0) / elapsed / 1e9);
+        std::printf("Computation time: %.3f ms\n", global_elapsed * 1000.0);
+        std::printf("Performance: %.3f GFLOPS\n", (n * n * n / 3.0) / global_elapsed / 1e9);
         if (printResults) print_results(full_a, "CholeskyL");
         if (validate) {
             double max_error = 0.0, max_relative = 0.0;

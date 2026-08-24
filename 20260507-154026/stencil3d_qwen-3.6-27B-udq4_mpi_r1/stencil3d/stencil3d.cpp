@@ -307,7 +307,9 @@ int main(int argc, char** argv) {
 
     double t1 = MPI_Wtime();
     MPI_Barrier(CART_COMM);
-    double duration = t1 - t0;
+    double localDuration = t1 - t0;
+    double duration;
+    MPI_Allreduce(&localDuration, &duration, 1, MPI_DOUBLE, MPI_MAX, CART_COMM);
 
     if (MPI_RANK == 0) {
         printf("Computation time: %.3f s\n", duration);

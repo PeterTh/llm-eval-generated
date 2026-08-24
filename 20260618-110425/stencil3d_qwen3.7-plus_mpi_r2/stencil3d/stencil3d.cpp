@@ -330,12 +330,11 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double end_time = MPI_Wtime();
     
-    // Get maximum time across all processes
+    // Get maximum elapsed time across all processes
+    double local_time = end_time - start_time;
     double max_time;
-    MPI_Allreduce(&end_time, &max_time, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    double min_start;
-    MPI_Allreduce(&start_time, &min_start, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
-    double duration_ms = (max_time - min_start) * 1000.0;
+    MPI_Allreduce(&local_time, &max_time, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    double duration_ms = max_time * 1000.0;
     
     if (decomp.rank == 0) {
         printf("Computation time: %.0f ms\n", duration_ms);

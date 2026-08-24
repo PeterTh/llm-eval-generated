@@ -181,7 +181,9 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamSynchronize(stream)); std::swap(cold,cnew);
     }
     MPI_Barrier(MPI_COMM_WORLD); const double elapsed=MPI_Wtime()-start;
-    if(!rank) std::printf("Computation time: %.3f ms\nPerformance: %.3f MCellUpdates/s\n",elapsed*1000.0,double(volume)*iterations/elapsed/1e6);
+    double global_elapsed=0.0;
+    MPI_Reduce(&elapsed,&global_elapsed,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
+    if(!rank) std::printf("Computation time: %.3f ms\nPerformance: %.3f MCellUpdates/s\n",global_elapsed*1000.0,double(volume)*iterations/global_elapsed/1e6);
 
     CUDA_CHECK(cudaMemcpy(host.data(),cold+plane,host.size()*sizeof(double),cudaMemcpyDeviceToHost));
     double local_min=std::numeric_limits<double>::infinity(), local_max=-local_min; int local_bad=0;

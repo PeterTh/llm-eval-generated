@@ -465,7 +465,16 @@ int main(int argc, char** argv) {
     }
 
     checkMPI(MPI_Barrier(MPI_COMM_WORLD), "MPI_Barrier end");
-    const double endTime = MPI_Wtime();
+    const double localDuration = MPI_Wtime() - startTime;
+    double maxDuration = 0.0;
+    checkMPI(MPI_Reduce(&localDuration,
+                        &maxDuration,
+                        1,
+                        MPI_DOUBLE,
+                        MPI_MAX,
+                        0,
+                        MPI_COMM_WORLD),
+             "MPI_Reduce duration");
 
     checkMPI(MPI_Gatherv(posX_local.data(),
                          localCount,
@@ -536,7 +545,7 @@ int main(int argc, char** argv) {
              "MPI_Gatherv velZ");
 
     if (worldRank == 0) {
-        const double durationMs = (endTime - startTime) * 1000.0;
+        const double durationMs = maxDuration * 1000.0;
         printf("Simulation time: %ld ms\n", static_cast<long>(durationMs));
 
         if (printResults) {

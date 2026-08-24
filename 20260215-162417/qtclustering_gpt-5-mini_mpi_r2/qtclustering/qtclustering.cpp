@@ -237,10 +237,9 @@ int main(int argc, char** argv) {
     std::vector<Cluster> clusters;
     clusters.reserve(128);
 
-    // Synchronize and start timing on rank 0
+    // Synchronize and start timing on all ranks
     MPI_Barrier(MPI_COMM_WORLD);
-    std::chrono::high_resolution_clock::time_point tstart, tend;
-    if (rank == 0) tstart = std::chrono::high_resolution_clock::now();
+    const auto tstart = std::chrono::high_resolution_clock::now();
 
     // Main distributed clustering loop
     while (true) {
@@ -286,12 +285,13 @@ int main(int argc, char** argv) {
         // Continue loop until no unclustered points left
     }
 
-    // End timing
-    MPI_Barrier(MPI_COMM_WORLD);
+    // End timing and report the maximum per-rank elapsed time
+    const auto tend = std::chrono::high_resolution_clock::now();
+    const long long local_cluster_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tend - tstart).count();
+    long long cluster_time_ms = 0;
+    MPI_Reduce(&local_cluster_time_ms, &cluster_time_ms, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {
-        tend = std::chrono::high_resolution_clock::now();
-        auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(tend - tstart);
-        printf("Clustering time: %ld ms\n", cluster_time.count());
+        printf("Clustering time: %lld ms\n", cluster_time_ms);
         printf("Clusters found: %zu\n", clusters.size());
 
         int total_clustered = 0; int max_cluster_size = 0;
@@ -303,7 +303,7 @@ int main(int argc, char** argv) {
         printf("Points clustered: %d / %d (%.1f%%)\n", total_clustered, num_points, 100.0 * total_clustered / num_points);
         printf("Average cluster size: %.2f\n", avg_cluster_size);
         printf("Maximum cluster size: %d\n", max_cluster_size);
-        double time_sec = cluster_time.count() / 1000.0;
+        double time_sec = cluster_time_ms / 1000.0;
         double clusters_per_sec = clusters.size() / (time_sec > 0.0 ? time_sec : 1.0);
         double points_per_sec = num_points / (time_sec > 0.0 ? time_sec : 1.0);
         printf("Performance: %.1f clusters/s, %.1f points/s\n", clusters_per_sec, points_per_sec);

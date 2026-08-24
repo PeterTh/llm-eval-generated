@@ -361,6 +361,8 @@ int main(int argc, char** argv) {
 
     double endTime = MPI_Wtime();
     double durationMs = (endTime - startTime) * 1000.0;
+    MPI_Allreduce(MPI_IN_PLACE, &durationMs, 1, MPI_DOUBLE, MPI_MAX,
+                  MPI_COMM_WORLD);
 
     // ---- copy results back to host -------------------------------------
     CUDA_CHECK(cudaMemcpy(localDist.data(), d_localDist, localBytes,

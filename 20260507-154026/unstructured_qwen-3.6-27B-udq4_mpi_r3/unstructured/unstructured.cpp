@@ -414,19 +414,21 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double end_time = MPI_Wtime();
     const double duration_ms = (end_time - start_time) * 1000.0;
+    double max_duration_ms;
+    MPI_Allreduce(&duration_ms, &max_duration_ms, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
     // Calculate performance metrics (using total grid size)
     const int n_measured_iters = std::max(n_iters - 1, 1);
-    const double time_per_iter = duration_ms / n_measured_iters;
+    const double time_per_iter = max_duration_ms / n_measured_iters;
     const double giga_elems_per_sec = (n_measured_iters * static_cast<double>(n_elems)) /
-                                      (duration_ms / 1000.0) / 1e9;
+                                      (max_duration_ms / 1000.0) / 1e9;
     const double gflops = giga_elems_per_sec * 22.0;
 
     // Compute hash
     const uint64_t hash = computeHash(world, n_elems_root, local_start_x);
 
     if (rank == 0) {
-        printf("Computation time: %.0f ms\n", duration_ms);
+        printf("Computation time: %.0f ms\n", max_duration_ms);
 
         printf("Performance:\n");
         printf("  Time per iteration: %.4f ms\n", time_per_iter);

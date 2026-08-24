@@ -286,15 +286,19 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
 
+    const long long local_duration_ms = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    long long duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG_LONG_INT, MPI_MAX,
+               0, MPI_COMM_WORLD);
+
     if (rank == 0) {
-        const auto duration =
-            std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", duration_ms);
 
         const double ops = static_cast<double>(numNodes) *
                            static_cast<double>(numNodes) *
                            static_cast<double>(numNodes);
-        const double gflops = ops / (static_cast<double>(duration.count()) / 1000.0) / 1.0e9;
+        const double gflops = ops / (static_cast<double>(duration_ms) / 1000.0) / 1.0e9;
         printf("Performance: %.3f GOPS\n", gflops);
     }
 

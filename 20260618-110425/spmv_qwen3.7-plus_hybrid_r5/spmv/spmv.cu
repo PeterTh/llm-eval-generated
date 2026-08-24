@@ -468,6 +468,11 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
 
+    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    double local_duration_ms = duration_us.count() / 1000.0;
+    double duration_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
     // ========================================================================
     // Copy results from device to host
     // ========================================================================
@@ -500,9 +505,6 @@ int main(int argc, char** argv) {
     // Report timing and performance metrics (rank 0)
     // ========================================================================
     if (rank == 0) {
-        auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        double duration_ms = duration_us.count() / 1000.0;
-
         printf("Computation time: %.3f ms\n", duration_ms);
 
         const double gflops = (2.0 * nItems * iterations) / (duration_ms / 1000.0) / 1e9;

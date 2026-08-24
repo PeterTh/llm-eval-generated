@@ -276,8 +276,10 @@ int main(int argc, char** argv) {
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    long duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    if (duration_ms == 0) duration_ms = 1;
+    long local_duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    if (local_duration_ms == 0) local_duration_ms = 1;
+    long duration_ms;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // ---- Hash (XOR-reduce across ranks) ----
     uint64_t local_hash = 0;

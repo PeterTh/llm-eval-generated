@@ -397,7 +397,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double t1 = MPI_Wtime();
     const double duration_s = t1 - t0;
-    const long duration_ms = static_cast<long>(duration_s * 1000.0);
+    double max_duration_s = 0.0;
+    MPI_Reduce(&duration_s, &max_duration_s, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    const long duration_ms = static_cast<long>(max_duration_s * 1000.0);
     
     // Gather all element data on rank 0 for output and validation
     static_assert(sizeof(ElementDynamic) == 2 * sizeof(double));
@@ -428,7 +430,7 @@ int main(int argc, char** argv) {
         // Calculate performance metrics
         const int n_measured_iters = std::max(n_iters - 1, 1);
         const double time_per_iter = static_cast<double>(duration_ms) / n_measured_iters;
-        const double giga_elems_per_sec = (static_cast<double>(n_measured_iters) * n_elems) / duration_s / 1e9;
+        const double giga_elems_per_sec = (static_cast<double>(n_measured_iters) * n_elems) / max_duration_s / 1e9;
         
         // Approximate FLOPS: ~22 FLOPS per element per iteration (from reference)
         const double gflops = giga_elems_per_sec * 22.0;

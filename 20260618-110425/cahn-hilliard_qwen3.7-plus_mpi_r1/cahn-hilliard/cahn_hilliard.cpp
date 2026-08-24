@@ -290,6 +290,11 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
 
+    auto local_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long local_ms = local_duration.count();
+    long long ms = 0;
+    MPI_Reduce(&local_ms, &ms, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+
     // ---- Gather results to rank 0 for output / validation ----
     const int local_count = static_cast<int>(nz_local * nx * ny);
     const double* send_buf = cold.data() + nx * ny; // skip bottom ghost
@@ -316,9 +321,6 @@ int main(int argc, char** argv) {
 
     // ---- Report timing and results on rank 0 ----
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        long long ms = duration.count();
-
         printf("Computation time: %lld ms\n", ms);
 
         double cellUpdates = static_cast<double>(global_vol) * iterations;

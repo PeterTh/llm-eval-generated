@@ -497,8 +497,8 @@ int main(int argc, char** argv) {
 
         if (rank == 0) printf("Running Cahn-Hilliard simulation...\n");
 
-        MPI_Barrier(MPI_COMM_WORLD);
         auto start = std::chrono::high_resolution_clock::now();
+        MPI_Barrier(MPI_COMM_WORLD);
 
         for (int t = 0; t < iterations; ++t) {
             // 1. Fill halos of cold
@@ -609,8 +609,8 @@ int main(int argc, char** argv) {
 
         if (rank == 0) printf("Running Cahn-Hilliard simulation...\n");
 
-        MPI_Barrier(MPI_COMM_WORLD);
         auto start = std::chrono::high_resolution_clock::now();
+        MPI_Barrier(MPI_COMM_WORLD);
 
         for (int t = 0; t < iterations; ++t) {
             // 1. Fill halos of cold

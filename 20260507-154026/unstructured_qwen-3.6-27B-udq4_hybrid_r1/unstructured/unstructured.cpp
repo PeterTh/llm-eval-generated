@@ -355,6 +355,9 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
     long long duration_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long max_duration_ms = 0;
+    MPI_Reduce(&duration_ms, &max_duration_ms, 1, MPI_LONG_LONG_INT, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     // ---- gather results to rank 0 for validation / output ---------------
     std::vector<double> h_energy(n_owned);
@@ -393,12 +396,12 @@ int main(int argc, char** argv) {
 
     // ---- timing / performance (rank 0) ----------------------------------
     if (rank_id == 0) {
-        printf("Computation time: %lld ms\n", (long long)duration_ms);
+        printf("Computation time: %lld ms\n", max_duration_ms);
 
         const int n_measured_iters = std::max(n_iters - 1, 1);
-        const double time_per_iter = static_cast<double>(duration_ms) / n_measured_iters;
+        const double time_per_iter = static_cast<double>(max_duration_ms) / n_measured_iters;
         const double giga_elems_per_sec =
-            (n_measured_iters * n_elems) / (duration_ms / 1000.0) / 1e9;
+            (n_measured_iters * n_elems) / (max_duration_ms / 1000.0) / 1e9;
         const double gflops = giga_elems_per_sec * 22.0;
 
         printf("Performance:\n");

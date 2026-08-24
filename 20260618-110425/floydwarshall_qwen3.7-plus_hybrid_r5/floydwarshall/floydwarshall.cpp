@@ -340,6 +340,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    long local_duration_ms = duration.count();
+    long duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather full distance matrix on rank 0 for validation/output
     std::vector<int> recvcounts(num_procs);
@@ -362,7 +365,6 @@ int main(int argc, char** argv) {
 
     int result = 0;
     if (rank == 0) {
-        long duration_ms = duration.count();
         printf("Computation time: %ld ms\n", duration_ms);
 
         double ops = (double)numNodes * numNodes * numNodes;

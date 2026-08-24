@@ -776,13 +776,16 @@ int main(int argc, char** argv) {
     const auto cluster_start = std::chrono::high_resolution_clock::now();
     const std::vector<Cluster> clusters = qtClustering(
         points, threshold, rank, world_size, device);
-    MPI_Barrier(MPI_COMM_WORLD);
     const auto cluster_end = std::chrono::high_resolution_clock::now();
+    const long long local_cluster_time =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            cluster_end - cluster_start).count();
+    long long cluster_time = 0;
+    MPI_Reduce(&local_cluster_time, &cluster_time, 1, MPI_LONG_LONG_INT,
+               MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        const auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-            cluster_end - cluster_start);
-        std::printf("Clustering time: %ld ms\n", cluster_time.count());
+        std::printf("Clustering time: %lld ms\n", cluster_time);
         std::printf("Clusters found: %zu\n", clusters.size());
 
         int total_clustered = 0;
@@ -804,7 +807,7 @@ int main(int argc, char** argv) {
         std::printf("Maximum cluster size: %d\n", max_cluster_size);
 
         const double time_sec = std::max(
-            cluster_time.count() / 1000.0, std::numeric_limits<double>::min());
+            cluster_time / 1000.0, std::numeric_limits<double>::min());
         const double clusters_per_sec = clusters.size() / time_sec;
         const double points_per_sec = num_points / time_sec;
         std::printf("Performance: %.1f clusters/s, %.1f points/s\n",

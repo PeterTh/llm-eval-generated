@@ -353,13 +353,15 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Wait for GPU to finish and synchronize MPI ranks
+    // Wait for GPU to finish before stopping the local timer
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    MPI_Barrier(MPI_COMM_WORLD);
     double t_end = MPI_Wtime();
+    double local_elapsed = t_end - t_start;
+    double elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     if (rank == 0) {
-        double elapsed = t_end - t_start;
         printf("Computation time: %.3f s\n", elapsed);
 
         double cellUpdates = static_cast<double>((nx - 2) * (ny - 2) * (nz - 2)) * iterations;

@@ -372,7 +372,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    double local_duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    double duration_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather final state to rank0 for output/validation
     CUDA_CHECK(cudaMemcpyAsync(lvx.data(), d_lvx, sizeof(double) * local_n, cudaMemcpyDeviceToHost, stream));
@@ -407,7 +409,7 @@ int main(int argc, char** argv) {
     int validation_ok = 1;
 
     if (rank == 0) {
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %.3f ms\n", duration_ms);
 
         // Print results for external validation (keep identical element order)
         if (printResults) {

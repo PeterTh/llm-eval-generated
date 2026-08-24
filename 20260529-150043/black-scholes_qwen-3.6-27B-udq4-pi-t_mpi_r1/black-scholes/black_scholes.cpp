@@ -234,6 +234,8 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     
     double elapsed = endTime - startTime;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&elapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     
     // Gather results to rank 0
     std::vector<double> results;
@@ -257,8 +259,8 @@ int main(int argc, char** argv) {
     
     // Rank 0: print timing, results, and validate
     if (rank == 0) {
-        printf("Computation time: %.3f ms\n", elapsed * 1000.0);
-        printf("Options per second: %.0f\n", numOptions / elapsed);
+        printf("Computation time: %.3f ms\n", maxElapsed * 1000.0);
+        printf("Options per second: %.0f\n", numOptions / maxElapsed);
         
         // Print results for external validation
         if (printResults) {

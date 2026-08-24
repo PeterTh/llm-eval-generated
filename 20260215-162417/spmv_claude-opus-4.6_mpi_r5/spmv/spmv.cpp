@@ -289,8 +289,12 @@ int main(int argc, char** argv) {
                 h_vec.data(), my_nrows, local_out.data());
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
+    const long long local_duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG_LONG_INT, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     // Gather results to rank 0
     MPI_Gatherv(local_out.data(), static_cast<int>(my_nrows), MPI_DOUBLE,
@@ -298,11 +302,10 @@ int main(int argc, char** argv) {
                 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", duration_ms);
         
-        const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
-        const double avgTime = duration.count() / static_cast<double>(iterations);
+        const double gflops = (2.0 * nItems * iterations) / (duration_ms / 1000.0) / 1e9;
+        const double avgTime = duration_ms / static_cast<double>(iterations);
         
         printf("Average time per iteration: %.3f ms\n", avgTime);
         printf("Performance: %.3f GFLOPS\n", gflops);

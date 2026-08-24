@@ -184,6 +184,9 @@ int main(int argc, char** argv) {
     cudaCheck(cudaMemcpy(localResults.data(), dResult, localCount * sizeof(double), cudaMemcpyDeviceToHost), "copy results");
     MPI_Barrier(MPI_COMM_WORLD);
     const auto endTime = std::chrono::high_resolution_clock::now();
+    const double localSeconds = std::chrono::duration<double>(endTime - start).count();
+    double seconds = 0.0;
+    MPI_Reduce(&localSeconds, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     std::vector<int> counts(world), displacements(world);
     const int localInt = static_cast<int>(localCount);
@@ -194,7 +197,6 @@ int main(int argc, char** argv) {
 
     cudaFree(dType); cudaFree(dStrike); cudaFree(dSpot); cudaFree(dQ); cudaFree(dRate); cudaFree(dT); cudaFree(dVol); cudaFree(dResult);
     if (rank == 0) {
-        const double seconds = std::chrono::duration<double>(endTime - start).count();
         printf("Computation time: %.3f ms\nOptions per second: %.0f\n", seconds * 1000.0, total / seconds);
         if (printResults) print_results(results, "OptionPrices");
         if (validate) {

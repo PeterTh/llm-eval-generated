@@ -358,7 +358,10 @@ int main(int argc, char** argv) {
     const std::vector<Cluster> clusters =
         qtClustering(points, threshold, rank, process_count);
     MPI_Barrier(MPI_COMM_WORLD);
-    const double cluster_seconds = MPI_Wtime() - cluster_start;
+    const double local_cluster_seconds = MPI_Wtime() - cluster_start;
+    double cluster_seconds = 0.0;
+    MPI_Reduce(&local_cluster_seconds, &cluster_seconds, 1, MPI_DOUBLE, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     int exit_code = 0;
     if (rank == 0) {

@@ -463,6 +463,10 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long localDurationMs = static_cast<long long>(duration.count());
+    long long globalDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &globalDurationMs, 1, MPI_LONG_LONG, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     // -----------------------------------------------------------------------
     // Copy results back from GPU
@@ -490,10 +494,10 @@ int main(int argc, char** argv) {
     // Report performance (rank 0 only)
     // -----------------------------------------------------------------------
     if (mpiRank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", globalDurationMs);
 
-        const double elapsedSec = static_cast<double>(duration.count()) / 1000.0;
-        const double avgTime    = static_cast<double>(duration.count())
+        const double elapsedSec = static_cast<double>(globalDurationMs) / 1000.0;
+        const double avgTime    = static_cast<double>(globalDurationMs)
                                   / static_cast<double>(iterations);
 
         printf("Average time per iteration: %.3f ms\n", avgTime);

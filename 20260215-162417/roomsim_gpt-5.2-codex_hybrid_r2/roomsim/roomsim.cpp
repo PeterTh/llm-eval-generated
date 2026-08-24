@@ -1086,7 +1086,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto endPre = std::chrono::high_resolution_clock::now();
-    auto preDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count();
+    long localPreDuration = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count());
+    long preDuration = 0;
+    MPI_Reduce(&localPreDuration, &preDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (isRoot) {
         printf("Precomputation time: %ld ms\n", preDuration);
@@ -1101,7 +1103,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto endSim = std::chrono::high_resolution_clock::now();
-    auto simDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count();
+    long localSimDuration = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count());
+    long simDuration = 0;
+    MPI_Reduce(&localSimDuration, &simDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (isRoot) {
         printf("Simulation time: %ld ms\n", simDuration);
@@ -1116,7 +1120,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto endDist = std::chrono::high_resolution_clock::now();
-    auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
+    long localDistDuration = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count());
+    long distDuration = 0;
+    MPI_Reduce(&localDistDuration, &distDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (isRoot) {
         printf("Distance computation time: %ld ms\n", distDuration);
@@ -1124,7 +1130,9 @@ int main(int argc, char** argv) {
     }
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long localTotalTime = localPreDuration + localSimDuration + localDistDuration;
+    long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (isRoot) {
         printf("Total computation time: %ld ms\n", totalTime);
     }

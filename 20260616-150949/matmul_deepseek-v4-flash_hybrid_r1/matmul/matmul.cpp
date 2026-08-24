@@ -255,6 +255,10 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     double end_time = MPI_Wtime();
+    double duration = end_time - start_time;
+    double max_duration = 0.0;
+    MPI_Reduce(&duration, &max_duration, 1, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     // Prepare MPI_Gatherv parameters for collecting C blocks
     std::vector<int> recv_counts(num_ranks);
@@ -281,12 +285,11 @@ int main(int argc, char** argv) {
 
     // Rank 0 reports timing and handles results
     if (rank == 0) {
-        double duration = end_time - start_time;
-        long duration_ms = static_cast<long>(duration * 1000.0);
+        long duration_ms = static_cast<long>(max_duration * 1000.0);
         printf("Computation time: %ld ms\n", duration_ms);
 
         // GFLOPS = (2 * N^3 operations) / time / 1e9
-        double gflops = (2.0 * N * N * N) / duration / 1e9;
+        double gflops = (2.0 * N * N * N) / max_duration / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
 
         if (printResults) {

@@ -982,7 +982,9 @@ int main(int argc, char** argv) {
     }
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long localTotalTime = preDuration + simDuration + distDuration;
+    long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (g_mpi_rank == 0) printf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics

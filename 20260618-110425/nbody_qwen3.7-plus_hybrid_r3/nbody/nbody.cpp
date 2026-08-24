@@ -361,9 +361,12 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end_time = std::chrono::high_resolution_clock::now();
 
+    long long local_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+    long long global_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &global_duration_ms, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %lld ms\n", global_duration_ms);
     }
 
     std::vector<double> final_px(numBodies), final_py(numBodies), final_pz(numBodies);

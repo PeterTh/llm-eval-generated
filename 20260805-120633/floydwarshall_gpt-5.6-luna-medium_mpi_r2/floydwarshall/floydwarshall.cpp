@@ -213,11 +213,16 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
 
+    const double localSeconds = std::chrono::duration<double>(end - start).count();
+    double seconds = 0.0;
+    MPI_Reduce(&localSeconds, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
+
     if (rank == 0) {
-        const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::duration<double>(seconds));
         const long long milliseconds = duration.count();
         printf("Computation time: %lld ms\n", milliseconds);
-        const double seconds = std::chrono::duration<double>(end - start).count();
         printf("Performance: %.3f GOPS\n",
                static_cast<double>(numNodes) * numNodes * numNodes / seconds / 1e9);
     }

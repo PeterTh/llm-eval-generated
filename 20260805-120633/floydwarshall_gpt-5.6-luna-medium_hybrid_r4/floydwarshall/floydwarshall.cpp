@@ -184,6 +184,9 @@ int main(int argc, char** argv) {
     }
     cudaCheck(cudaDeviceSynchronize(), "kernel completion");
     const auto end = std::chrono::high_resolution_clock::now();
+    const double localMs = std::chrono::duration<double, std::milli>(end - start).count();
+    double ms = 0.0;
+    MPI_Reduce(&localMs, &ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     cudaCheck(cudaMemcpy(dist.data(), dDist, localElements * sizeof(unsigned int), cudaMemcpyDeviceToHost), "copy result");
     cudaFree(dPivot); cudaFree(dPath); cudaFree(dDist);
 
@@ -193,7 +196,6 @@ int main(int argc, char** argv) {
     if (rank == 0) {
         // Gatherv receives packed column blocks; restore the reference layout.
         for (int r = 0; r < world; ++r) { const size_t rn = base + (static_cast<size_t>(r) < rem ? 1 : 0); const size_t off = static_cast<size_t>(r) * base + std::min(static_cast<size_t>(r), rem); for (size_t j = 0; j < n; ++j) std::memcpy(global.data() + j * n + off, gathered.data() + off * n + j * rn, rn * sizeof(unsigned int)); }
-        const double ms = std::chrono::duration<double, std::milli>(end - start).count();
         std::printf("Floyd-Warshall All-Pairs Shortest Path Benchmark\nNumber of nodes: %zu\nValidation: %s\n", n, validate ? "enabled" : "disabled");
         std::printf("Computation time: %.3f ms\nPerformance: %.3f GOPS\n", ms, static_cast<double>(n) * n * n / (ms * 1.0e6));
         if (printResults) print_results_int(global, "DistanceMatrix");

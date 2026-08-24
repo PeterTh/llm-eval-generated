@@ -921,9 +921,12 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     double endPre = MPI_Wtime();
-    long preDuration = static_cast<long>((endPre - startPre) * 1000.0);
+    double preElapsed = endPre - startPre;
+    double maxPreElapsed = 0.0;
+    MPI_Reduce(&preElapsed, &maxPreElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
+        long preDuration = static_cast<long>(maxPreElapsed * 1000.0);
         printf("Precomputation time: %ld ms\n", preDuration);
         printf("\n");
     }
@@ -936,9 +939,12 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     double endSim = MPI_Wtime();
-    long simDuration = static_cast<long>((endSim - startSim) * 1000.0);
+    double simElapsed = endSim - startSim;
+    double maxSimElapsed = 0.0;
+    MPI_Reduce(&simElapsed, &maxSimElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
+        long simDuration = static_cast<long>(maxSimElapsed * 1000.0);
         printf("Simulation time: %ld ms\n", simDuration);
         printf("\n");
     }
@@ -951,9 +957,12 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     double endDist = MPI_Wtime();
-    long distDuration = static_cast<long>((endDist - startDist) * 1000.0);
+    double distElapsed = endDist - startDist;
+    double maxDistElapsed = 0.0;
+    MPI_Reduce(&distElapsed, &maxDistElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
+        long distDuration = static_cast<long>(maxDistElapsed * 1000.0);
         printf("Distance computation time: %ld ms\n", distDuration);
         printf("\n");
     }
@@ -977,9 +986,12 @@ int main(int argc, char** argv) {
                 MPI_FLOAT, 0, MPI_COMM_WORLD);
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    double localTotalTime = preElapsed + simElapsed + distElapsed;
+    double globalTotalTime = 0.0;
+    MPI_Reduce(&localTotalTime, &globalTotalTime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
+        long totalTime = static_cast<long>(globalTotalTime * 1000.0);
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

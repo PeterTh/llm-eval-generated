@@ -144,6 +144,9 @@ int main(int argc, char** argv) {
     }
     
     auto end_time = std::chrono::high_resolution_clock::now();
+    long long local_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+    long long max_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &max_duration_ms, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
     
     std::vector<double> all_px_final, all_py_final, all_pz_final;
     std::vector<double> all_vx_final, all_vy_final, all_vz_final;
@@ -165,8 +168,7 @@ int main(int argc, char** argv) {
     MPI_Gatherv(local_vz.data(), local_n, MPI_DOUBLE, all_vz_final.data(), counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %lld ms\n", max_duration_ms);
         
         if (printResults) {
             std::vector<double> bodyData;

@@ -404,8 +404,8 @@ int main(int argc, char** argv) {
     
     bool success = choleskyDecomposition(A, n);
     
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
     
     if (!success) {
         if (mpi_rank == 0) {
@@ -415,10 +415,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long long local_duration_ms = duration.count();
     long long duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
     if (mpi_rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        duration_ms = duration.count();
         printf("Computation time: %lld ms\n", duration_ms);
         
         // Calculate GFLOPS (approximately n³/3 operations for Cholesky)

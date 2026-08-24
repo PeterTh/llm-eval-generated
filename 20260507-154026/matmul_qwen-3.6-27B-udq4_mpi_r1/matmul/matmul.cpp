@@ -257,16 +257,16 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
 
-    // Synchronize all ranks before timing
-    MPI_Barrier(MPI_COMM_WORLD);
+    long local_duration_ms = static_cast<long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    long duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", duration_ms);
 
         // Calculate GFLOPS
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        double gflops = (2.0 * N * N * N) / (duration_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
 
         // Print results for external validation

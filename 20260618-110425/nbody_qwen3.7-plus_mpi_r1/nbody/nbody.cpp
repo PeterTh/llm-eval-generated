@@ -194,6 +194,9 @@ int main(int argc, char** argv) {
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
+    double local_duration_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    double simulation_time_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &simulation_time_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather all body data to rank 0 for output/validation
     // Pack as [px,py,pz,vx,vy,vz] per body
@@ -223,8 +226,7 @@ int main(int argc, char** argv) {
                 MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start);
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %.3f ms\n", simulation_time_ms);
 
         if (printRes) {
             print_results(all_packed, "Bodies");

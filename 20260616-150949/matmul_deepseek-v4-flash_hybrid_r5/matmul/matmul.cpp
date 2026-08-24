@@ -264,6 +264,11 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize();
     auto compute_end = std::chrono::high_resolution_clock::now();
 
+    long local_duration = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        compute_end - compute_start).count());
+    long duration = 0;
+    MPI_Reduce(&local_duration, &duration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     // Copy result back from device to host
     if (local_rows > 0)
         cudaMemcpy(C_local.data(), d_C, local_rows * N * sizeof(double), cudaMemcpyDeviceToHost);
@@ -276,11 +281,9 @@ int main(int argc, char** argv) {
 
     // Output and validation on rank 0
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            compute_end - compute_start);
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", duration);
 
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        double gflops = (2.0 * N * N * N) / (duration / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
 
         if (printResults)

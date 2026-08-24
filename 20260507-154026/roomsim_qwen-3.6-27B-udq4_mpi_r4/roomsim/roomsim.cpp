@@ -1030,6 +1030,7 @@ int main(int argc, char** argv) {
 
     // Precomputation
     auto startPre = std::chrono::high_resolution_clock::now();
+    auto startTotal = startPre;
 
     computeTimeDelays(state);
     computeFormFactors(state);
@@ -1061,7 +1062,9 @@ int main(int argc, char** argv) {
     computeDistances(state);
 
     auto endDist = std::chrono::high_resolution_clock::now();
+    auto endTotal = endDist;
     auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
+    long long localTotalTime = std::chrono::duration_cast<std::chrono::milliseconds>(endTotal - startTotal).count();
 
     if (MPI_RANK == 0) {
         printf("Distance computation time: %ld ms\n", distDuration);
@@ -1069,7 +1072,8 @@ int main(int argc, char** argv) {
     }
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Validation: collective gather must happen on all ranks (before rank-0-only block)
     int totalNonZeroKij = 0;
@@ -1079,7 +1083,7 @@ int main(int argc, char** argv) {
 
     // Performance metrics (rank 0 only)
     if (MPI_RANK == 0) {
-        printf("Total computation time: %ld ms\n", totalTime);
+        printf("Total computation time: %lld ms\n", totalTime);
 
         // Performance metrics
         size_t n = state.numTriangles;

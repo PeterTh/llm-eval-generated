@@ -222,7 +222,10 @@ int main(int argc, char** argv) {
         if (step + 1 < numSteps) uploadPositions();
     }
     const auto end = std::chrono::high_resolution_clock::now();
-    if (rank == 0) std::printf("Simulation time: %ld ms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    const double localElapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
+    double simulationTimeMs = 0.0;
+    MPI_Reduce(&localElapsedMs, &simulationTimeMs, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) std::printf("Simulation time: %.3f ms\n", simulationTimeMs);
 
     // Velocities are target-local state and are only needed globally after the final step.
     const size_t localBytes = static_cast<size_t>(localCount) * sizeof(double);

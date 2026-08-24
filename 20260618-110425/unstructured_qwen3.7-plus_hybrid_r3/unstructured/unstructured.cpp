@@ -482,7 +482,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
     double end_time = MPI_Wtime();
-    double duration_ms = (end_time - start_time) * 1000.0;
+    double local_duration_ms = (end_time - start_time) * 1000.0;
+    double duration_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // === Copy results back to host ===
     std::vector<double> h_local_energy(local_owned);

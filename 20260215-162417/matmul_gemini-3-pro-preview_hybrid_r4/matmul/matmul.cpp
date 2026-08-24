@@ -266,6 +266,11 @@ int main(int argc, char** argv) {
     // Synchronize before ending timing
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
+
+    long long local_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long max_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &max_duration_ms, 1, MPI_LONG_LONG_INT, MPI_MAX,
+               0, MPI_COMM_WORLD);
     
     // Gather results
     MPI_Gather(local_C.data(), rows_per_rank * N, MPI_DOUBLE,
@@ -273,10 +278,9 @@ int main(int argc, char** argv) {
                0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %lld ms\n", max_duration_ms);
         
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        double gflops = (2.0 * N * N * N) / (max_duration_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
 
         if (printResults) {

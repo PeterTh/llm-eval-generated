@@ -359,10 +359,12 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    double localDurationMs = std::chrono::duration<double, std::milli>(end - start).count();
+    double globalDurationMs = 0.0;
+    MPI_Reduce(&localDurationMs, &globalDurationMs, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (worldRank == 0) {
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %.17g ms\n", globalDurationMs);
     }
 
     // Gather results to rank 0 for printing/validation.

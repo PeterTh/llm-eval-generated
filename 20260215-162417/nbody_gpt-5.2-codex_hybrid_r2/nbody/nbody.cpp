@@ -295,9 +295,12 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double end = MPI_Wtime();
+    const double localElapsed = end - start;
+    double globalElapsed = 0.0;
+    MPI_Reduce(&localElapsed, &globalElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Simulation time: %.3f ms\n", (end - start) * 1000.0);
+        printf("Simulation time: %.3f ms\n", globalElapsed * 1000.0);
     }
 
     if (printResults && rank == 0) {

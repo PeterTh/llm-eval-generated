@@ -399,6 +399,12 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
 
+    const long long localDurationMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long long globalDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &globalDurationMs, 1, MPI_LONG_LONG_INT, MPI_MAX,
+               0, MPI_COMM_WORLD);
+
     // ---- Copy results back to host ----
     std::vector<double> localOut(localRowCount, 0.0);
     if (localRowCount > 0) {
@@ -419,16 +425,14 @@ int main(int argc, char** argv) {
 
     // ---- Rank 0: report and validate ----
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        printf("Computation time: %lld ms\n", globalDurationMs);
 
-        printf("Computation time: %ld ms\n", duration.count());
-
-        const double elapsedSec = static_cast<double>(duration.count()) / 1000.0;
+        const double elapsedSec = static_cast<double>(globalDurationMs) / 1000.0;
         const double gflops =
             (2.0 * static_cast<double>(nItems) * static_cast<double>(iterations)) /
             elapsedSec / 1e9;
         const double avgTime =
-            static_cast<double>(duration.count()) / static_cast<double>(iterations);
+            static_cast<double>(globalDurationMs) / static_cast<double>(iterations);
 
         printf("Average time per iteration: %.3f ms\n", avgTime);
         printf("Performance: %.3f GFLOPS\n", gflops);
