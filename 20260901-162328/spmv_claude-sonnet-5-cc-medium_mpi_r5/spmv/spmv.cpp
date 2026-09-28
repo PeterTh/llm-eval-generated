@@ -333,6 +333,8 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     const double end = MPI_Wtime();
     const long durationMs = static_cast<long>((end - start) * 1000.0);
+    long globalDurationMs = 0;
+    MPI_Reduce(&durationMs, &globalDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather the distributed output vector back onto the root rank
     std::vector<int> outCounts(numRanks);
@@ -348,11 +350,11 @@ int main(int argc, char** argv) {
                 0, MPI_COMM_WORLD);
 
     if (isRoot) {
-        printf("Computation time: %ld ms\n", durationMs);
+        printf("Computation time: %ld ms\n", globalDurationMs);
 
         // Calculate performance metrics
-        const double gflops = (2.0 * nItems * iterations) / (durationMs / 1000.0) / 1e9;
-        const double avgTime = durationMs / static_cast<double>(iterations);
+        const double gflops = (2.0 * nItems * iterations) / (globalDurationMs / 1000.0) / 1e9;
+        const double avgTime = globalDurationMs / static_cast<double>(iterations);
 
         printf("Average time per iteration: %.3f ms\n", avgTime);
         printf("Performance: %.3f GFLOPS\n", gflops);

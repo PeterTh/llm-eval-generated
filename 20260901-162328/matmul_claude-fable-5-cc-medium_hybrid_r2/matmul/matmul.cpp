@@ -231,8 +231,8 @@ int main(int argc, char** argv) {
 
     // Perform matrix multiplication
     if (rank == 0) printf("Computing matrix multiplication...\n");
-    MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     matrixMultiply(localA, B, localC, C, N, rowCount, counts, displs);
 

@@ -241,10 +241,11 @@ int main(int argc, char** argv) {
 
     matrixMultiplyGPU(localA, B, localC, localRowCount, N, handle);
 
-    MPI_Barrier(MPI_COMM_WORLD);
     double t1 = MPI_Wtime();
 
-    const long durationMs = std::lround((t1 - t0) * 1000.0);
+    const long localDurationMs = std::lround((t1 - t0) * 1000.0);
+    long durationMs = 0;
+    MPI_Reduce(&localDurationMs, &durationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather the distributed row-blocks of C back onto rank 0
     std::vector<double> C;

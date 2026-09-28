@@ -283,15 +283,17 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     const double endTime = MPI_Wtime();
     const long durationMs = (long)((endTime - startTime) * 1000.0);
+    long maxDurationMs = 0;
+    MPI_Reduce(&durationMs, &maxDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     const size_t gridSize = nx * ny * nz;
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", durationMs);
+        printf("Computation time: %ld ms\n", maxDurationMs);
 
         // Calculate performance
         double cellUpdates = (double)gridSize * iterations;
-        double mcups = cellUpdates / (durationMs / 1000.0) / 1e6;
+        double mcups = cellUpdates / (maxDurationMs / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

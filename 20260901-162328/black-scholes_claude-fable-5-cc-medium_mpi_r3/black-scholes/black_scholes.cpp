@@ -210,8 +210,8 @@ int main(int argc, char** argv) {
     if (rank == 0) {
         printf("Pricing options...\n");
     }
-    MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     for (size_t i = 0; i < localCount; ++i) {
         results[i] = blackScholes(options[i]);

@@ -403,6 +403,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDuration = duration.count();
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Copy the local slab back and gather the full field on rank 0
     if (lnz > 0)
@@ -424,11 +427,11 @@ int main(int argc, char** argv) {
 
     int exitCode = 0;
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", maxDuration);
 
         // Calculate performance
         double cellUpdates = (double)gridSize * iterations;
-        double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
+        double mcups = cellUpdates / (maxDuration / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
 
         // Print results for external validation

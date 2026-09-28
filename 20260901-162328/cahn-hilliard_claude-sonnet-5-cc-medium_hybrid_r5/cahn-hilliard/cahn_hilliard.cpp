@@ -359,6 +359,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long durationMs = duration.count();
+    long maxDurationMs = 0;
+    MPI_Reduce(&durationMs, &maxDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather the local interior slabs (contiguous, matching the global z-major layout)
     // back to rank 0 to reproduce the original single-process result vector.
@@ -398,10 +401,10 @@ int main(int argc, char** argv) {
     int exitCode = 0;
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", maxDurationMs);
 
         const double cellUpdates = static_cast<double>(gridSize) * iterations;
-        const double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
+        const double mcups = cellUpdates / (maxDurationMs / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
 
         if (printResults) {

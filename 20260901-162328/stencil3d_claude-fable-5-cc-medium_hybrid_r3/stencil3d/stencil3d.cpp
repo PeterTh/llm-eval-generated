@@ -308,6 +308,8 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     const double tEnd = MPI_Wtime();
     const long durationMs = static_cast<long>((tEnd - tStart) * 1000.0);
+    long globalDurationMs = 0;
+    MPI_Reduce(&durationMs, &globalDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Copy the final local slab back and gather the full grid on rank 0.
     CUDA_CHECK(cudaMemcpy(hostSlab.data() + plane, d_in + plane, nzl * planeBytes,
@@ -328,11 +330,11 @@ int main(int argc, char** argv) {
 
     int exitCode = 0;
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", durationMs);
+        printf("Computation time: %ld ms\n", globalDurationMs);
 
         // Calculate performance metrics
         double cellUpdates = (double)((nx-2) * (ny-2) * (nz-2)) * iterations;
-        double mcups = cellUpdates / (durationMs / 1000.0) / 1e6;  // Million cell updates per second
+        double mcups = cellUpdates / (globalDurationMs / 1000.0) / 1e6;  // Million cell updates per second
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
 
         // Print results for external validation

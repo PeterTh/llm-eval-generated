@@ -268,6 +268,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     const double tEnd = MPI_Wtime();
     const double durationUs = (tEnd - tStart) * 1e6;
+    double maxDurationUs = 0.0;
+    MPI_Reduce(&durationUs, &maxDurationUs, 1, MPI_DOUBLE, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     if (dOptions != nullptr) {
         CUDA_CHECK(cudaFree(dOptions));
@@ -292,8 +295,8 @@ int main(int argc, char** argv) {
 
     int exitCode = 0;
     if (rank == 0) {
-        printf("Computation time: %.3f ms\n", durationUs / 1000.0);
-        printf("Options per second: %.0f\n", numOptions / (durationUs / 1e6));
+        printf("Computation time: %.3f ms\n", maxDurationUs / 1000.0);
+        printf("Options per second: %.0f\n", numOptions / (maxDurationUs / 1e6));
 
         // Print results for external validation
         if (printResults) {

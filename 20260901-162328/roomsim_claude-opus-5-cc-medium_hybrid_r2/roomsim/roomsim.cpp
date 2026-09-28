@@ -1418,7 +1418,10 @@ int main(int argc, char** argv) {
     rprintf("\n");
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long localDurations[3] = {preDuration, simDuration, distDuration};
+    long maxDurations[3] = {};
+    MPI_Reduce(localDurations, maxDurations, 3, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    long totalTime = maxDurations[0] + maxDurations[1] + maxDurations[2];
     rprintf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics

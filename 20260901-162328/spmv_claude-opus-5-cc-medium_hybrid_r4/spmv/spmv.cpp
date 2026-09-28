@@ -804,11 +804,12 @@ int main(int argc, char** argv) {
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    const double elapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
+    const double localElapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
+    double elapsedMs = 0.0;
+    MPI_Reduce(&localElapsedMs, &elapsedMs, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %.3f ms\n", elapsedMs);
 
         // Calculate performance metrics
         const double gflops = (2.0 * nItems * iterations) / (elapsedMs / 1000.0) / 1e9;

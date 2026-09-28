@@ -324,7 +324,10 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double tEnd = MPI_Wtime();
-    const long durationMs = (long)((tEnd - tStart) * 1000.0);
+    const double localElapsed = tEnd - tStart;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&localElapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    const long durationMs = (long)(maxElapsed * 1000.0);
 
     // Download the owned planes of the final grid.
     if (nzl > 0) {

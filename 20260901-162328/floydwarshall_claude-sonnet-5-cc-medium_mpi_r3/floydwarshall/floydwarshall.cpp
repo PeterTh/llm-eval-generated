@@ -257,8 +257,8 @@ int main(int argc, char** argv) {
         printf("Computing shortest paths...\n");
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     floydWarshallMPI(distLocal, pathLocal, numNodes, rowCounts, rowDispls, rank);
 

@@ -388,8 +388,8 @@ int main(int argc, char** argv) {
 
     // Run stencil iterations
     if (rank == 0) printf("Running stencil computation...\n");
-    MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     for (int iter = 0; iter < iterations; ++iter) {
         if (!active) break;

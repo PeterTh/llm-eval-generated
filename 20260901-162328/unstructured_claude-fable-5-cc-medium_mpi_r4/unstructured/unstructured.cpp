@@ -411,8 +411,10 @@ int main(int argc, char** argv) {
     runSimulation(world, n_iters);
 
     MPI_Barrier(MPI_COMM_WORLD);
-    const double end = MPI_Wtime();
-    const long duration_ms = static_cast<long>((end - start) * 1000.0);
+    const double local_duration = MPI_Wtime() - start;
+    double max_duration = 0.0;
+    MPI_Reduce(&local_duration, &max_duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    const long duration_ms = static_cast<long>(max_duration * 1000.0);
 
     // Compute hash for verification (XOR-combine partial hashes)
     const uint64_t local_hash = computeLocalHash(world);

@@ -1226,13 +1226,15 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     double preDuration = (MPI_Wtime() - startPre) * 1000.0;
+    double globalPreDuration = 0.0;
+    MPI_Reduce(&preDuration, &globalPreDuration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     unsigned long long localNonZeroKij = countNonzeroKijGPU(gpu, state.rowCount, state.numTriangles);
     unsigned long long globalNonZeroKij = 0;
     MPI_Reduce(&localNonZeroKij, &globalNonZeroKij, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Precomputation time: %.3f ms\n", preDuration);
+        printf("Precomputation time: %.3f ms\n", globalPreDuration);
         printf("\n");
     }
 
@@ -1244,9 +1246,11 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     double simDuration = (MPI_Wtime() - startSim) * 1000.0;
+    double globalSimDuration = 0.0;
+    MPI_Reduce(&simDuration, &globalSimDuration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Simulation time: %.3f ms\n", simDuration);
+        printf("Simulation time: %.3f ms\n", globalSimDuration);
         printf("\n");
     }
 
@@ -1258,13 +1262,15 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     double distDuration = (MPI_Wtime() - startDist) * 1000.0;
+    double globalDistDuration = 0.0;
+    MPI_Reduce(&distDuration, &globalDistDuration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Distance computation time: %.3f ms\n", distDuration);
+        printf("Distance computation time: %.3f ms\n", globalDistDuration);
         printf("\n");
     }
 
-    double totalTime = preDuration + simDuration + distDuration;
+    double totalTime = globalPreDuration + globalSimDuration + globalDistDuration;
 
     int validationResult = 0;
     if (rank == 0) {

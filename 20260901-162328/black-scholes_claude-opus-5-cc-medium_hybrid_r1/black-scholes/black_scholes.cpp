@@ -453,8 +453,8 @@ int main(int argc, char** argv) {
 
     // Price options
     if (isRoot) printf("Pricing options...\n");
-    MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
 #pragma omp parallel num_threads(nDev + 1)
     {

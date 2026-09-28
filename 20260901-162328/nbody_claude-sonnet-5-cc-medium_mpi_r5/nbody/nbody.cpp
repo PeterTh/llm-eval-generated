@@ -228,9 +228,12 @@ int main(int argc, char** argv) {
 
     auto endTime = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - start);
+    long localDuration = duration.count();
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %ld ms\n", maxDuration);
     }
 
     // Print results for external validation

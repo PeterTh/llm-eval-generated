@@ -418,17 +418,19 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long max_duration_ms = 0;
+    MPI_Reduce(&duration_ms, &max_duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather full results onto rank 0 for hashing/validation/output
     std::vector<ElementDynamic> global_dynamic = gatherResults(world, rank, size);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration_ms);
+        printf("Computation time: %ld ms\n", max_duration_ms);
 
         // Calculate performance metrics
         const int n_measured_iters = std::max(n_iters - 1, 1);
-        const double time_per_iter = static_cast<double>(duration_ms) / n_measured_iters;
-        const double giga_elems_per_sec = (n_measured_iters * static_cast<double>(n_elems)) / (duration_ms / 1000.0) / 1e9;
+        const double time_per_iter = static_cast<double>(max_duration_ms) / n_measured_iters;
+        const double giga_elems_per_sec = (n_measured_iters * static_cast<double>(n_elems)) / (max_duration_ms / 1000.0) / 1e9;
 
         // Approximate FLOPS: ~22 FLOPS per element per iteration (from reference)
         const double gflops = giga_elems_per_sec * 22.0;

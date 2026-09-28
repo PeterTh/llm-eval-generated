@@ -382,8 +382,8 @@ int main(int argc, char** argv) {
 
     // Run stencil iterations
     if (rank == 0) printf("Running stencil computation...\n");
-    MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     int cur = 0;  // dBuf[cur] is the input, dBuf[1-cur] the output of an iteration
     for (int iter = 0; iter < iterations; ++iter) {

@@ -277,7 +277,10 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double tEnd = MPI_Wtime();
-    const double elapsedUs = (tEnd - tStart) * 1e6;
+    const double localElapsedUs = (tEnd - tStart) * 1e6;
+    double elapsedUs = 0.0;
+    MPI_Reduce(&localElapsedUs, &elapsedUs, 1, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     // Gather full result vector on rank 0 for output and validation.
     std::vector<double> results;

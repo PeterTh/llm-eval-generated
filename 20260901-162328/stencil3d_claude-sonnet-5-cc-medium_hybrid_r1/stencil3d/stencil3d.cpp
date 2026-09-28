@@ -287,9 +287,9 @@ int main(int argc, char** argv) {
                      static_cast<unsigned>((ny + block.y - 1) / block.y),
                      static_cast<unsigned>((nzLocal + block.z - 1) / block.z));
 
+    auto start = std::chrono::high_resolution_clock::now();
     MPI_Barrier(MPI_COMM_WORLD);
     if (rank == 0) printf("Running stencil computation...\n");
-    auto start = std::chrono::high_resolution_clock::now();
 
     for (int iter = 0; iter < iterations; ++iter) {
         Real* d_in = (iter % 2 == 0) ? d_grid1 : d_grid2;

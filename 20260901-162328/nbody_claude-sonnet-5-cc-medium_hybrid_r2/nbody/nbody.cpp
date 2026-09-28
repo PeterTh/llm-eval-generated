@@ -289,8 +289,8 @@ int main(int argc, char** argv) {
     constexpr int kThreads = 256;
     const int kBlocks = localCount > 0 ? (localCount + kThreads - 1) / kThreads : 1;
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     for (int step = 0; step < numSteps; ++step) {
         if (localCount > 0) {

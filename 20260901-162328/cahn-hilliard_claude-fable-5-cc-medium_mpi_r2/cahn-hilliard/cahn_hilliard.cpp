@@ -291,13 +291,15 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double elapsed = MPI_Wtime() - tStart;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&elapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", (long)(elapsed * 1000.0));
+        printf("Computation time: %ld ms\n", (long)(maxElapsed * 1000.0));
 
         // Calculate performance
         double cellUpdates = (double)gridSize * iterations;
-        double mcups = cellUpdates / elapsed / 1e6;
+        double mcups = cellUpdates / maxElapsed / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

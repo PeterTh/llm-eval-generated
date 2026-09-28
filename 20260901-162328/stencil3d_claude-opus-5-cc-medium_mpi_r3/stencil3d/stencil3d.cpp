@@ -450,13 +450,16 @@ int main(int argc, char** argv) {
     MPI_Barrier(cart);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const long localDurationMs = duration.count();
+    long globalDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &globalDurationMs, 1, MPI_LONG, MPI_MAX, 0, cart);
 
     if (isRoot) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", globalDurationMs);
 
         // Calculate performance metrics
         double cellUpdates = (double)((nx-2) * (ny-2) * (nz-2)) * iterations;
-        double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;  // Million cell updates per second
+        double mcups = cellUpdates / (globalDurationMs / 1000.0) / 1e6;  // Million cell updates per second
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

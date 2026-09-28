@@ -280,8 +280,8 @@ int main(int argc, char** argv) {
                     (static_cast<unsigned>(ny) + block.y - 1) / block.y, 1);
     const int kLast = static_cast<int>(nzLocal);
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     for (int iter = 0; iter < iterations; ++iter) {
         if (!active) break;

@@ -184,8 +184,8 @@ int main(int argc, char** argv) {
     if (rank == 0) {
         printf("Computing matrix multiplication...\n");
     }
-    MPI_Barrier(MPI_COMM_WORLD);
     const double start = MPI_Wtime();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     matrixMultiplyRows(A, B, localC, N, localRows);
 

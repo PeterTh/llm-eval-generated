@@ -305,9 +305,13 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double tEnd = MPI_Wtime();
-    const long durationMs = (long)((tEnd - tStart) * 1000.0);
+    const double localElapsed = tEnd - tStart;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&localElapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     if (rank == 0) {
+        const long durationMs = (long)(maxElapsed * 1000.0);
         printf("Computation time: %ld ms\n", durationMs);
 
         // Calculate performance metrics

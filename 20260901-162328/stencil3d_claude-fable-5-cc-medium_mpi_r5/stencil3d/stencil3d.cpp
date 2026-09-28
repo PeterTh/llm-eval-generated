@@ -207,8 +207,8 @@ int main(int argc, char** argv) {
 
     // Run stencil iterations
     if (rank == 0) printf("Running stencil computation...\n");
-    MPI_Barrier(MPI_COMM_WORLD);
     const double tStart = MPI_Wtime();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     Real* in = grid1.data();
     Real* out = grid2.data();

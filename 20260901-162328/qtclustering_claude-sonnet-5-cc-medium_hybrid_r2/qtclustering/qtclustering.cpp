@@ -514,6 +514,10 @@ int main(int argc, char** argv) {
     auto cluster_end = std::chrono::high_resolution_clock::now();
     auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
         cluster_end - cluster_start);
+    const long local_cluster_time = cluster_time.count();
+    long global_cluster_time = 0;
+    MPI_Reduce(&local_cluster_time, &global_cluster_time, 1, MPI_LONG, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     #pragma omp parallel for num_threads(deviceCount) schedule(static)
     for (int d = 0; d < deviceCount; ++d) {
@@ -529,7 +533,7 @@ int main(int argc, char** argv) {
     }
 
     if (mpiRank == 0) {
-        printf("Clustering time: %ld ms\n", cluster_time.count());
+        printf("Clustering time: %ld ms\n", global_cluster_time);
         printf("Clusters found: %zu\n", clusters.size());
 
         // Calculate statistics and performance metrics
@@ -552,7 +556,7 @@ int main(int argc, char** argv) {
         printf("Maximum cluster size: %d\n", max_cluster_size);
 
         // Performance metrics
-        const double time_sec = cluster_time.count() / 1000.0;
+        const double time_sec = global_cluster_time / 1000.0;
         const double clusters_per_sec = clusters.size() / time_sec;
         const double points_per_sec = num_points / time_sec;
         printf("Performance: %.1f clusters/s, %.1f points/s\n",

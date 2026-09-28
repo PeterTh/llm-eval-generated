@@ -962,9 +962,11 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto endPre = std::chrono::high_resolution_clock::now();
     auto preDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count();
+    long maxPreDuration = 0;
+    MPI_Reduce(&preDuration, &maxPreDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (g_rank == 0) {
-        printf("Precomputation time: %ld ms\n", preDuration);
+        printf("Precomputation time: %ld ms\n", maxPreDuration);
         printf("\n");
     }
 
@@ -976,9 +978,11 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto endSim = std::chrono::high_resolution_clock::now();
     auto simDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count();
+    long maxSimDuration = 0;
+    MPI_Reduce(&simDuration, &maxSimDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (g_rank == 0) {
-        printf("Simulation time: %ld ms\n", simDuration);
+        printf("Simulation time: %ld ms\n", maxSimDuration);
         printf("\n");
     }
 
@@ -990,14 +994,16 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto endDist = std::chrono::high_resolution_clock::now();
     auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
+    long maxDistDuration = 0;
+    MPI_Reduce(&distDuration, &maxDistDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (g_rank == 0) {
-        printf("Distance computation time: %ld ms\n", distDuration);
+        printf("Distance computation time: %ld ms\n", maxDistDuration);
         printf("\n");
     }
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long totalTime = maxPreDuration + maxSimDuration + maxDistDuration;
     if (g_rank == 0) printf("Total computation time: %ld ms\n", totalTime);
 
     if (g_rank == 0) {

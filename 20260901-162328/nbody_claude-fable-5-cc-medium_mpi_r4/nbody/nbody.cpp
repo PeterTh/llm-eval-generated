@@ -201,8 +201,10 @@ int main(int argc, char** argv) {
     }
 
     const double elapsed = MPI_Wtime() - startTime;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&elapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    if (rank == 0) printf("Simulation time: %ld ms\n", (long)(elapsed * 1000.0));
+    if (rank == 0) printf("Simulation time: %ld ms\n", (long)(maxElapsed * 1000.0));
 
     if (rank != 0) {
         MPI_Finalize();

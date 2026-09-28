@@ -181,20 +181,22 @@ int main(int argc, char** argv) {
 
     matrixMultiplyRows(localA, B, localC, N, localRows);
 
+    auto end = std::chrono::high_resolution_clock::now();
+    long localDuration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long duration = 0;
+    MPI_Reduce(&localDuration, &duration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     MPI_Gatherv(localC.data(), static_cast<int>(localRows * N), MPI_DOUBLE,
                 rank == 0 ? C.data() : nullptr, counts.data(), displs.data(), MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
 
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
     int exitCode = 0;
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", duration);
 
         // Calculate GFLOPS
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        double gflops = (2.0 * N * N * N) / (duration / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
 
         // Print results for external validation

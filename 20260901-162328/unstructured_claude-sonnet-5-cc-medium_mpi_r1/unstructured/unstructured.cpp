@@ -414,6 +414,7 @@ int main(int argc, char** argv) {
         MPI_Barrier(comm);
         auto end = std::chrono::high_resolution_clock::now();
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        MPI_Allreduce(MPI_IN_PLACE, &duration_ms, 1, MPI_LONG, MPI_MAX, comm);
 
         // Gather owned-row results into global order on rank 0
         std::vector<int> counts, displs;

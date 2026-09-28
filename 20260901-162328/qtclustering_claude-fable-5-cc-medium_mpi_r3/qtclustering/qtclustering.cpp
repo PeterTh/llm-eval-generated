@@ -388,10 +388,13 @@ int main(int argc, char** argv) {
     const std::vector<Cluster> clusters = qtClustering(points, threshold,
                                                        rank, nprocs);
 
-    MPI_Barrier(MPI_COMM_WORLD);
     const double cluster_end = MPI_Wtime();
+    const double local_cluster_time = cluster_end - cluster_start;
+    double global_cluster_time = 0.0;
+    MPI_Reduce(&local_cluster_time, &global_cluster_time, 1, MPI_DOUBLE,
+               MPI_MAX, 0, MPI_COMM_WORLD);
     const long cluster_time_ms =
-        static_cast<long>((cluster_end - cluster_start) * 1000.0);
+        static_cast<long>(global_cluster_time * 1000.0);
 
     if (rank != 0) {
         MPI_Finalize();

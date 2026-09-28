@@ -625,8 +625,8 @@ int main(int argc, char** argv) {
     }
 
     // Perform QT clustering
-    MPI_Barrier(MPI_COMM_WORLD);
     auto cluster_start = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     const std::vector<Cluster> clusters =
         qtClustering(points, threshold, ctxs, rank, nprocs);

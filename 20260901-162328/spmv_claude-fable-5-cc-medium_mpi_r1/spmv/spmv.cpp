@@ -275,8 +275,8 @@ int main(int argc, char** argv) {
     if (rank == 0) {
         printf("Computing SpMV...\n");
     }
-    MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     for (index_t iter = 0; iter < iterations; ++iter) {
         spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),

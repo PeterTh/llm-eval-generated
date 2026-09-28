@@ -722,6 +722,9 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDuration = duration.count();
+    long globalDuration = 0;
+    MPI_Reduce(&localDuration, &globalDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (pinnedC) CUDA_CHECK(cudaHostUnregister(C.data()));
     if (pinnedB) CUDA_CHECK(cudaHostUnregister(B.data()));
@@ -729,10 +732,10 @@ int main(int argc, char** argv) {
 
     int exitCode = 0;
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", globalDuration);
 
         // Calculate GFLOPS
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        double gflops = (2.0 * N * N * N) / (globalDuration / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
 
         // Print results for external validation

@@ -290,8 +290,8 @@ int main(int argc, char** argv) {
     const int numBlocks = (std::max(localN, 1) + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     // Run simulation
-    MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     for (int step = 0; step < numSteps; ++step) {
         if (localN > 0) {

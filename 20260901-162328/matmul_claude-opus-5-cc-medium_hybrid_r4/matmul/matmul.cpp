@@ -641,8 +641,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     const double seconds = std::chrono::duration<double>(end - start).count();
+    double maxSeconds = 0.0;
+    MPI_Reduce(&seconds, &maxSeconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Assemble the full result on the root
     if (isRoot) C.resize(N * N);
@@ -659,10 +660,10 @@ int main(int argc, char** argv) {
     }
 
     if (isRoot) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %.3f ms\n", maxSeconds * 1000.0);
 
         // Calculate GFLOPS
-        double gflops = (2.0 * N * N * N) / seconds / 1e9;
+        double gflops = (2.0 * N * N * N) / maxSeconds / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
 
         // Print results for external validation
