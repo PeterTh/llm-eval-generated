@@ -89,7 +89,7 @@ int main(int argc,char** argv) {
     if(z0==0) cudaCheck(cudaMemcpy(dc,hc.data()+plane,plane*sizeof(double),cudaMemcpyHostToDevice));
     if(z0+lz==nz) cudaCheck(cudaMemcpy(dc+plane*(lz+1),hc.data()+plane*lz,plane*sizeof(double),cudaMemcpyHostToDevice));
     if(rank==0) { printf("Cahn-Hilliard Phase Separation Benchmark\nGrid size: %zu x %zu x %zu\nTime steps: %d\nValidation: %s\n",nx,ny,nz,iterations,validate?"enabled":"disabled"); }
-    MPI_Barrier(MPI_COMM_WORLD); auto start=std::chrono::high_resolution_clock::now();
+    auto start=std::chrono::high_resolution_clock::now(); MPI_Barrier(MPI_COMM_WORLD);
     const int prev=(rank==0?MPI_PROC_NULL:rank-1), next=(rank==ranks-1?MPI_PROC_NULL:rank+1);
     const double invx2=1.0, invy2=1.0, invz2=1.0;
     for(int t=0;t<iterations;++t) {

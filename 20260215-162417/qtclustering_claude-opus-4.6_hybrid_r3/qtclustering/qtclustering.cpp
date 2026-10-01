@@ -436,10 +436,10 @@ int main(int argc, char** argv) {
 
     // CUDA: precompute NxN distance matrix on GPU
     std::vector<double> dist_matrix;
+    auto cluster_start = std::chrono::high_resolution_clock::now();
     computeDistanceMatrixGPU(points, dist_matrix, num_points);
 
     // Perform QT clustering with MPI + OpenMP
-    auto cluster_start = std::chrono::high_resolution_clock::now();
 
     const std::vector<Cluster> clusters = qtClustering(points, threshold,
                                                         dist_matrix.data());

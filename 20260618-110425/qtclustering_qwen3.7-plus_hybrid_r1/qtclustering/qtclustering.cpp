@@ -432,6 +432,7 @@ int main(int argc, char** argv) {
 
     // ---- CUDA: precompute distance matrix on GPU ---------------------------
     if (mpi_rank == 0) printf("Computing distance matrix on GPU...\n");
+    auto cluster_start = std::chrono::high_resolution_clock::now();
     auto gpu_start = std::chrono::high_resolution_clock::now();
 
     // Select GPU based on MPI rank (one rank per GPU)
@@ -450,7 +451,6 @@ int main(int argc, char** argv) {
 
     // ---- Hybrid MPI+OpenMP clustering --------------------------------------
     MPI_Barrier(MPI_COMM_WORLD);
-    auto cluster_start = std::chrono::high_resolution_clock::now();
 
     const std::vector<Cluster> clusters = qtClusteringHybrid(points, dist_matrix.data(), threshold);
 

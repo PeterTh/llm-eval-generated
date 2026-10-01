@@ -138,8 +138,10 @@ int main(int argc, char** argv) {
     MPI_Allreduce(&computeOk, &allComputeOk, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DOUBLE, C.data(), counts.data(), displacements.data(), MPI_DOUBLE, MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
+    const double localSeconds = std::chrono::duration<double>(end - start).count();
+    double seconds = 0.0;
+    MPI_Reduce(&localSeconds, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {
-        const double seconds = std::chrono::duration<double>(end - start).count();
         std::printf("Computation time: %ld ms\n", static_cast<long>(seconds * 1000.0));
         std::printf("Performance: %.3f GFLOPS\n", (2.0 * N * N * N) / seconds / 1e9);
         if (printResults) print_results(C, "MatrixC");

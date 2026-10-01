@@ -399,6 +399,10 @@ int main(int argc, char** argv) {
     }
     MPI_Bcast(points.data(), num_points * 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     
+    // Synchronize all ranks before timing
+    MPI_Barrier(MPI_COMM_WORLD);
+    double cluster_start = MPI_Wtime();
+
     // Pre-compute distance matrix on rank 0, then broadcast to all ranks
     std::vector<double> distMatrix;
     if (rank == 0) {
@@ -410,11 +414,7 @@ int main(int argc, char** argv) {
     }
     MPI_Bcast(distMatrix.data(), num_points * num_points, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     
-    // Synchronize all ranks before timing
-    MPI_Barrier(MPI_COMM_WORLD);
-    
     // Perform QT clustering (parallel across ranks)
-    double cluster_start = MPI_Wtime();
     
     const std::vector<Cluster> clusters = qtClustering(points, distMatrix, threshold, 
                                                        rank, num_ranks);

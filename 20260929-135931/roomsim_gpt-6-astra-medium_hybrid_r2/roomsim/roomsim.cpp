@@ -1123,11 +1123,13 @@ int main(int argc, char** argv) {
     if (worldRank == 0) printf("Distance computation time: %ld ms\n", distDuration);
     if (worldRank == 0) printf("\n");
 
+    long localTotalTime = preDuration + simDuration + distDuration;
+    long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (validate) collectValidation(state);
     int exitCode = 0;
     if (worldRank == 0) {
         // Total time
-        long totalTime = preDuration + simDuration + distDuration;
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

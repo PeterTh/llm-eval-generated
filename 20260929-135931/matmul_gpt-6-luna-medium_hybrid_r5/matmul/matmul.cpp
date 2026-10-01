@@ -146,10 +146,11 @@ int main(int argc, char** argv) {
                 rank == 0 ? fullC.data() : nullptr, counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
+    double seconds = std::chrono::duration<double>(end - start).count();
+    MPI_Allreduce(MPI_IN_PLACE, &seconds, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) {
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::duration<double>(seconds)).count();
         printf("Computation time: %ld ms\n", static_cast<long>(ms));
-        const double seconds = std::chrono::duration<double>(end - start).count();
         printf("Performance: %.3f GFLOPS\n", seconds > 0 ? (2.0 * N * N * N) / seconds / 1e9 : 0.0);
         if (printResults) print_results(fullC, "MatrixC");
         if (validate) {

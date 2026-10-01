@@ -513,11 +513,11 @@ int main(int argc, char** argv) {
     const int device_id = world_rank % device_count;
     checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
 
+    MPI_Barrier(MPI_COMM_WORLD);
+    const double cluster_start = MPI_Wtime();
     DistanceMatrix dist_matrix = computeDistanceMatrixCUDA(points, device_id);
     
     // Perform QT clustering
-    MPI_Barrier(MPI_COMM_WORLD);
-    const double cluster_start = MPI_Wtime();
     
     const std::vector<Cluster> clusters =
         qtClusteringMPI(points, dist_matrix.matrix, threshold, world_rank, world_size);

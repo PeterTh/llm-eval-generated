@@ -533,10 +533,9 @@ int main(int argc, char** argv) {
     setCudaDeviceForRank(mpi_rank);
 
     std::vector<double> dist_matrix;
-    computeDistanceMatrixCUDA(points, dist_matrix);
-
     CHECK_MPI(MPI_Barrier(MPI_COMM_WORLD));
     auto cluster_start = std::chrono::high_resolution_clock::now();
+    computeDistanceMatrixCUDA(points, dist_matrix);
     std::vector<Cluster> clusters = qtClustering(dist_matrix.data(), threshold,
                                                  num_points, mpi_rank, mpi_size);
     auto cluster_end = std::chrono::high_resolution_clock::now();

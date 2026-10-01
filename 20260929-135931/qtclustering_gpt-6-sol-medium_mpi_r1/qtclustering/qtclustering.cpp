@@ -307,7 +307,9 @@ int main(int argc, char** argv) {
     const double cluster_start = MPI_Wtime();
     const std::vector<Cluster> clusters = qtClustering(points, threshold, rank, ranks);
     MPI_Barrier(MPI_COMM_WORLD);
-    const double time_sec = MPI_Wtime() - cluster_start;
+    const double local_time_sec = MPI_Wtime() - cluster_start;
+    double time_sec = 0.0;
+    MPI_Reduce(&local_time_sec, &time_sec, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank != 0) {
         MPI_Finalize();

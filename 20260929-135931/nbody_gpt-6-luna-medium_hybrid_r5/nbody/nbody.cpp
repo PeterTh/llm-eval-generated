@@ -108,7 +108,9 @@ int main(int argc,char** argv) {
         MPI_Allgatherv(localBodies.data(),counts[rank],MPI_BYTE,bodies.data(),counts.data(),displs.data(),MPI_BYTE,MPI_COMM_WORLD);
     }
     MPI_Barrier(MPI_COMM_WORLD); auto end=std::chrono::high_resolution_clock::now();
-    if(rank==0)printf("Simulation time: %ld ms\n",(long)std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count());
+    long local_ms=std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count(), max_ms=0;
+    MPI_Reduce(&local_ms,&max_ms,1,MPI_LONG,MPI_MAX,0,MPI_COMM_WORLD);
+    if(rank==0)printf("Simulation time: %ld ms\n",max_ms);
     cudaFree(deviceBodies);
     if(rank==0&&printResults){std::vector<double> data;data.reserve((size_t)n*6);for(const auto& b:bodies){data.insert(data.end(),{b.pos.x,b.pos.y,b.pos.z,b.vel.x,b.vel.y,b.vel.z});}print_results(data,"Bodies");}
     int valid=1;

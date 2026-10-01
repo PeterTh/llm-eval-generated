@@ -695,9 +695,16 @@ int main(int argc, char** argv) {
     std::vector<Cluster> clusters = qtClustering(points, threshold,
                                                   mpi_rank, mpi_size);
 
+#ifdef __CUDACC__
+    syncCUDA();
+#endif
     auto cluster_end = std::chrono::high_resolution_clock::now();
-    auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        cluster_end - cluster_start);
+    long local_cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cluster_end - cluster_start).count();
+    long max_cluster_time = 0;
+    MPI_Reduce(&local_cluster_time, &max_cluster_time, 1, MPI_LONG,
+               MPI_MAX, 0, MPI_COMM_WORLD);
+    auto cluster_time = std::chrono::milliseconds(max_cluster_time);
 
     // Rank 0 prints results and statistics
     if (mpi_rank == 0) {

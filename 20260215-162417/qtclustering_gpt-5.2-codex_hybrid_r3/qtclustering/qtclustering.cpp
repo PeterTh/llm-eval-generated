@@ -568,6 +568,12 @@ int main(int argc, char** argv) {
     auto cluster_end = std::chrono::high_resolution_clock::now();
     auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
         cluster_end - cluster_start);
+    long local_ms = cluster_time.count();
+    long max_ms = 0;
+    MPI_Reduce(&local_ms, &max_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (g_mpi_rank == 0) {
+        cluster_time = std::chrono::milliseconds(max_ms);
+    }
     
     if (g_mpi_rank == 0) {
         printf("Clustering time: %ld ms\n", cluster_time.count());

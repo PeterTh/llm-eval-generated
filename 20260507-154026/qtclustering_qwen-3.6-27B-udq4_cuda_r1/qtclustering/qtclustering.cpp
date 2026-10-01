@@ -390,6 +390,8 @@ int main(int argc, char** argv) {
     // Upload points to GPU
     CUDA_CHECK(cudaMemcpy(d_points, points.data(), N * sizeof(Point), cudaMemcpyHostToDevice));
 
+    auto cluster_start = std::chrono::high_resolution_clock::now();
+
     // Compute pairwise distance matrix on GPU
     const int blockDim = 32;
     const int gridX = (N + blockDim - 1) / blockDim;
@@ -399,12 +401,12 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Perform QT clustering on GPU
-    auto cluster_start = std::chrono::high_resolution_clock::now();
 
     const std::vector<Cluster> clusters = qtClusteringGPU(
         points, threshold, d_distMatrix, d_clustered, d_inCluster,
         d_clusterMembers, d_maxDists, h_maxDists);
 
+    CUDA_CHECK(cudaDeviceSynchronize());
     auto cluster_end = std::chrono::high_resolution_clock::now();
     auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
         cluster_end - cluster_start);

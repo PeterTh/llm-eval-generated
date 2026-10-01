@@ -513,7 +513,10 @@ int main(int argc, char** argv) {
     double t0 = MPI_Wtime();
     const std::vector<Cluster> clusters =
         qtClustering(points, threshold, mpi_rank, mpi_size);
-    double cluster_time = MPI_Wtime() - t0;
+    double local_cluster_time = MPI_Wtime() - t0;
+    double cluster_time = 0.0;
+    MPI_Reduce(&local_cluster_time, &cluster_time, 1, MPI_DOUBLE, MPI_MAX,
+               0, MPI_COMM_WORLD);
 
     // ---- results (rank 0 only) ----
     if (mpi_rank == 0) {

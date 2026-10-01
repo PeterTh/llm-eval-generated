@@ -617,6 +617,7 @@ int main(int argc, char** argv) {
     }
 
     std::vector<GpuContext> gpu_ctxs(my_gpu_ids.size());
+    auto cluster_start = std::chrono::high_resolution_clock::now();
 #pragma omp parallel for num_threads(my_gpu_ids.size())
     for (size_t t = 0; t < my_gpu_ids.size(); ++t) {
         initGpuContext(gpu_ctxs[t], my_gpu_ids[t], points, num_points);
@@ -625,7 +626,6 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
 
     // Perform QT clustering
-    auto cluster_start = std::chrono::high_resolution_clock::now();
 
     const std::vector<Cluster> clusters =
         qtClustering(points, threshold, gpu_ctxs, world_rank, world_size);

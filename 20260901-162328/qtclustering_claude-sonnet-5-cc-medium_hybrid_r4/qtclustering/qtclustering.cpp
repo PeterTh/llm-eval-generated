@@ -607,14 +607,14 @@ int main(int argc, char** argv) {
     std::vector<Point> points(num_points);
     generateSyntheticData(points, num_points);
 
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto cluster_start = std::chrono::high_resolution_clock::now();
+
     // Set up per-GPU device contexts (distance matrix + scratch buffers).
     std::vector<GpuContext> gpus(my_devices.size());
     for (size_t g = 0; g < my_devices.size(); ++g) {
         setupGpuContext(gpus[g], my_devices[g], points, num_points);
     }
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    auto cluster_start = std::chrono::high_resolution_clock::now();
 
     const std::vector<Cluster> clusters = qtClustering(points, threshold, mpi_rank, mpi_size, gpus);
 

@@ -953,8 +953,8 @@ int main(int argc, char** argv) {
     rootPrintf("\n");
 
     // Precomputation
-    MPI_Barrier(MPI_COMM_WORLD);
     auto startPre = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     computeTimeDelays(state);
     computeFormFactors(state);
@@ -967,8 +967,8 @@ int main(int argc, char** argv) {
     rootPrintf("\n");
 
     // Simulation
-    MPI_Barrier(MPI_COMM_WORLD);
     auto startSim = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     runSimulation(state);
 
@@ -980,8 +980,8 @@ int main(int argc, char** argv) {
     rootPrintf("\n");
 
     // Distance computation
-    MPI_Barrier(MPI_COMM_WORLD);
     auto startDist = std::chrono::high_resolution_clock::now();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     computeDistances(state);
 

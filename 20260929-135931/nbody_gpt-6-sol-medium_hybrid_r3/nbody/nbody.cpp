@@ -235,7 +235,10 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     const auto endTime = std::chrono::high_resolution_clock::now();
     const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - start);
-    if (rank == 0) std::printf("Simulation time: %ld ms\n", duration.count());
+    const long localDuration = duration.count();
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) std::printf("Simulation time: %ld ms\n", maxDuration);
 
     if (printResults || validate) {
         checkCuda(cudaMemcpy(localVelocities.data(), deviceVelocities, localVelocities.size() * sizeof(Vec3),

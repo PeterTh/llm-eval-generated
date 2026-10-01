@@ -547,7 +547,10 @@ int main(int argc, char** argv) {
     const std::vector<Cluster> clusters =
         qtClustering(points, threshold, rank, num_ranks);
     auto t1 = std::chrono::high_resolution_clock::now();
-    auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0);
+    long local_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    long max_time_ms = 0;
+    MPI_Reduce(&local_time_ms, &max_time_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    auto cluster_time = std::chrono::milliseconds(max_time_ms);
 
     // ---- results (rank 0 only) ----
     if (rank == 0) {

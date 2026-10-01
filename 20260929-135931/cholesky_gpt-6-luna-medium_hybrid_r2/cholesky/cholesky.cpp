@@ -206,6 +206,9 @@ int main(int argc, char** argv) {
     
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long elapsed_ms = duration.count();
+    MPI_Allreduce(MPI_IN_PLACE, &elapsed_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
+    duration = std::chrono::milliseconds(elapsed_ms);
     
     if (!success) {
         if(rank==0) printf("Cholesky decomposition failed\n");

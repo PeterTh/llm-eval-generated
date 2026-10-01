@@ -206,7 +206,10 @@ int main(int argc, char** argv) {
     }
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long maxDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &maxDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    auto duration = std::chrono::milliseconds(maxDurationMs);
     if (worldRank == 0) {
         printf("Computation time: %ld ms\n", duration.count());
         double cellUpdates = static_cast<double>((nx-2) * (ny-2) * (nz-2)) * iterations;

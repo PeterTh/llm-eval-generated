@@ -566,12 +566,17 @@ int main(int argc, char** argv) {
                                         mpi_rank, mpi_size,
                                         MPI_COMM_WORLD);
 
+    CUDA_ABORT(cudaDeviceSynchronize());
     auto t1 = std::chrono::high_resolution_clock::now();
+    long local_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        t1 - t0).count();
+    long max_ms = 0;
+    MPI_Reduce(&local_ms, &max_ms, 1, MPI_LONG, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     // ---- Rank 0 reports timing and statistics ----
     if (mpi_rank == 0) {
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      t1 - t0);
+        auto ms = std::chrono::milliseconds(max_ms);
         printf("Clustering time: %ld ms\n", ms.count());
         printf("Clusters found: %zu\n", clusters.size());
 

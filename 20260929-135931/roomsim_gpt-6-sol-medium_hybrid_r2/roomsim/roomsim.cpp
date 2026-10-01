@@ -1016,7 +1016,9 @@ int main(int argc, char** argv) {
     if (mpiRank == 0) { printf("Distance computation time: %ld ms\n", distDuration); printf("\n"); }
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long localTotalTime = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startPre).count();
+    long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (mpiRank == 0) {
     printf("Total computation time: %ld ms\n", totalTime);
 

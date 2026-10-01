@@ -626,13 +626,14 @@ int main(int argc, char** argv) {
     }
     MPI_Bcast(points.data(), num_points * 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto cluster_start = std::chrono::high_resolution_clock::now();
+
     // Initialize GPU: compute distance matrix on CUDA device
     GPUState gpu_state;
     initGPU(gpu_state, points);
 
     // Perform QT clustering with MPI + OpenMP + CUDA
-    MPI_Barrier(MPI_COMM_WORLD);
-    auto cluster_start = std::chrono::high_resolution_clock::now();
 
     const std::vector<Cluster> clusters = qtClustering(
         points, threshold, rank, world_size, gpu_state);

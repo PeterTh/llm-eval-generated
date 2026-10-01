@@ -339,11 +339,10 @@ int main(int argc, char** argv) {
     std::vector<int> unclustered_indices;
     std::vector<Cluster> clusters;
     unclustered_indices.reserve(N);
-    for (int i = 0; i < N; ++i) unclustered_indices.push_back(i);
-
     // Start timing on every rank after synchronization
     MPI_Barrier(MPI_COMM_WORLD);
     const auto cluster_start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < N; ++i) unclustered_indices.push_back(i);
 
     while (true) {
         // Locally prune clustered indices

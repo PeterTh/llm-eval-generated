@@ -1007,9 +1007,11 @@ int main(int argc, char** argv) {
         MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, state.kij.data(),
                        counts.data(), offsets.data(), MPI_FLOAT, MPI_COMM_WORLD);
     }
-    if (rank == 0) {
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long localTotalTime = preDuration + simDuration + distDuration;
+    long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) {
     printf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics

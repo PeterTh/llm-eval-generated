@@ -220,6 +220,9 @@ int main(int argc, char** argv) {
     if (rank == 0) for (size_t i = 0; i < numNodes; ++i) for (size_t j = 0; j < numNodes; ++j)
         dist[idx2(j, i, numNodes)] = packedDist[i * numNodes + j];
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long maxDuration = duration.count();
+    MPI_Allreduce(MPI_IN_PLACE, &maxDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
+    duration = std::chrono::milliseconds(maxDuration);
     
     if (rank == 0) printf("Computation time: %ld ms\n", duration.count());
     

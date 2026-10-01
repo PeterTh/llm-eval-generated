@@ -483,6 +483,9 @@ int main(int argc, char** argv) {
     auto cluster_end = std::chrono::high_resolution_clock::now();
     auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
         cluster_end - cluster_start);
+    long cluster_time_ms = cluster_time.count();
+    MPI_Allreduce(MPI_IN_PLACE, &cluster_time_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
+    cluster_time = std::chrono::milliseconds(cluster_time_ms);
     
     if (mpi_rank == 0) {
         printf("Clustering time: %ld ms\n", cluster_time.count());

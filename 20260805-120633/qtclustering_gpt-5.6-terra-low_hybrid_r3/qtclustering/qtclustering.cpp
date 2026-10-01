@@ -181,8 +181,11 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD); const auto start = std::chrono::high_resolution_clock::now();
     const auto clusters = qtClustering(points, threshold, rank, ranks);
     MPI_Barrier(MPI_COMM_WORLD); const auto end = std::chrono::high_resolution_clock::now();
+    const long local_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long ms = 0;
+    MPI_Reduce(&local_ms, &ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!rank) {
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count(); int total = 0, maximum = 0;
+        int total = 0, maximum = 0;
         for (const auto& c : clusters) { total += c.members.size(); maximum = std::max(maximum, static_cast<int>(c.members.size())); }
         printf("QT Clustering Benchmark\nNumber of points: %d\nDistance threshold: %.2f\nMPI ranks: %d, OpenMP threads/rank: %d\nClustering time: %ld ms\nClusters found: %zu\n", n, threshold, ranks, omp_get_max_threads(), ms, clusters.size());
         printf("Points clustered: %d / %d (%.1f%%)\nAverage cluster size: %.2f\nMaximum cluster size: %d\n", total, n, 100. * total / n, clusters.empty() ? 0. : double(total) / clusters.size(), maximum);

@@ -367,6 +367,8 @@ int main(int argc, char** argv) {
     std::vector<GpuContext> gpuCtx(deviceCount);
     const size_t sharedBytes = THREADS_PER_BLOCK * (sizeof(double) + sizeof(int));
 
+    auto cluster_start = std::chrono::high_resolution_clock::now();
+
     #pragma omp parallel for num_threads(deviceCount) schedule(static)
     for (int d = 0; d < deviceCount; ++d) {
         GpuContext& ctx = gpuCtx[d];
@@ -390,7 +392,6 @@ int main(int argc, char** argv) {
     }
 
     // Main clustering loop
-    auto cluster_start = std::chrono::high_resolution_clock::now();
 
     std::vector<unsigned char> clusteredU8(N, 0);
     std::vector<int> unclustered_indices(N);

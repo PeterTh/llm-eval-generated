@@ -428,10 +428,10 @@ int main(int argc, char** argv) {
         MPI_Abort(MPI_COMM_WORLD, 2);
     }
 
-    computeDistanceMatrixCUDA(points, dist2, mpi_rank);
-
     MPI_Barrier(MPI_COMM_WORLD);
     const auto cluster_start = std::chrono::high_resolution_clock::now();
+
+    computeDistanceMatrixCUDA(points, dist2, mpi_rank);
 
     const std::vector<Cluster> clusters = qtClusteringHybridMPI(points, dist2, threshold, mpi_rank, mpi_size);
 

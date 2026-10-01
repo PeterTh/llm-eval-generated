@@ -237,8 +237,10 @@ int main(int argc, char** argv) {
     const auto start = std::chrono::high_resolution_clock::now();
     const std::vector<Cluster> clusters = qtClustering(points, threshold, rank, ranks);
     MPI_Barrier(MPI_COMM_WORLD);
+    const long local_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - start).count();
+    long ms = 0;
+    MPI_Reduce(&local_ms, &ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!rank) {
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - start).count();
         int total = 0, maximum = 0; for (const auto& c : clusters) { total += c.members.size(); maximum = std::max(maximum, static_cast<int>(c.members.size())); }
         printf("Clustering time: %ld ms\nClusters found: %zu\nPoints clustered: %d / %d (%.1f%%)\nAverage cluster size: %.2f\nMaximum cluster size: %d\n", ms, clusters.size(), total, n, 100.0 * total / n, clusters.empty() ? 0.0 : static_cast<double>(total) / clusters.size(), maximum);
         const double seconds = std::max(0.001, ms / 1000.0); printf("Performance: %.1f clusters/s, %.1f points/s\n", clusters.size() / seconds, n / seconds);

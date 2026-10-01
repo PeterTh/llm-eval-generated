@@ -250,9 +250,12 @@ int main(int argc, char** argv) {
                 rank == 0 ? results.data() : nullptr, counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    double localTimeMs = duration.count() / 1000.0;
+    double maxTimeMs = 0.0;
+    MPI_Reduce(&localTimeMs, &maxTimeMs, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {
-    printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
-    printf("Options per second: %.0f\n", duration.count() ? numOptions / (duration.count() / 1e6) : 0.0);
+    printf("Computation time: %.3f ms\n", maxTimeMs);
+    printf("Options per second: %.0f\n", maxTimeMs ? numOptions / (maxTimeMs / 1000.0) : 0.0);
     
     // Print results for external validation
     if (printResults) {

@@ -109,12 +109,14 @@ int main(int argc, char** argv) {
     auto start = std::chrono::high_resolution_clock::now();
     runSimulation(root, iters, rank, size, first, rows, local);
     auto end = std::chrono::high_resolution_clock::now();
+    long local_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long ms = 0;
+    MPI_Reduce(&local_ms, &ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     int *counts = nullptr, *displs = nullptr;
     if (!rank) { counts = new int[size]; displs = new int[size]; for (int r = 0, off = 0; r < size; ++r) { counts[r] = 2 * (root / size + (r < rem)) * root; displs[r] = off; off += counts[r]; } }
     std::vector<ElementDynamic> all(rank == 0 ? n : 0);
     MPI_Gatherv(local.data(), static_cast<int>(local.size() * 2), MPI_DOUBLE, all.data(), counts, displs, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (!rank) {
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
         printf("Computation time: %ld ms\n", ms);
         int measured = std::max(iters - 1, 1); double eps = (measured * static_cast<double>(n)) / (ms / 1000.0) / 1e9;
         printf("Performance:\n  Time per iteration: %.4f ms\n  Elements/sec: %.4f GigaElements/s\n  Performance: %.4f GFLOPS\n  Result hash: %016lX\n\n", static_cast<double>(ms) / measured, eps, eps * 22, computeHash(all));

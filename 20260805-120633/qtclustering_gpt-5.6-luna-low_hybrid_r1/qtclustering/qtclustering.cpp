@@ -399,10 +399,10 @@ int main(int argc, char** argv) {
     // Generate synthetic data
     std::vector<Point> points(num_points);
     generateSyntheticData(points, num_points);
+    auto cluster_start = std::chrono::high_resolution_clock::now();
     const std::vector<double> distances = buildDistanceMatrix(points);
     
     // Perform QT clustering
-    auto cluster_start = std::chrono::high_resolution_clock::now();
     
     const std::vector<Cluster> clusters = qtClustering(points, threshold, distances, mpi_rank, mpi_size);
     

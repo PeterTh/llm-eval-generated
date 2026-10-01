@@ -358,11 +358,11 @@ int main(int argc, char** argv) {
     std::vector<Point> points(num_points);
     generateSyntheticData(points, num_points);
 
-    // Precompute pairwise distance matrix for fast lookups
-    precomputeDistances(points);
-
     MPI_Barrier(MPI_COMM_WORLD);
     auto cluster_start = std::chrono::high_resolution_clock::now();
+
+    // Precompute pairwise distance matrix for fast lookups
+    precomputeDistances(points);
 
     const std::vector<Cluster> clusters = qtClustering(points, threshold);
 

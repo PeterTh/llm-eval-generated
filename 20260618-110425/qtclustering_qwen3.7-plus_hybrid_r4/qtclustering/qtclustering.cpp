@@ -465,11 +465,11 @@ int main(int argc, char** argv) {
 
     // Compute distance matrix on GPU
     std::vector<double> dist_matrix;
+    MPI_Barrier(MPI_COMM_WORLD);
+    double start_time = MPI_Wtime();
     computeDistanceMatrixGPU(points, dist_matrix);
 
     // Perform QT clustering (MPI + OpenMP)
-    MPI_Barrier(MPI_COMM_WORLD);
-    double start_time = MPI_Wtime();
 
     const std::vector<Cluster> clusters = qtClustering(points, dist_matrix.data(), threshold);
 
