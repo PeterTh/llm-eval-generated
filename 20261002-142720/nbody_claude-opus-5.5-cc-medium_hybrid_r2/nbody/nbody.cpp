@@ -422,7 +422,10 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     
-    if (root) printf("Simulation time: %ld ms\n", duration.count());
+    long localDuration = duration.count();
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (root) printf("Simulation time: %ld ms\n", maxDuration);
 
     // Collect final state: positions are already replicated in hPos when
     // exchanging; velocities are gathered on rank 0 (and everywhere for -v).

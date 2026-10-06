@@ -1214,11 +1214,14 @@ int run(int argc, char** argv) {
     long long nonZeroKij = 0;
     MPI_Reduce(&state.localNonZeroKij, &nonZeroKij, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
+    long localTotalTime = preDuration + simDuration + distDuration;
+    long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     // Everything below (reporting, hash, validation) happens on rank 0 only
     if (g_rank != 0) return 0;
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
     printf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics

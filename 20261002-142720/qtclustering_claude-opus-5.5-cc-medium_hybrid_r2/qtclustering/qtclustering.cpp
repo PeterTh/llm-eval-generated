@@ -1274,8 +1274,10 @@ static int runBenchmark(int argc, char** argv, const int rank) {
     const std::vector<Cluster> clusters = qtClustering(points, threshold, staging);
     
     auto cluster_end = std::chrono::high_resolution_clock::now();
-    auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        cluster_end - cluster_start);
+    long cluster_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cluster_end - cluster_start).count();
+    MPI_Allreduce(MPI_IN_PLACE, &cluster_time_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
+    auto cluster_time = std::chrono::milliseconds(cluster_time_ms);
     
     CUDA_CHECK(cudaFreeHost(staging));
 

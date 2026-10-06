@@ -467,7 +467,7 @@ int main(int argc, char** argv) {
     MPI_Barrier(comm);
     auto end = std::chrono::high_resolution_clock::now();
     long duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    MPI_Bcast(&duration_ms, 1, MPI_LONG, 0, comm);
+    MPI_Allreduce(MPI_IN_PLACE, &duration_ms, 1, MPI_LONG, MPI_MAX, comm);
     
     // Compute hash for verification
     const uint64_t local_hash = computeHash(energy, flux, static_cast<uint64_t>(g_begin));

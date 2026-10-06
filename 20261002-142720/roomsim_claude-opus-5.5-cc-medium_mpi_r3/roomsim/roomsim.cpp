@@ -1310,7 +1310,8 @@ int main(int argc, char** argv) {
     printf("\n");
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long totalTime = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startPre).count();
+    MPI_Allreduce(MPI_IN_PLACE, &totalTime, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
     printf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics

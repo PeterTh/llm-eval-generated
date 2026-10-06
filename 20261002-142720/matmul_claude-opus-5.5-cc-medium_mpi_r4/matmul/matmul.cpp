@@ -350,7 +350,10 @@ int main(int argc, char** argv) {
     }
     
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDuration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long globalDuration = 0;
+    MPI_Reduce(&localDuration, &globalDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    auto duration = std::chrono::milliseconds(globalDuration);
 
     for (auto& t : blockTypes) MPI_Type_free(&t);
     if (rowType != MPI_DATATYPE_NULL) MPI_Type_free(&rowType);

@@ -457,8 +457,12 @@ int runBenchmark(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     
     auto cluster_end = std::chrono::high_resolution_clock::now();
-    auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        cluster_end - cluster_start);
+    const long local_cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cluster_end - cluster_start).count();
+    long max_cluster_time;
+    MPI_Allreduce(&local_cluster_time, &max_cluster_time, 1, MPI_LONG, MPI_MAX,
+                  MPI_COMM_WORLD);
+    const auto cluster_time = std::chrono::milliseconds(max_cluster_time);
     
     printf("Clustering time: %ld ms\n", cluster_time.count());
     printf("Clusters found: %zu\n", clusters.size());

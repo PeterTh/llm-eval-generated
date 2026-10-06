@@ -398,7 +398,10 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);  // all ranks have their prices
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    const long long localDuration = static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+    long long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+    auto duration = std::chrono::microseconds(maxDuration);
 
     // Collect the distributed results on rank 0 (in messages of <= kChunk elements)
     if (collect && nranks > 1) {

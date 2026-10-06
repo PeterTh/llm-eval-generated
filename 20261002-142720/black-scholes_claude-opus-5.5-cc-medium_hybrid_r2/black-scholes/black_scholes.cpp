@@ -385,7 +385,9 @@ int main(int argc, char** argv) {
     MPI_Waitall(static_cast<int>(reqs.size()), reqs.data(), MPI_STATUSES_IGNORE);
     
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    const double localSeconds = std::chrono::duration<double>(end - start).count();
+    double maxSeconds = 0.0;
+    MPI_Reduce(&localSeconds, &maxSeconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     #pragma omp parallel for num_threads(nDev) schedule(static, 1)
     for (int k = 0; k < nDev; ++k) teardownDevice(ctxs[k]);
@@ -397,8 +399,8 @@ int main(int argc, char** argv) {
 
     int exitCode = 0;
     if (rank == 0) {
-        printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
-        printf("Options per second: %.0f\n", numOptions / (duration.count() / 1e6));
+        printf("Computation time: %.3f ms\n", maxSeconds * 1000.0);
+        printf("Options per second: %.0f\n", numOptions / maxSeconds);
         
         // Print results for external validation
         if (printResults) {

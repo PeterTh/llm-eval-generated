@@ -369,7 +369,7 @@ static int run(int argc, char** argv, const int rank, const int size) {
     MPI_Barrier(d.cart);
     auto end = std::chrono::high_resolution_clock::now();
     long ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    MPI_Bcast(&ms, 1, MPI_LONG, 0, d.cart);
+    MPI_Allreduce(MPI_IN_PLACE, &ms, 1, MPI_LONG, MPI_MAX, d.cart);
 
     if (rank == 0) {
         printf("Computation time: %ld ms\n", ms);

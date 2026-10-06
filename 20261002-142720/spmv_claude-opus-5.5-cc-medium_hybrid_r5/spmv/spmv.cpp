@@ -815,6 +815,10 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const long localDuration = duration.count();
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (root) duration = std::chrono::milliseconds(maxDuration);
 
     CUDA_CHECK(cudaFreeHost(h_localOut));
     CUDA_CHECK(cudaFree(d_val));

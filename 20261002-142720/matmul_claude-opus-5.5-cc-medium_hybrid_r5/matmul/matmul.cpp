@@ -826,6 +826,9 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_duration_ms = duration.count(), max_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &max_duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) duration = std::chrono::milliseconds(max_duration_ms);
 
     MPI_Type_free(&rowType);
     for (auto& comm : resultComms) MPI_Comm_free(&comm);

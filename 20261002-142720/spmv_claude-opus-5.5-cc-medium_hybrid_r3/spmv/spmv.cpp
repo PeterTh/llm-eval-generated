@@ -715,8 +715,11 @@ int run(int argc, char** argv, const int rank, const int nranks) {
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    const double elapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const double localElapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
+    double elapsedMs = 0.0;
+    MPI_Reduce(&localElapsedMs, &elapsedMs, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::duration<double, std::milli>(elapsedMs));
 
     CUDA_CHECK(cudaEventDestroy(longDone));
     CUDA_CHECK(cudaStreamDestroy(stream));

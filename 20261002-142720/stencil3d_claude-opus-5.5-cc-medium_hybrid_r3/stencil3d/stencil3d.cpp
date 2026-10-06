@@ -794,14 +794,16 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDuration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long duration = 0;
+    MPI_Reduce(&localDuration, &duration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (root) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", duration);
 
         // Calculate performance metrics
         double cellUpdates = (double)((nx-2) * (ny-2) * (nz-2)) * iterations;
-        double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;  // Million cell updates per second
+        double mcups = cellUpdates / (duration / 1000.0) / 1e6;  // Million cell updates per second
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

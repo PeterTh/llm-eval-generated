@@ -482,7 +482,10 @@ int run(int argc, char** argv, const int rank, const int nranks) {
                 0, MPI_COMM_WORLD);
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const long local_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long max_ms = 0;
+    MPI_Reduce(&local_ms, &max_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    auto duration = std::chrono::milliseconds(max_ms);
 
     CUDA_CHECK(cudaFreeHost(h_localOut));
     CUDA_CHECK(cudaFree(d_val));

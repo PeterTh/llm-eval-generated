@@ -368,7 +368,9 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     
-    if (rank == 0) printf("Simulation time: %ld ms\n", duration.count());
+    long local_ms = duration.count(), global_ms = 0;
+    MPI_Reduce(&local_ms, &global_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) printf("Simulation time: %ld ms\n", global_ms);
 
     // Bring final state back to the host.
     if (size == 1 && n3) CUDA_CHECK(cudaMemcpy(hPos, dPos, n3 * sizeof(double), cudaMemcpyDeviceToHost));

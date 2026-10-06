@@ -1000,7 +1000,11 @@ static int runMain(int argc, char** argv, const int rank) {
         cluster_end - cluster_start);
     
     // All ranks hold the identical result; only rank 0 reports
+    const long local_time_ms = cluster_time.count();
+    long max_time_ms = 0;
+    MPI_Reduce(&local_time_ms, &max_time_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!root) return 0;
+    cluster_time = std::chrono::milliseconds(max_time_ms);
 
     printf("Clustering time: %ld ms\n", cluster_time.count());
     printf("Clusters found: %zu\n", clusters.size());

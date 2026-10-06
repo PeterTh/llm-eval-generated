@@ -403,6 +403,9 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDurationMs = duration.count();
+    long maxDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &maxDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Release resources
     MPI_Type_free(&rowType);
@@ -421,10 +424,10 @@ int main(int argc, char** argv) {
 
     int exitCode = 0;
     if (root) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", maxDurationMs);
         
         // Calculate GFLOPS
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        double gflops = (2.0 * N * N * N) / (maxDurationMs / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
         
         // Print results for external validation

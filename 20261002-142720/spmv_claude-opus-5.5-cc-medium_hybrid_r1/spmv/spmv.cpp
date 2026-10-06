@@ -728,6 +728,9 @@ int run(int argc, char** argv, const int rank, const int nranks) {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_ms = duration.count();
+    long max_ms = 0;
+    MPI_Reduce(&local_ms, &max_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     CUDA_CHECK(cudaStreamDestroy(stream));
     for (void* p : {static_cast<void*>(d_cols), static_cast<void*>(d_val), static_cast<void*>(d_sliceOff),
@@ -737,11 +740,11 @@ int run(int argc, char** argv, const int rank, const int nranks) {
 
     if (!root) return 0;
 
-    printf("Computation time: %ld ms\n", duration.count());
+    printf("Computation time: %ld ms\n", max_ms);
 
     // Calculate performance metrics
-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
-    const double avgTime = duration.count() / static_cast<double>(iterations);
+    const double gflops = (2.0 * nItems * iterations) / (max_ms / 1000.0) / 1e9;
+    const double avgTime = max_ms / static_cast<double>(iterations);
 
     printf("Average time per iteration: %.3f ms\n", avgTime);
     printf("Performance: %.3f GFLOPS\n", gflops);

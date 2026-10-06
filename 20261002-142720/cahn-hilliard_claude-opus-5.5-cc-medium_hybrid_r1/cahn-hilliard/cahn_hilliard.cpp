@@ -455,8 +455,11 @@ int main(int argc, char** argv) {
         MPI_Comm_free(&comm);
     }
 
+    long long globalElapsedMs = 0;
+    MPI_Reduce(&elapsedMs, &globalElapsedMs, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
     int exitCode = 0;
     if (root) {
+        elapsedMs = globalElapsedMs;
         printf("Computation time: %lld ms\n", elapsedMs);
 
         // Calculate performance

@@ -1750,6 +1750,7 @@ int main(int argc, char** argv) {
     auto startSim = std::chrono::high_resolution_clock::now();
 
     runSimulation(state);
+    CUDA_CHECK(cudaDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
     auto endSim = std::chrono::high_resolution_clock::now();
@@ -1767,6 +1768,9 @@ int main(int argc, char** argv) {
 
     auto endDist = std::chrono::high_resolution_clock::now();
     auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
+    long localTotalTime = preDuration + simDuration + distDuration;
+    long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     releaseDevice(state);
 
@@ -1776,7 +1780,6 @@ int main(int argc, char** argv) {
         printf("\n");
 
         // Total time
-        long totalTime = preDuration + simDuration + distDuration;
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

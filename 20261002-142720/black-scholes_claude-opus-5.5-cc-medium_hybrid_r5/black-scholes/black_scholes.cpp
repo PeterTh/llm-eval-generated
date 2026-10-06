@@ -418,6 +418,9 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    double local_ms = duration.count() / 1000.0;
+    double global_ms = 0.0;
+    MPI_Reduce(&local_ms, &global_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Release GPU / pinned resources
     #pragma omp parallel for num_threads(numWorkers) schedule(static, 1)
@@ -438,8 +441,8 @@ int main(int argc, char** argv) {
 
     int exitCode = 0;
     if (root) {
-        printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
-        printf("Options per second: %.0f\n", numOptions / (duration.count() / 1e6));
+        printf("Computation time: %.3f ms\n", global_ms);
+        printf("Options per second: %.0f\n", numOptions / (global_ms / 1000.0));
         
         // Print results for external validation
         if (printResults) {

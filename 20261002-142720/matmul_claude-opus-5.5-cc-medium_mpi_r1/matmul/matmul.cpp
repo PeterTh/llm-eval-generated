@@ -324,6 +324,9 @@ int main(int argc, char** argv) {
     
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_ms = duration.count();
+    long global_ms = 0;
+    MPI_Reduce(&local_ms, &global_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     for (auto& t : recvTypes) MPI_Type_free(&t);
     if (rowType != MPI_DATATYPE_NULL) MPI_Type_free(&rowType);
@@ -333,10 +336,10 @@ int main(int argc, char** argv) {
 
     int exitCode = 0;
     if (root) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", global_ms);
         
         // Calculate GFLOPS
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        double gflops = (2.0 * N * N * N) / (global_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
         
         // Print results for external validation

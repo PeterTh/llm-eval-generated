@@ -420,7 +420,9 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     long long durationMs = duration.count();
-    MPI_Bcast(&durationMs, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+    long long globalDurationMs = 0;
+    MPI_Reduce(&durationMs, &globalDurationMs, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (isRoot) durationMs = globalDurationMs;
 
     if (isRoot) {
         printf("Computation time: %lld ms\n", durationMs);

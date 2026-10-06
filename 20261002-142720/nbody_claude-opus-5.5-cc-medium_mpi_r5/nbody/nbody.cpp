@@ -268,6 +268,8 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_ms = duration.count(), global_ms = 0;
+    MPI_Reduce(&local_ms, &global_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     
     // Collect velocities on rank 0 (positions are already replicated)
     std::vector<double> allVel;
@@ -282,7 +284,7 @@ int main(int argc, char** argv) {
             bodies[i].vel = Vec3(allVel[3 * i + 0], allVel[3 * i + 1], allVel[3 * i + 2]);
         }
 
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %ld ms\n", global_ms);
         
         // Print results for external validation
         if (printResults) {

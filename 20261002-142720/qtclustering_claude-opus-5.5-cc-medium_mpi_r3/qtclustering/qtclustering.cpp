@@ -385,8 +385,12 @@ static int runMain(int argc, char** argv, const int rank) {
     
     MPI_Barrier(MPI_COMM_WORLD);
     auto cluster_end = std::chrono::high_resolution_clock::now();
-    auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        cluster_end - cluster_start);
+    long local_cluster_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cluster_end - cluster_start).count();
+    long max_cluster_time_ms = local_cluster_time_ms;
+    MPI_Reduce(&local_cluster_time_ms, &max_cluster_time_ms, 1, MPI_LONG, MPI_MAX,
+               0, MPI_COMM_WORLD);
+    auto cluster_time = std::chrono::milliseconds(max_cluster_time_ms);
     
     printf("Clustering time: %ld ms\n", cluster_time.count());
     printf("Clusters found: %zu\n", clusters.size());

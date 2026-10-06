@@ -1164,7 +1164,11 @@ int run(int argc, char** argv) {
     auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
         cluster_end - cluster_start);
     
+    const long local_cluster_ms = cluster_time.count();
+    long max_cluster_ms = 0;
+    MPI_Reduce(&local_cluster_ms, &max_cluster_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!root) return 0;   // all output and validation on rank 0
+    cluster_time = std::chrono::milliseconds(max_cluster_ms);
     
     printf("Clustering time: %ld ms\n", cluster_time.count());
     printf("Clusters found: %zu\n", clusters.size());

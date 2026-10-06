@@ -348,8 +348,11 @@ int main(int argc, char** argv) {
     for (auto& t : blockTypes) MPI_Type_free(&t);
 
     int exitCode = 0;
+    long localDuration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (root) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        auto duration = std::chrono::milliseconds(maxDuration);
         
         printf("Computation time: %ld ms\n", duration.count());
         

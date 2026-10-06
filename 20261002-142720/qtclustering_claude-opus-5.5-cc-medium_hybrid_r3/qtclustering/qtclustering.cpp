@@ -1259,6 +1259,10 @@ int main(int argc, char** argv) {
     auto cluster_end = std::chrono::high_resolution_clock::now();
     auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
         cluster_end - cluster_start);
+    long local_time_ms = cluster_time.count();
+    long max_time_ms = 0;
+    MPI_Reduce(&local_time_ms, &max_time_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (root) cluster_time = std::chrono::milliseconds(max_time_ms);
 
     if (!root) {
         MPI_Finalize();

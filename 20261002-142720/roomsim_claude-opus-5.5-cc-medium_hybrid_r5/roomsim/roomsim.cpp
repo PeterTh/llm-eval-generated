@@ -1799,7 +1799,10 @@ int main(int argc, char** argv) {
     computeFormFactors(state);
 
     double endPre = wallMs(MPI_COMM_WORLD);
-    long preDuration = static_cast<long>(endPre - startPre);
+    double localPreDuration = endPre - startPre;
+    double globalPreDuration = 0.0;
+    MPI_Reduce(&localPreDuration, &globalPreDuration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    long preDuration = static_cast<long>(globalPreDuration);
 
     if (root) {
         printf("Precomputation time: %ld ms\n", preDuration);
@@ -1812,7 +1815,10 @@ int main(int argc, char** argv) {
     runSimulation(state);
 
     double endSim = wallMs(MPI_COMM_WORLD);
-    long simDuration = static_cast<long>(endSim - startSim);
+    double localSimDuration = endSim - startSim;
+    double globalSimDuration = 0.0;
+    MPI_Reduce(&localSimDuration, &globalSimDuration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    long simDuration = static_cast<long>(globalSimDuration);
 
     if (root) {
         printf("Simulation time: %ld ms\n", simDuration);
@@ -1825,7 +1831,10 @@ int main(int argc, char** argv) {
     computeDistances(state);
 
     double endDist = wallMs(MPI_COMM_WORLD);
-    long distDuration = static_cast<long>(endDist - startDist);
+    double localDistDuration = endDist - startDist;
+    double globalDistDuration = 0.0;
+    MPI_Reduce(&localDistDuration, &globalDistDuration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    long distDuration = static_cast<long>(globalDistDuration);
 
     int exitCode = 0;
     if (root) {

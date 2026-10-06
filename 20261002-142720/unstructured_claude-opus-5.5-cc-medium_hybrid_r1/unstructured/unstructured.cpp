@@ -623,7 +623,7 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     long long duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    MPI_Bcast(&duration_ms, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &duration_ms, 1, MPI_LONG_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     // Results back to host, hash via XOR-reduction over ranks
     std::vector<ElementDynamic> local_dyn = downloadResults(dm);

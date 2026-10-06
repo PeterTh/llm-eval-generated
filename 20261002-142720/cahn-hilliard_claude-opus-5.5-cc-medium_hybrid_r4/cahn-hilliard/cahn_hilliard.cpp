@@ -389,6 +389,9 @@ int main(int argc, char** argv) {
         MPI_Barrier(comm);
         auto end = std::chrono::high_resolution_clock::now();
         durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        long long maxDurationMs = 0;
+        MPI_Reduce(&durationMs, &maxDurationMs, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, comm);
+        if (root) durationMs = maxDurationMs;
 
         // Gather the final field on rank 0 when needed
         if (printResults || validate) {

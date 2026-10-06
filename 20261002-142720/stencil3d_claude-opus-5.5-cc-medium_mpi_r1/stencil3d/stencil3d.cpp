@@ -342,7 +342,10 @@ int main(int argc, char** argv) {
 
         MPI_Barrier(cart);
         auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        const long localDuration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        long maxDuration = 0;
+        MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, cart);
+        auto duration = std::chrono::milliseconds(maxDuration);
 
         if (isRoot) {
             printf("Computation time: %ld ms\n", duration.count());
