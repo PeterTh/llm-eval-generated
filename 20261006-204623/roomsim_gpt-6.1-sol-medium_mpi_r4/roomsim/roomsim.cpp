@@ -989,6 +989,8 @@ int main(int argc, char** argv) {
 
     // Total time
     long totalTime = preDuration + simDuration + distDuration;
+    MPI_Allreduce(MPI_IN_PLACE, &totalTime, 1, MPI_LONG, MPI_MAX,
+                  MPI_COMM_WORLD);
     rootPrintf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics

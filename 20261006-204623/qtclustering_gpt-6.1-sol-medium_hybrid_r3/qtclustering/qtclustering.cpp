@@ -496,11 +496,14 @@ int main(int argc, char** argv) {
     const std::vector<Cluster> clusters = qtClustering(points, threshold);
     
     MPI_Barrier(MPI_COMM_WORLD);
+    auto cluster_end = std::chrono::high_resolution_clock::now();
+    const long local_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cluster_end - cluster_start).count();
+    long max_time_ms = 0;
+    MPI_Reduce(&local_time_ms, &max_time_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank != 0) return 0;
 
-    auto cluster_end = std::chrono::high_resolution_clock::now();
-    auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        cluster_end - cluster_start);
+    auto cluster_time = std::chrono::milliseconds(max_time_ms);
     
     printf("Clustering time: %ld ms\n", cluster_time.count());
     printf("Clusters found: %zu\n", clusters.size());

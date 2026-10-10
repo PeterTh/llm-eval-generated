@@ -1014,10 +1014,14 @@ int main(int argc, char** argv) {
     rootPrintf("Distance computation time: %ld ms\n", distDuration);
     rootPrintf("\n");
 
+    long localTotalTime = preDuration + simDuration + distDuration;
+    long globalTotalTime = 0;
+    MPI_Reduce(&localTotalTime, &globalTotalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     int result = 0;
     if (mpiRank == 0) {
         // Total time
-        long totalTime = preDuration + simDuration + distDuration;
+        long totalTime = globalTotalTime;
         rootPrintf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

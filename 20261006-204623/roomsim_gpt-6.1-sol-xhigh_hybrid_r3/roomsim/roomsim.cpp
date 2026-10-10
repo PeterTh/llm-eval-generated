@@ -1482,6 +1482,7 @@ int main(int argc, char **argv) {
 
         mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
         long preDuration = static_cast<long>((MPI_Wtime() - startPre) * 1000);
+        mpiCheck(MPI_Allreduce(MPI_IN_PLACE, &preDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD));
         if (!runtime.rank)
             printf("Precomputation time: %ld ms\n\n", preDuration);
 
@@ -1492,6 +1493,7 @@ int main(int argc, char **argv) {
 
         mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
         long simDuration = static_cast<long>((MPI_Wtime() - startSim) * 1000);
+        mpiCheck(MPI_Allreduce(MPI_IN_PLACE, &simDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD));
         if (!runtime.rank)
             printf("Simulation time: %ld ms\n\n", simDuration);
 
@@ -1502,6 +1504,7 @@ int main(int argc, char **argv) {
 
         mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
         long distDuration = static_cast<long>((MPI_Wtime() - startDist) * 1000);
+        mpiCheck(MPI_Allreduce(MPI_IN_PLACE, &distDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD));
         uint64_t matrixMemory = state.rows * state.numTriangles * (sizeof(val_t) + sizeof(int)) +
                                 state.numTimesteps * (state.numTriangles + state.rows) * sizeof(val_t);
         uint64_t maximumMatrixMemory = 0;
