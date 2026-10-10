@@ -1,0 +1,3500 @@
+Reading additional input from stdin...
+OpenAI Codex v0.160.1
+--------
+workdir: /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+model: gpt-6.1-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 01a11494-4311-78c2-a7b9-84286160a6a2
+--------
+user
+Parallelize the unstructured benchmark code found in ./unstructured/ with MPI for distributed memory cluster parallelism. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the solver and build setup, then add MPI domain decomposition and communication while preserving the numerical update and executable name. I’ll compare results across process counts and check the communication overhead.
+
+exec
+/bin/bash -lc "pwd && rg --files -g 'AGENTS.md' -g '*CMakeLists*' -g '*.c' -g '*.cc' -g '*.cpp' -g '*.h' -g '*.hpp' -g 'README*' -g '*.f90' -g 'Makefile'" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ succeeded in 0ms:
+/home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+common/results_output.hpp
+common/hash.hpp
+
+exec
+/bin/bash -lc "cat unstructured/CMakeLists.txt && sed -n '1,260p' unstructured/unstructured.cpp" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ succeeded in 0ms:
+cmake_minimum_required(VERSION 3.10)
+project(unstructured_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(unstructured unstructured.cpp)
+
+# Enable optimizations
+target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link math library
+target_link_libraries(unstructured m)
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+// Types to represent unstructured mesh elements
+using idx_t = uint64_t;
+using val_t = double;
+
+// Maximum number of connections per element (for a 2D grid: 4 neighbors)
+constexpr int MAX_CONNECTIONS = 8;
+
+// Material properties for energy transfer
+struct Material {
+    val_t transfer_coeff;  // Energy transfer coefficient
+    val_t external_flow;   // External energy source/sink
+};
+
+// Static connectivity information for each element
+struct ElementStatic {
+    idx_t material_idx;
+    idx_t num_connections;
+    idx_t connected_idx[MAX_CONNECTIONS];     // Indices of connected elements
+    val_t connected_flux[MAX_CONNECTIONS];    // Flux coefficients for each connection
+};
+
+// Dynamic state for each element
+struct ElementDynamic {
+    val_t current_energy;
+    val_t total_flux;
+};
+
+// World state
+struct World {
+    std::vector<Material> materials;
+    std::vector<ElementStatic> elements_static;
+    std::vector<ElementDynamic> elements_dynamic;
+    std::vector<ElementDynamic> elements_dynamic_swap;
+};
+
+// Material type IDs
+constexpr idx_t DEFAULT_MAT_ID = 0;
+constexpr idx_t INFLOW_MAT_ID = 1;
+constexpr idx_t OUTFLOW_MAT_ID = 2;
+
+// Build a 2D square grid as an unstructured mesh
+// This represents computation on arbitrarily-shaped geometries
+void buildSquare2D(World& world, const int n_elems_root) {
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    // Initialize materials
+    world.materials.emplace_back(Material{0.8, 0.0});    // Default material
+    world.materials.emplace_back(Material{0.8, 0.5});    // Inflow material
+    world.materials.emplace_back(Material{0.8, -0.5});   // Outflow material
+    
+    // Allocate elements
+    world.elements_static.resize(n_elems);
+    world.elements_dynamic.resize(n_elems);
+    world.elements_dynamic_swap.resize(n_elems);
+    
+    // Initialize all elements with default material and zero energy
+    for (int i = 0; i < n_elems; ++i) {
+        world.elements_static[i].material_idx = DEFAULT_MAT_ID;
+        world.elements_static[i].num_connections = 0;
+        world.elements_dynamic[i].current_energy = 0.0;
+        world.elements_dynamic[i].total_flux = 0.0;
+    }
+    
+    // Build connectivity: each element connects to its neighbors in 2D grid
+    for (int x = 0; x < n_elems_root; ++x) {
+        for (int y = 0; y < n_elems_root; ++y) {
+            const int idx = x * n_elems_root + y;
+            ElementStatic& elem = world.elements_static[idx];
+            
+            // Connect to neighbors (up, down, left, right)
+            const int offsets[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            
+            for (int n = 0; n < 4; ++n) {
+                const int nx = x + offsets[n][0];
+                const int ny = y + offsets[n][1];
+                
+                // Check if neighbor is within bounds
+                if (nx >= 0 && nx < n_elems_root && ny >= 0 && ny < n_elems_root) {
+                    const int neighbor_idx = nx * n_elems_root + ny;
+                    elem.connected_idx[elem.num_connections] = neighbor_idx;
+                    elem.connected_flux[elem.num_connections] = 1.0;
+                    elem.num_connections++;
+                }
+            }
+        }
+    }
+    
+    // Set corner elements as inflow/outflow to create interesting dynamics
+    const int last = n_elems_root - 1;
+    world.elements_static[0 * n_elems_root + 0].material_idx = INFLOW_MAT_ID;
+    world.elements_static[0 * n_elems_root + last].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + 0].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + last].material_idx = INFLOW_MAT_ID;
+}
+
+// Compute energy flux between two elements
+inline val_t computeFlux(const Material& mat, const ElementDynamic& this_elem,
+                        val_t connection_flux, const ElementDynamic& other_elem) {
+    return (other_elem.current_energy - this_elem.current_energy) * 
+           mat.transfer_coeff * connection_flux * 0.25;
+}
+
+// Run simulation for n_iters iterations
+void runSimulation(World& world, const int n_iters) {
+    const size_t n_elems = world.elements_static.size();
+    
+    for (int iter = 0; iter < n_iters; ++iter) {
+        // Update all elements
+        for (size_t i = 0; i < n_elems; ++i) {
+            const ElementStatic& elem_static = world.elements_static[i];
+            const ElementDynamic& elem_dyn = world.elements_dynamic[i];
+            const Material& mat = world.materials[elem_static.material_idx];
+            
+            // Start with external flow
+            val_t total_flux = mat.external_flow;
+            
+            // Add flux from all connected elements
+            for (idx_t j = 0; j < elem_static.num_connections; ++j) {
+                const idx_t neighbor_idx = elem_static.connected_idx[j];
+                const ElementDynamic& neighbor_dyn = world.elements_dynamic[neighbor_idx];
+                total_flux += computeFlux(mat, elem_dyn, elem_static.connected_flux[j], neighbor_dyn);
+            }
+            
+            // Update element state
+            ElementDynamic& elem_write = world.elements_dynamic_swap[i];
+            elem_write.current_energy = elem_dyn.current_energy + total_flux;
+            elem_write.total_flux = elem_dyn.total_flux + std::abs(total_flux);
+        }
+        
+        // Swap buffers
+        std::swap(world.elements_dynamic, world.elements_dynamic_swap);
+    }
+}
+
+// Validate simulation results
+bool validateResults(const World& world) {
+    val_t energy_sum = 0.0;
+    val_t flux_sum = 0.0;
+    val_t energy_max = std::numeric_limits<val_t>::lowest();
+    val_t energy_min = std::numeric_limits<val_t>::max();
+    
+    for (const auto& elem : world.elements_dynamic) {
+        energy_sum += elem.current_energy;
+        flux_sum += elem.total_flux;
+        energy_max = std::max(elem.current_energy, energy_max);
+        energy_min = std::min(elem.current_energy, energy_min);
+    }
+    
+    printf("Validation results:\n");
+    printf("  Energy sum: %.12f\n", energy_sum);
+    printf("  Flux sum: %.2f\n", flux_sum);
+    printf("  Energy range: [%.6f, %.6f]\n", energy_min, energy_max);
+    
+    // Check for numerical issues
+    constexpr val_t energy_epsilon = 1e-8;
+    
+    if (!std::isfinite(energy_sum)) {
+        printf("  ERROR: Energy sum is not finite\n");
+        return false;
+    }
+    
+    if (std::abs(energy_sum) > energy_epsilon) {
+        printf("  WARNING: Energy sum diverged from 0 (expected conservation)\n");
+        // Don't fail validation as this can happen with external flows
+    }
+    
+    if (!std::isfinite(flux_sum)) {
+        printf("  ERROR: Flux sum is not finite\n");
+        return false;
+    }
+    
+    if (!std::isfinite(energy_max) || !std::isfinite(energy_min)) {
+        printf("  ERROR: Energy extrema are not finite\n");
+        return false;
+    }
+    
+    printf("  Validation: PASSED\n");
+    return true;
+}
+
+// Compute a simple hash of the results for verification
+uint64_t computeHash(const std::vector<ElementDynamic>& elements) {
+    uint64_t hash = 0;
+    for (size_t i = 0; i < elements.size(); ++i) {
+        // Simple hash combining energy and flux values
+        const uint64_t* e_ptr = reinterpret_cast<const uint64_t*>(&elements[i].current_energy);
+        const uint64_t* f_ptr = reinterpret_cast<const uint64_t*>(&elements[i].total_flux);
+        hash ^= (*e_ptr + i) * 0x9e3779b97f4a7c15ULL;
+        hash ^= (*f_ptr + i) * 0xbf58476d1ce4e5b9ULL;
+    }
+    return hash;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Grid size (NxN elements) (default: 512)\n");
+    printf("  -i <num>     Number of simulation iterations (default: 10)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    int n_elems_root = 512;
+    int n_iters = 10;
+    bool validate = false;
+    bool printResults = false;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            n_elems_root = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            n_iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+    
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    printf("Unstructured Mesh Energy Transfer Benchmark\n");
+    printf("============================================\n");
+    printf("Grid size: %d x %d = %d elements\n", n_elems_root, n_elems_root, n_elems);
+    printf("Iterations: %d\n", n_iters);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    printf("\n");
+    
+    // Build the unstructured mesh
+    printf("Building unstructured mesh...\n");
+    World world;
+    buildSquare2D(world, n_elems_root);
+    
+    // Calculate memory usage
+    const size_t static_mem = world.elements_static.size() * sizeof(ElementStatic);
+    const size_t dynamic_mem = world.elements_dynamic.size() * sizeof(ElementDynamic) * 2;
+    const size_t total_mem = static_mem + dynamic_mem;
+    printf("Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\n",
+
+exec
+/bin/bash -lc 'for p in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1/AGENTS.md /home/llmtest/evals/20261006-204623/AGENTS.md /home/llmtest/evals/AGENTS.md /home/llmtest/AGENTS.md /home/AGENTS.md /AGENTS.md; do if [ -f "$p" ]; then printf '"'%s\\n' \""'$p"; cat "$p"; fi; done; git status --short' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ exited 128 in 0ms:
+fatal: not a git repository (or any parent up to mount point /)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+
+exec
+/bin/bash -lc 'ls -la && rg --files && command -v mpicxx && command -v mpirun && cmake --version && cat common/results_output.hpp && cat common/hash.hpp' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ succeeded in 0ms:
+total 4
+drwxrwxrwx 4 petert  petert   74 Oct  7 06:17 .
+drwxrwxr-x 3 petert  petert   59 Oct  7 06:17 ..
+drwxrwxrwx 2 petert  petert   60 Oct  7 06:17 common
+-rw-r--r-- 1 llmtest users  1563 Oct  7 06:17 output.txt
+drwxrwxrwx 2 petert  petert   64 Oct  7 06:17 unstructured
+output.txt
+common/hash.hpp
+common/results_output.hpp
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+/usr/bin/mpicxx
+/usr/bin/mpirun
+cmake version 3.30.2
+
+CMake suite maintained and supported by Kitware (kitware.com/cmake).
+#pragma once
+
+#include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+#include "hash.hpp"
+
+// Kahan summation for numerically stable sum
+template <typename T>
+T kahan_sum(const std::vector<T>& data) {
+    T sum = 0.0;
+    T c = 0.0;
+    for (const auto& val : data) {
+        T y = val - c;
+        T t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    return sum;
+}
+
+// Print results for floating-point arrays
+template <typename T>
+void print_results(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute statistics
+    T sum = kahan_sum(data);
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Sum: %.17e\n", static_cast<double>(sum));
+    printf("Min: %.17e\n", static_cast<double>(min_val));
+    printf("Max: %.17e\n", static_cast<double>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %.17e\n", indices[i], static_cast<double>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+// Print results for integer arrays (uses exact hash comparison)
+template <typename T>
+void print_results_int(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Compute min/max
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Min: %lld\n", static_cast<long long>(min_val));
+    printf("Max: %lld\n", static_cast<long long>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %lld\n", indices[i], static_cast<long long>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+#pragma once
+
+#include <cstdint>
+
+// FNV-1a hash, 64 bit length
+class hash {
+  public:
+	using digest = uint64_t;
+
+	template <typename T>
+	void add(const T& value) {
+		const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&value);
+		for(size_t i = 0; i < sizeof(T); ++i) {
+			d = (d ^ bytes[i]) * 0x100000001b3ull;
+		}
+	}
+
+	digest get() const { return d; }
+
+  private:
+	digest d = 0xcbf29ce484222325ull;
+};
+
+exec
+/bin/bash -lc "rg --files -g 'AGENTS.md' unstructured common /home/llmtest/.codex 2>/dev/null" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ succeeded in 0ms:
+/home/llmtest/.codex/plugins/cache/openai-curated-remote/product-design/0.1.56/templates/prototype/AGENTS.md
+/home/llmtest/.codex/plugins/cache/openai-curated-remote/product-design/0.1.56/templates/mobile-app/AGENTS.md
+
+exec
+/bin/bash -lc "sed -n '260,420p' unstructured/unstructured.cpp && cat output.txt && mpirun --version && nproc && lscpu" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+exec
+/bin/bash -lc 'g++ -O3 -march=native -Wall -Wextra -std=c++20 unstructured/unstructured.cpp -o /tmp/unstructured_serial_reference && /tmp/unstructured_serial_reference -n 7 -i 25 -v -r' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ succeeded in 19ms:
+    printf("Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\n",
+           total_mem / (1024.0 * 1024.0),
+           static_mem / (1024.0 * 1024.0),
+           dynamic_mem / (1024.0 * 1024.0));
+    printf("\n");
+    
+    // Run simulation
+    printf("Running simulation...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    runSimulation(world, n_iters);
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    
+    printf("Computation time: %ld ms\n", duration_ms);
+    
+    // Calculate performance metrics
+    const int n_measured_iters = std::max(n_iters - 1, 1);
+    const double time_per_iter = static_cast<double>(duration_ms) / n_measured_iters;
+    const double giga_elems_per_sec = (n_measured_iters * n_elems) / (duration_ms / 1000.0) / 1e9;
+    
+    // Approximate FLOPS: ~22 FLOPS per element per iteration (from reference)
+    const double gflops = giga_elems_per_sec * 22.0;
+    
+    printf("Performance:\n");
+    printf("  Time per iteration: %.4f ms\n", time_per_iter);
+    printf("  Elements/sec: %.4f GigaElements/s\n", giga_elems_per_sec);
+    printf("  Performance: %.4f GFLOPS\n", gflops);
+    
+    // Compute hash for verification
+    const uint64_t hash = computeHash(world.elements_dynamic);
+    printf("  Result hash: %016lX\n", hash);
+    printf("\n");
+    
+    // Print results for external validation
+    if (printResults) {
+        std::vector<double> energyData;
+        energyData.reserve(world.elements_dynamic.size());
+        for (const auto& elem : world.elements_dynamic) {
+            energyData.push_back(elem.current_energy);
+        }
+        print_results(energyData, "ElementEnergy");
+    }
+    
+    // Validation
+    if (validate) {
+        bool valid = validateResults(world);
+        if (!valid) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+Reading additional input from stdin...
+OpenAI Codex v0.160.1
+--------
+workdir: /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+model: gpt-6.1-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 01a11494-4311-78c2-a7b9-84286160a6a2
+--------
+user
+Parallelize the unstructured benchmark code found in ./unstructured/ with MPI for distributed memory cluster parallelism. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the solver and build setup, then add MPI domain decomposition and communication while preserving the numerical update and executable name. I’ll compare results across process counts and check the communication overhead.
+
+exec
+/bin/bash -lc "pwd && rg --files -g 'AGENTS.md' -g '*CMakeLists*' -g '*.c' -g '*.cc' -g '*.cpp' -g '*.h' -g '*.hpp' -g 'README*' -g '*.f90' -g 'Makefile'" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ succeeded in 0ms:
+/home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+common/results_output.hpp
+common/hash.hpp
+
+exec
+/bin/bash -lc "cat unstructured/CMakeLists.txt && sed -n '1,260p' unstructured/unstructured.cpp" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ succeeded in 0ms:
+cmake_minimum_required(VERSION 3.10)
+project(unstructured_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(unstructured unstructured.cpp)
+
+# Enable optimizations
+target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link math library
+target_link_libraries(unstructured m)
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+// Types to represent unstructured mesh elements
+using idx_t = uint64_t;
+using val_t = double;
+
+// Maximum number of connections per element (for a 2D grid: 4 neighbors)
+constexpr int MAX_CONNECTIONS = 8;
+
+// Material properties for energy transfer
+struct Material {
+    val_t transfer_coeff;  // Energy transfer coefficient
+    val_t external_flow;   // External energy source/sink
+};
+
+// Static connectivity information for each element
+struct ElementStatic {
+    idx_t material_idx;
+    idx_t num_connections;
+    idx_t connected_idx[MAX_CONNECTIONS];     // Indices of connected elements
+    val_t connected_flux[MAX_CONNECTIONS];    // Flux coefficients for each connection
+};
+
+// Dynamic state for each element
+struct ElementDynamic {
+    val_t current_energy;
+    val_t total_flux;
+};
+
+// World state
+struct World {
+    std::vector<Material> materials;
+    std::vector<ElementStatic> elements_static;
+    std::vector<ElementDynamic> elements_dynamic;
+    std::vector<ElementDynamic> elements_dynamic_swap;
+};
+
+// Material type IDs
+constexpr idx_t DEFAULT_MAT_ID = 0;
+constexpr idx_t INFLOW_MAT_ID = 1;
+constexpr idx_t OUTFLOW_MAT_ID = 2;
+
+// Build a 2D square grid as an unstructured mesh
+// This represents computation on arbitrarily-shaped geometries
+void buildSquare2D(World& world, const int n_elems_root) {
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    // Initialize materials
+    world.materials.emplace_back(Material{0.8, 0.0});    // Default material
+    world.materials.emplace_back(Material{0.8, 0.5});    // Inflow material
+    world.materials.emplace_back(Material{0.8, -0.5});   // Outflow material
+    
+    // Allocate elements
+    world.elements_static.resize(n_elems);
+    world.elements_dynamic.resize(n_elems);
+    world.elements_dynamic_swap.resize(n_elems);
+    
+    // Initialize all elements with default material and zero energy
+    for (int i = 0; i < n_elems; ++i) {
+        world.elements_static[i].material_idx = DEFAULT_MAT_ID;
+        world.elements_static[i].num_connections = 0;
+        world.elements_dynamic[i].current_energy = 0.0;
+        world.elements_dynamic[i].total_flux = 0.0;
+    }
+    
+    // Build connectivity: each element connects to its neighbors in 2D grid
+    for (int x = 0; x < n_elems_root; ++x) {
+        for (int y = 0; y < n_elems_root; ++y) {
+            const int idx = x * n_elems_root + y;
+            ElementStatic& elem = world.elements_static[idx];
+            
+            // Connect to neighbors (up, down, left, right)
+            const int offsets[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            
+            for (int n = 0; n < 4; ++n) {
+                const int nx = x + offsets[n][0];
+                const int ny = y + offsets[n][1];
+                
+                // Check if neighbor is within bounds
+                if (nx >= 0 && nx < n_elems_root && ny >= 0 && ny < n_elems_root) {
+                    const int neighbor_idx = nx * n_elems_root + ny;
+                    elem.connected_idx[elem.num_connections] = neighbor_idx;
+                    elem.connected_flux[elem.num_connections] = 1.0;
+                    elem.num_connections++;
+                }
+            }
+        }
+    }
+    
+    // Set corner elements as inflow/outflow to create interesting dynamics
+    const int last = n_elems_root - 1;
+    world.elements_static[0 * n_elems_root + 0].material_idx = INFLOW_MAT_ID;
+    world.elements_static[0 * n_elems_root + last].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + 0].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + last].material_idx = INFLOW_MAT_ID;
+}
+
+// Compute energy flux between two elements
+inline val_t computeFlux(const Material& mat, const ElementDynamic& this_elem,
+                        val_t connection_flux, const ElementDynamic& other_elem) {
+    return (other_elem.current_energy - this_elem.current_energy) * 
+           mat.transfer_coeff * connection_flux * 0.25;
+}
+
+// Run simulation for n_iters iterations
+void runSimulation(World& world, const int n_iters) {
+    const size_t n_elems = world.elements_static.size();
+    
+    for (int iter = 0; iter < n_iters; ++iter) {
+        // Update all elements
+        for (size_t i = 0; i < n_elems; ++i) {
+            const ElementStatic& elem_static = world.elements_static[i];
+            const ElementDynamic& elem_dyn = world.elements_dynamic[i];
+            const Material& mat = world.materials[elem_static.material_idx];
+            
+            // Start with external flow
+            val_t total_flux = mat.external_flow;
+            
+            // Add flux from all connected elements
+            for (idx_t j = 0; j < elem_static.num_connections; ++j) {
+                const idx_t neighbor_idx = elem_static.connected_idx[j];
+                const ElementDynamic& neighbor_dyn = world.elements_dynamic[neighbor_idx];
+                total_flux += computeFlux(mat, elem_dyn, elem_static.connected_flux[j], neighbor_dyn);
+            }
+            
+            // Update element state
+            ElementDynamic& elem_write = world.elements_dynamic_swap[i];
+            elem_write.current_energy = elem_dyn.current_energy + total_flux;
+            elem_write.total_flux = elem_dyn.total_flux + std::abs(total_flux);
+        }
+        
+        // Swap buffers
+        std::swap(world.elements_dynamic, world.elements_dynamic_swap);
+    }
+}
+
+// Validate simulation results
+bool validateResults(const World& world) {
+    val_t energy_sum = 0.0;
+    val_t flux_sum = 0.0;
+    val_t energy_max = std::numeric_limits<val_t>::lowest();
+    val_t energy_min = std::numeric_limits<val_t>::max();
+    
+    for (const auto& elem : world.elements_dynamic) {
+        energy_sum += elem.current_energy;
+        flux_sum += elem.total_flux;
+        energy_max = std::max(elem.current_energy, energy_max);
+        energy_min = std::min(elem.current_energy, energy_min);
+    }
+    
+    printf("Validation results:\n");
+    printf("  Energy sum: %.12f\n", energy_sum);
+    printf("  Flux sum: %.2f\n", flux_sum);
+    printf("  Energy range: [%.6f, %.6f]\n", energy_min, energy_max);
+    
+    // Check for numerical issues
+    constexpr val_t energy_epsilon = 1e-8;
+    
+    if (!std::isfinite(energy_sum)) {
+        printf("  ERROR: Energy sum is not finite\n");
+        return false;
+    }
+    
+    if (std::abs(energy_sum) > energy_epsilon) {
+        printf("  WARNING: Energy sum diverged from 0 (expected conservation)\n");
+        // Don't fail validation as this can happen with external flows
+    }
+    
+    if (!std::isfinite(flux_sum)) {
+        printf("  ERROR: Flux sum is not finite\n");
+        return false;
+    }
+    
+    if (!std::isfinite(energy_max) || !std::isfinite(energy_min)) {
+        printf("  ERROR: Energy extrema are not finite\n");
+        return false;
+    }
+    
+    printf("  Validation: PASSED\n");
+    return true;
+}
+
+// Compute a simple hash of the results for verification
+uint64_t computeHash(const std::vector<ElementDynamic>& elements) {
+    uint64_t hash = 0;
+    for (size_t i = 0; i < elements.size(); ++i) {
+        // Simple hash combining energy and flux values
+        const uint64_t* e_ptr = reinterpret_cast<const uint64_t*>(&elements[i].current_energy);
+        const uint64_t* f_ptr = reinterpret_cast<const uint64_t*>(&elements[i].total_flux);
+        hash ^= (*e_ptr + i) * 0x9e3779b97f4a7c15ULL;
+        hash ^= (*f_ptr + i) * 0xbf58476d1ce4e5b9ULL;
+    }
+    return hash;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Grid size (NxN elements) (default: 512)\n");
+    printf("  -i <num>     Number of simulation iterations (default: 10)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    int n_elems_root = 512;
+    int n_iters = 10;
+    bool validate = false;
+    bool printResults = false;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            n_elems_root = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            n_iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+    
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    printf("Unstructured Mesh Energy Transfer Benchmark\n");
+    printf("============================================\n");
+    printf("Grid size: %d x %d = %d elements\n", n_elems_root, n_elems_root, n_elems);
+    printf("Iterations: %d\n", n_iters);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    printf("\n");
+    
+    // Build the unstructured mesh
+    printf("Building unstructured mesh...\n");
+    World world;
+    buildSquare2D(world, n_elems_root);
+    
+    // Calculate memory usage
+    const size_t static_mem = world.elements_static.size() * sizeof(ElementStatic);
+    const size_t dynamic_mem = world.elements_dynamic.size() * sizeof(ElementDynamic) * 2;
+    const size_t total_mem = static_mem + dynamic_mem;
+    printf("Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\n",
+
+exec
+/bin/bash -lc 'for p in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1/AGENTS.md /home/llmtest/evals/20261006-204623/AGENTS.md /home/llmtest/evals/AGENTS.md /home/llmtest/AGENTS.md /home/AGENTS.md /AGENTS.md; do if [ -f "$p" ]; then printf '"'%s\\n' \""'$p"; cat "$p"; fi; done; git status --short' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ exited 128 in 0ms:
+fatal: not a git repository (or any parent up to mount point /)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+
+exec
+/bin/bash -lc 'ls -la && rg --files && command -v mpicxx && command -v mpirun && cmake --version && cat common/results_output.hpp && cat common/hash.hpp' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ succeeded in 0ms:
+total 4
+drwxrwxrwx 4 petert  petert   74 Oct  7 06:17 .
+drwxrwxr-x 3 petert  petert   59 Oct  7 06:17 ..
+drwxrwxrwx 2 petert  petert   60 Oct  7 06:17 common
+-rw-r--r-- 1 llmtest users  1563 Oct  7 06:17 output.txt
+drwxrwxrwx 2 petert  petert   64 Oct  7 06:17 unstructured
+output.txt
+common/hash.hpp
+common/results_output.hpp
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+/usr/bin/mpicxx
+/usr/bin/mpirun
+cmake version 3.30.2
+
+CMake suite maintained and supported by Kitware (kitware.com/cmake).
+#pragma once
+
+#include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+#include "hash.hpp"
+
+// Kahan summation for numerically stable sum
+template <typename T>
+T kahan_sum(const std::vector<T>& data) {
+    T sum = 0.0;
+    T c = 0.0;
+    for (const auto& val : data) {
+        T y = val - c;
+        T t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    return sum;
+}
+
+// Print results for floating-point arrays
+template <typename T>
+void print_results(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute statistics
+    T sum = kahan_sum(data);
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Sum: %.17e\n", static_cast<double>(sum));
+    printf("Min: %.17e\n", static_cast<double>(min_val));
+    printf("Max: %.17e\n", static_cast<double>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %.17e\n", indices[i], static_cast<double>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+// Print results for integer arrays (uses exact hash comparison)
+template <typename T>
+void print_results_int(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Compute min/max
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Min: %lld\n", static_cast<long long>(min_val));
+    printf("Max: %lld\n", static_cast<long long>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %lld\n", indices[i], static_cast<long long>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+#pragma once
+
+#include <cstdint>
+
+// FNV-1a hash, 64 bit length
+class hash {
+  public:
+	using digest = uint64_t;
+
+	template <typename T>
+	void add(const T& value) {
+		const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&value);
+		for(size_t i = 0; i < sizeof(T); ++i) {
+			d = (d ^ bytes[i]) * 0x100000001b3ull;
+		}
+	}
+
+	digest get() const { return d; }
+
+  private:
+	digest d = 0xcbf29ce484222325ull;
+};
+
+mpirun (Open MPI) 4.1.6
+
+Report bugs to http://www.open-mpi.org/community/help/
+256
+Architecture:                         x86_64
+CPU op-mode(s):                       32-bit, 64-bit
+Address sizes:                        48 bits physical, 48 bits virtual
+Byte Order:                           Little Endian
+CPU(s):                               256
+On-line CPU(s) list:                  0-255
+Vendor ID:                            AuthenticAMD
+Model name:                           AMD EPYC 7763 64-Core Processor
+CPU family:                           25
+Model:                                1
+Thread(s) per core:                   2
+Core(s) per socket:                   64
+Socket(s):                            2
+Stepping:                             1
+Frequency boost:                      enabled
+CPU(s) scaling MHz:                   57%
+CPU max MHz:                          3530.0000
+CPU min MHz:                          400.0000
+BogoMIPS:                             4900.02
+Flags:                                fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpb cat_l3 cdp_l3 hw_pstate ssbd mba ibrs ibpb stibp vmmcall fsgsbase bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk clzero irperf xsaveerptr rdpru wbnoinvd amd_ppin brs arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold v_vmsave_vmload vgif v_spec_ctrl umip pku ospke vaes vpclmulqdq rdpid overflow_recov succor smca fsrm debug_swap
+Virtualization:                       AMD-V
+L1d cache:                            4 MiB (128 instances)
+L1i cache:                            4 MiB (128 instances)
+L2 cache:                             64 MiB (128 instances)
+L3 cache:                             512 MiB (16 instances)
+NUMA node(s):                         2
+NUMA node0 CPU(s):                    0-63,128-191
+NUMA node1 CPU(s):                    64-127,192-255
+Vulnerability Gather data sampling:   Not affected
+Vulnerability Itlb multihit:          Not affected
+Vulnerability L1tf:                   Not affected
+Vulnerability Mds:                    Not affected
+Vulnerability Meltdown:               Not affected
+Vulnerability Mmio stale data:        Not affected
+Vulnerability Reg file data sampling: Not affected
+Vulnerability Retbleed:               Not affected
+Vulnerability Spec rstack overflow:   Mitigation; Safe RET
+Vulnerability Spec store bypass:      Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:             Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:             Mitigation; Retpolines; IBPB conditional; IBRS_FW; STIBP always-on; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                  Not affected
+Vulnerability Tsx async abort:        Not affected
+
+ succeeded in 2448ms:
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 7 x 7 = 49 elements
+Iterations: 25
+Validation: enabled
+
+Building unstructured mesh...
+Memory usage: 0.01 MB (static: 0.01 MB, dynamic: 0.00 MB)
+
+Running simulation...
+Computation time: 0 ms
+Performance:
+  Time per iteration: 0.0000 ms
+  Elements/sec: inf GigaElements/s
+  Performance: inf GFLOPS
+  Result hash: 3F8EA2AD02CE7930
+
+=== RESULTS ===
+Name: ElementEnergy
+Elements: 49
+Sum: 0.00000000000000000e+00
+Min: -2.39283726607975034e+00
+Max: 2.39283726607975034e+00
+Sample[0]: 2.39283726607975034e+00
+Sample[12]: -7.53107697461421588e-01
+Sample[24]: 0.00000000000000000e+00
+Sample[36]: -7.53107697461421588e-01
+Sample[48]: 2.39283726607975034e+00
+Hash: f5f1bf34137bcfe5
+=== END RESULTS ===
+Validation results:
+  Energy sum: 0.000000000000
+  Flux sum: 29.53
+  Energy range: [-2.392837, 2.392837]
+  Validation: PASSED
+
+codex
+The mesh is a square grid stored with explicit neighbor lists. I’ll divide it into rectangular blocks on a 2D MPI Cartesian grid and overlap edge-energy exchanges with interior updates. I’ll preserve the neighbor summation order and global indices for exact hash comparison with the serial version.
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1/unstructured/CMakeLists.txt
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+from pathlib import Path
+path = Path('unstructured/unstructured.cpp')
+path.write_text(r'''#include <mpi.h>
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cerrno>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <limits>
+#include <vector>
+
+#include \"../common/results_output.hpp\"
+
+using idx_t = uint64_t;
+using val_t = double;
+
+// The generated mesh has at most four connections, all with unit flux.
+constexpr int MAX_CONNECTIONS = 4;
+constexpr val_t CONNECTION_FLUX = 1.0;
+constexpr uint8_t DEFAULT_MAT_ID = 0;
+constexpr uint8_t INFLOW_MAT_ID = 1;
+constexpr uint8_t OUTFLOW_MAT_ID = 2;
+
+struct Material {
+    val_t transfer_coeff;
+    val_t external_flow;
+};
+
+// Indices address local energies, including the one-cell ghost layer.
+// Unit connection coefficients are shared rather than repeated per element.
+struct ElementStatic {
+    idx_t connected_idx[MAX_CONNECTIONS];
+    uint8_t material_idx;
+    uint8_t num_connections;
+};
+
+struct World {
+    std::array<Material, 3> materials{{{0.8, 0.0}, {0.8, 0.5}, {0.8, -0.5}}};
+    std::vector<ElementStatic> elements_static;
+    std::array<std::vector<val_t>, 2> energy;
+    // Neighbors only read energy, so cumulative flux can be updated in place.
+    std::vector<val_t> total_flux;
+    MPI_Comm comm = MPI_COMM_NULL;
+    MPI_Datatype column_type = MPI_DATATYPE_NULL;
+    std::array<std::array<MPI_Request, 8>, 2> requests;
+    int request_count = 0;
+    int current_buffer = 0;
+    int rank = 0;
+    int size = 1;
+    int grid_size = 0;
+    int dims[2] = {1, 1};
+    int coords[2] = {0, 0};
+    int start[2] = {0, 0};
+    int extent[2] = {0, 0};
+    size_t stride = 0;
+};
+
+void partition(const int n, const int parts, const int coordinate,
+               int& start, int& extent) {
+    const int base = n / parts;
+    const int remainder = n % parts;
+    extent = base + (coordinate < remainder);
+    start = coordinate * base + std::min(coordinate, remainder);
+}
+
+// Use as many nonempty rectangular blocks as possible, preferring a square
+// process grid. Extra processes participate in world-level finalization only.
+int chooseProcessGrid(const int n, const int processes, int dims[2]) {
+    int active = 0;
+    int best_difference = std::numeric_limits<int>::max();
+    for (int x = 1; x <= std::min(n, processes); ++x) {
+        const int y = std::min(n, processes / x);
+        const int count = x * y;
+        const int difference = std::abs(x - y);
+        if (count > active || (count == active && difference < best_difference)) {
+            active = count;
+            best_difference = difference;
+            dims[0] = x;
+            dims[1] = y;
+        }
+    }
+    return active;
+}
+
+void setupHaloExchange(World& world) {
+    int x_minus, x_plus, y_minus, y_plus;
+    MPI_Cart_shift(world.comm, 0, 1, &x_minus, &x_plus);
+    MPI_Cart_shift(world.comm, 1, 1, &y_minus, &y_plus);
+    const int nx = world.extent[0];
+    const int ny = world.extent[1];
+    const size_t stride = world.stride;
+
+    if (y_minus "'!= MPI_PROC_NULL || y_plus != MPI_PROC_NULL) {
+        MPI_Type_vector(nx, 1, static_cast<int>(stride), MPI_DOUBLE, &world.column_type);
+        MPI_Type_commit(&world.column_type);
+    }
+
+    // Persistent requests amortize setup and refer to each fixed energy buffer.
+    // Tags identify the direction in which the sender'"'s data travels.
+    for (int buffer = 0; buffer < 2; ++buffer) {
+        val_t* energy = world.energy[buffer].data();
+        auto& requests = world.requests[buffer];
+        int count = 0;
+        if (x_minus "'!= MPI_PROC_NULL)
+            MPI_Recv_init(energy + 1, ny, MPI_DOUBLE, x_minus, 0,
+                          world.comm, &requests[count++]);
+        if (x_plus != MPI_PROC_NULL)
+            MPI_Recv_init(energy + (nx + 1) * stride + 1, ny, MPI_DOUBLE, x_plus, 1,
+                          world.comm, &requests[count++]);
+        if (y_minus != MPI_PROC_NULL)
+            MPI_Recv_init(energy + stride, 1, world.column_type, y_minus, 2,
+                          world.comm, &requests[count++]);
+        if (y_plus != MPI_PROC_NULL)
+            MPI_Recv_init(energy + stride + ny + 1, 1, world.column_type, y_plus, 3,
+                          world.comm, &requests[count++]);
+        if (x_minus != MPI_PROC_NULL)
+            MPI_Send_init(energy + stride + 1, ny, MPI_DOUBLE, x_minus, 1,
+                          world.comm, &requests[count++]);
+        if (x_plus != MPI_PROC_NULL)
+            MPI_Send_init(energy + nx * stride + 1, ny, MPI_DOUBLE, x_plus, 0,
+                          world.comm, &requests[count++]);
+        if (y_minus != MPI_PROC_NULL)
+            MPI_Send_init(energy + stride + 1, 1, world.column_type, y_minus, 3,
+                          world.comm, &requests[count++]);
+        if (y_plus != MPI_PROC_NULL)
+            MPI_Send_init(energy + stride + ny, 1, world.column_type, y_plus, 2,
+                          world.comm, &requests[count++]);
+        world.request_count = count;
+    }
+}
+
+void freeHaloExchange(World& world) {
+    for (auto& requests : world.requests)
+        for (int i = 0; i < world.request_count; ++i)
+            MPI_Request_free(&requests[i]);
+    if (world.column_type != MPI_DATATYPE_NULL)
+        MPI_Type_free(&world.column_type);
+}
+
+// Build only the owned portion of the original unstructured square mesh.
+void buildSquare2D(World& world, const int n_elems_root) {
+    world.grid_size = n_elems_root;
+    MPI_Comm_rank(world.comm, &world.rank);
+    MPI_Comm_size(world.comm, &world.size);
+    MPI_Cart_get(world.comm, 2, world.dims, world.start, world.coords);
+    for (int axis = 0; axis < 2; ++axis)
+        partition(n_elems_root, world.dims[axis], world.coords[axis],
+                  world.start[axis], world.extent[axis]);
+    const int nx = world.extent[0];
+    const int ny = world.extent[1];
+    world.stride = static_cast<size_t>(ny) + 2;
+    const size_t storage = (static_cast<size_t>(nx) + 2) * world.stride;
+    world.elements_static.resize(static_cast<size_t>(nx) * ny);
+    for (auto& energy : world.energy)
+        energy.assign(storage, 0.0);
+    world.total_flux.assign(storage, 0.0);
+
+    for (int x = 1; x <= nx; ++x) {
+        const int global_x = world.start[0] + x - 1;
+        for (int y = 1; y <= ny; ++y) {
+            const int global_y = world.start[1] + y - 1;
+            const size_t i = static_cast<size_t>(x) * world.stride + y;
+            ElementStatic& elem = world.elements_static[static_cast<size_t>(x - 1) * ny + y - 1];
+            elem.material_idx = DEFAULT_MAT_ID;
+            elem.num_connections = 0;
+            // Preserve the original summation order: +x, -x, +y, -y.
+            if (global_x + 1 < n_elems_root)
+                elem.connected_idx[elem.num_connections++] = i + world.stride;
+            if (global_x > 0)
+                elem.connected_idx[elem.num_connections++] = i - world.stride;
+            if (global_y + 1 < n_elems_root)
+                elem.connected_idx[elem.num_connections++] = i + 1;
+            if (global_y > 0)
+                elem.connected_idx[elem.num_connections++] = i - 1;
+
+            const int last = n_elems_root - 1;
+            // Separate assignments also preserve the 1x1 mesh'"'s final inflow.
+            if (global_x == 0 && global_y == 0) elem.material_idx = INFLOW_MAT_ID;
+            if (global_x == 0 && global_y == last) elem.material_idx = OUTFLOW_MAT_ID;
+            if (global_x == last && global_y == 0) elem.material_idx = OUTFLOW_MAT_ID;
+            if (global_x == last && global_y == last) elem.material_idx = INFLOW_MAT_ID;
+        }
+    }
+    setupHaloExchange(world);
+}
+
+inline val_t computeFlux(const Material& mat, val_t energy, val_t other_energy) {
+    return (other_energy - energy) * mat.transfer_coeff * CONNECTION_FLUX * 0.25;
+}
+
+template <bool full_connectivity>
+inline void updateElement(World& world, const val_t* energy, val_t* next,
+                          const size_t element_index, const size_t energy_index) {
+    const ElementStatic& elem = world.elements_static[element_index];
+    const Material& mat = world.materials[elem.material_idx];
+    const val_t current = energy[energy_index];
+    val_t flux = mat.external_flow;
+    const int connections = full_connectivity ? MAX_CONNECTIONS : elem.num_connections;
+    for (int j = 0; j < connections; ++j)
+        flux += computeFlux(mat, current, energy[elem.connected_idx[j]]);
+    next[energy_index] = current + flux;
+    world.total_flux[energy_index] += std::abs(flux);
+}
+
+void runSimulation(World& world, const int n_iters) {
+    const int nx = world.extent[0];
+    const int ny = world.extent[1];
+    const size_t stride = world.stride;
+    for (int iter = 0; iter < n_iters; ++iter) {
+        const int buffer = world.current_buffer;
+        const val_t* energy = world.energy[buffer].data();
+        val_t* next = world.energy[1 - buffer].data();
+        if (world.request_count)
+            MPI_Startall(world.request_count, world.requests[buffer].data());
+
+        // No ghost values are read here, allowing communication to overlap work.
+        for (int x = 2; x < nx; ++x) {
+            const size_t row = static_cast<size_t>(x) * stride;
+            const size_t element_row = static_cast<size_t>(x - 1) * ny;
+            for (int y = 2; y < ny; ++y)
+                updateElement<true>(world, energy, next, element_row + y - 1, row + y);
+        }
+        if (world.request_count)
+            MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+
+        // Update the block perimeter exactly once, including thin 1-cell blocks.
+        for (int y = 1; y <= ny; ++y)
+            updateElement<false>(world, energy, next, y - 1, stride + y);
+        if (nx > 1) {
+            const size_t row = static_cast<size_t>(nx) * stride;
+            const size_t element_row = static_cast<size_t>(nx - 1) * ny;
+            for (int y = 1; y <= ny; ++y)
+                updateElement<false>(world, energy, next, element_row + y - 1, row + y);
+        }
+        for (int x = 2; x < nx; ++x) {
+            const size_t row = static_cast<size_t>(x) * stride;
+            const size_t element_row = static_cast<size_t>(x - 1) * ny;
+            updateElement<false>(world, energy, next, element_row, row + 1);
+            if (ny > 1)
+                updateElement<false>(world, energy, next, element_row + ny - 1, row + ny);
+        }
+        world.current_buffer = 1 - buffer;
+    }
+}
+
+bool validateResults(const World& world) {
+    val_t sums[2] = {0.0, 0.0};
+    val_t energy_max = std::numeric_limits<val_t>::lowest();
+    val_t energy_min = std::numeric_limits<val_t>::max();
+    const auto& energy = world.energy[world.current_buffer];
+    for (int x = 1; x <= world.extent[0]; ++x) {
+        const size_t row = static_cast<size_t>(x) * world.stride;
+        for (int y = 1; y <= world.extent[1]; ++y) {
+            const size_t i = row + y;
+            sums[0] += energy[i];
+            sums[1] += world.total_flux[i];
+            energy_max = std::max(energy[i], energy_max);
+            energy_min = std::min(energy[i], energy_min);
+        }
+    }
+    val_t global_sums[2], global_max, global_min;
+    MPI_Reduce(sums, global_sums, 2, MPI_DOUBLE, MPI_SUM, 0, world.comm);
+    MPI_Reduce(&energy_max, &global_max, 1, MPI_DOUBLE, MPI_MAX, 0, world.comm);
+    MPI_Reduce(&energy_min, &global_min, 1, MPI_DOUBLE, MPI_MIN, 0, world.comm);
+    if (world.rank "'!= 0) return true;
+
+    printf("Validation results:'"\\n\");
+    printf(\"  Energy sum: %.12f\\n\", global_sums[0]);
+    printf(\"  Flux sum: %.2f\\n\", global_sums[1]);
+    printf(\"  Energy range: [%.6f, %.6f]\\n\", global_min, global_max);
+    constexpr val_t energy_epsilon = 1e-8;
+    if ("'!std::isfinite(global_sums[0])) {
+        printf("  ERROR: Energy sum is not finite'"\\n\");
+        return false;
+    }
+    if (std::abs(global_sums[0]) > energy_epsilon)
+        printf(\"  WARNING: Energy sum diverged from 0 (expected conservation)\\n\");
+    if ("'!std::isfinite(global_sums[1])) {
+        printf("  ERROR: Flux sum is not finite'"\\n\");
+        return false;
+    }
+    if ("'!std::isfinite(global_max) || !std::isfinite(global_min)) {
+        printf("  ERROR: Energy extrema are not finite'"\\n\");
+        return false;
+    }
+    printf(\"  Validation: PASSED\\n\");
+    return true;
+}
+
+uint64_t computeHash(const World& world) {
+    uint64_t local_hash = 0;
+    const auto& energy = world.energy[world.current_buffer];
+    for (int x = 1; x <= world.extent[0]; ++x) {
+        const idx_t global_row = static_cast<idx_t>(world.start[0] + x - 1) * world.grid_size;
+        const size_t row = static_cast<size_t>(x) * world.stride;
+        for (int y = 1; y <= world.extent[1]; ++y) {
+            const size_t local_i = row + y;
+            const idx_t global_i = global_row + world.start[1] + y - 1;
+            const uint64_t e_bits = std::bit_cast<uint64_t>(energy[local_i]);
+            const uint64_t f_bits = std::bit_cast<uint64_t>(world.total_flux[local_i]);
+            local_hash "'^= (e_bits + global_i) * 0x9e3779b97f4a7c15ULL;
+            local_hash ''^= (f_bits + global_i) * 0xbf58476d1ce4e5b9ULL;
+        }
+    }
+    uint64_t global_hash = 0;
+    MPI_Reduce(&local_hash, &global_hash, 1, MPI_UINT64_T, MPI_BXOR, 0, world.comm);
+    return global_hash;
+}
+
+// Only -r needs a global array: preserve print_results'"' row-major Kahan sum,
+// samples and order-sensitive FNV hash. Datatypes place tiles directly into it.
+void printDistributedResults(const World& world) {
+    constexpr int result_tag = 4;
+    const auto& energy = world.energy[world.current_buffer];
+    if (world.rank "'!= 0) {
+        MPI_Datatype tile;
+        MPI_Type_vector(world.extent[0], world.extent[1], static_cast<int>(world.stride),
+                        MPI_DOUBLE, &tile);
+        MPI_Type_commit(&tile);
+        MPI_Send(energy.data() + world.stride + 1, 1, tile, 0, result_tag, world.comm);
+        MPI_Type_free(&tile);
+        return;
+    }
+
+    const int n = world.grid_size;
+    std::vector<val_t> results(static_cast<size_t>(n) * n);
+    std::vector<MPI_Request> requests;
+    requests.reserve(world.size - 1);
+    for (int rank = 1; rank < world.size; ++rank) {
+        int coords[2], start[2], extent[2];
+        MPI_Cart_coords(world.comm, rank, 2, coords);
+        for (int axis = 0; axis < 2; ++axis)
+            partition(n, world.dims[axis], coords[axis], start[axis], extent[axis]);
+        MPI_Datatype tile;
+        MPI_Type_vector(extent[0], extent[1], n, MPI_DOUBLE, &tile);
+        MPI_Type_commit(&tile);
+        MPI_Request request;
+        MPI_Irecv(results.data() + static_cast<size_t>(start[0]) * n + start[1],
+                  1, tile, rank, result_tag, world.comm, &request);
+        requests.push_back(request);
+        MPI_Type_free(&tile);
+    }
+    for (int x = 0; x < world.extent[0]; ++x)
+        std::copy_n(energy.data() + static_cast<size_t>(x + 1) * world.stride + 1,
+                    world.extent[1],
+                    results.data() + static_cast<size_t>(world.start[0] + x) * n + world.start[1]);
+    if (!requests.empty())
+        MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+    print_results(results, "ElementEnergy");
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]'"\\n\", progName);
+    printf(\"Options:\\n\");
+    printf(\"  -n <num>     Grid size (NxN elements) (default: 512)\\n\");
+    printf(\"  -i <num>     Number of simulation iterations (default: 10)\\n\");
+    printf(\"  -v           Enable validation\\n\");
+    printf(\"  -r           Print results for external validation\\n\");
+    printf(\"  -h           Show this help message\\n\");
+}
+
+bool parseInteger(const char* text, int& value) {
+    char* end;
+    errno = 0;
+    const long parsed = std::strtol(text, &end, 10);
+    if (errno == ERANGE || end == text || *end "'!= '"'\\0' || parsed < 0 ||
+        parsed > std::numeric_limits<int>::max())
+        return false;
+    value = static_cast<int>(parsed);
+    return true;
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    int rank, processes;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &processes);
+    // grid size, iterations, validation, external results, parse status
+    int options[5] = {512, 10, 0, 0, 0};
+    if (rank == 0) {
+        for (int i = 1; i < argc; ++i) {
+            if ((strcmp(argv[i], \"-n\") == 0 || strcmp(argv[i], \"-i\") == 0) && i + 1 < argc) {
+                const int option = strcmp(argv[i], \"-n\") == 0 ? 0 : 1;
+                if ("'!parseInteger(argv[++i], options[option])) {
+                    printf("Invalid numeric argument: %s'"\\n\", argv[i]);
+                    options[4] = 1;
+                    break;
+                }
+            } else if (strcmp(argv[i], \"-v\") == 0) {
+                options[2] = 1;
+            } else if (strcmp(argv[i], \"-r\") == 0) {
+                options[3] = 1;
+            } else if (strcmp(argv[i], \"-h\") == 0) {
+                options[4] = 2;
+                break;
+            } else {
+                printf(\"Unknown option: %s\\n\", argv[i]);
+                options[4] = 1;
+                break;
+            }
+        }
+        if (options[4] == 0 && (options[0] < 1 || options[0] > std::numeric_limits<int>::max() - 2)) {
+            printf(\"Grid size must be positive and leave room for ghost cells.\\n\");
+            options[4] = 1;
+        }
+        if (options[4] "'!= 0) printUsage(argv[0]);
+    }
+    MPI_Bcast(options, 5, MPI_INT, 0, MPI_COMM_WORLD);
+    if (options[4] != 0) {
+        MPI_Finalize();
+        return options[4] == 2 ? 0 : 1;
+    }
+
+    const int n_elems_root = options[0];
+    const int n_iters = options[1];
+    const idx_t n_elems = static_cast<idx_t>(n_elems_root) * n_elems_root;
+    int dims[2];
+    const int active_processes = chooseProcessGrid(n_elems_root, processes, dims);
+    MPI_Comm active_comm;
+    MPI_Comm_split(MPI_COMM_WORLD, rank < active_processes ? 0 : MPI_UNDEFINED, rank, &active_comm);
+    int exit_status = 0;
+    try {
+        if (rank < active_processes) {
+            World world;
+            const int periods[2] = {0, 0};
+            // Retain rank zero as the sole output process.
+            MPI_Cart_create(active_comm, 2, dims, periods, 0, &world.comm);
+            MPI_Comm_free(&active_comm);
+            if (rank == 0) {
+                printf("Unstructured Mesh Energy Transfer Benchmark'"\\n\");
+                printf(\"============================================\\n\");
+                printf(\"Grid size: %d x %d = %\" PRIu64 \" elements\\n\", n_elems_root, n_elems_root, n_elems);
+                printf(\"Iterations: %d\\n\", n_iters);
+                printf(\"Validation: %s\\n\", options[2] ? \"enabled\" : \"disabled\");
+                printf(\"MPI processes: %d (%d active, %d x %d blocks)\\n\\n\",
+                       processes, active_processes, dims[0], dims[1]);
+                printf(\"Building unstructured mesh...\\n\");
+            }
+            buildSquare2D(world, n_elems_root);
+            const uint64_t memory[2] = {
+                world.elements_static.size() * sizeof(ElementStatic),
+                (world.energy[0].size() * 2 + world.total_flux.size()) * sizeof(val_t)
+            };
+            uint64_t global_memory[2];
+            MPI_Reduce(memory, global_memory, 2, MPI_UINT64_T, MPI_SUM, 0, world.comm);
+            if (rank == 0) {
+                printf(\"Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\\n\\n\",
+                       (global_memory[0] + global_memory[1]) / (1024.0 * 1024.0),
+                       global_memory[0] / (1024.0 * 1024.0),
+                       global_memory[1] / (1024.0 * 1024.0));
+                printf(\"Running simulation...\\n\");
+            }
+            MPI_Barrier(world.comm);
+            const double start_time = MPI_Wtime();
+            runSimulation(world, n_iters);
+            const double local_time = MPI_Wtime() - start_time;
+            double elapsed;
+            MPI_Reduce(&local_time, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, world.comm);
+            freeHaloExchange(world);
+            const uint64_t result_hash = computeHash(world);
+            if (rank == 0) {
+                const double duration_ms = elapsed * 1000.0;
+                const double time_per_iter = duration_ms / std::max(n_iters, 1);
+                const double giga_elems_per_sec = elapsed > 0.0
+                    ? static_cast<double>(n_iters) * n_elems / elapsed / 1e9 : 0.0;
+                printf(\"Computation time: %.3f ms\\n\", duration_ms);
+                printf(\"Performance:\\n\");
+                printf(\"  Time per iteration: %.4f ms\\n\", time_per_iter);
+                printf(\"  Elements/sec: %.4f GigaElements/s\\n\", giga_elems_per_sec);
+                printf(\"  Performance: %.4f GFLOPS\\n\", giga_elems_per_sec * 22.0);
+                printf(\"  Result hash: %016\" PRIX64 \"\\n\\n\", result_hash);
+            }
+            if (options[3]) printDistributedResults(world);
+            if (options[2] && "'!validateResults(world)) exit_status = 1;
+            MPI_Comm_free(&world.comm);
+        }
+    } catch (const std::exception& error) {
+        fprintf(stderr, "Rank %d: %s'"\\n\", rank, error.what());
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    // Includes idle ranks and propagates root's validation status to every rank.
+    MPI_Bcast(&exit_status, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Finalize();
+    return exit_status;
+}
+''')
+PY
+cmake -S unstructured -B /tmp/unstructured_mpi_build -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/unstructured_mpi_build -j 4" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ succeeded in 5698ms:
+-- The C compiler identification is GNU 13.2.0
+-- The CXX compiler identification is GNU 13.2.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Configuring done (3.0s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/unstructured_mpi_build
+[ 50%] Building CXX object CMakeFiles/unstructured.dir/unstructured.cpp.o
+[100%] Linking CXX executable unstructured
+[100%] Built target unstructured
+
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+
+codex
+The MPI implementation builds successfully. Each rank stores its own mesh block and ghosts; persistent requests exchange boundary energies, and cumulative flux updates in place. I’ll now compare hashes and printed results against the original, including uneven partitions, one-cell blocks, and runs with more ranks than cells.
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+import concurrent.futures
+import re
+import subprocess
+
+serial = '/tmp/unstructured_serial_reference'
+parallel = '/tmp/unstructured_mpi_build/unstructured'
+cases = [(n, i, p) for n, i, ranks in [
+    (1, 0, [1, 2, 5]), (1, 13, [1, 2, 5]),
+    (2, 1, [1, 2, 3, 4, 7]), (2, 19, [1, 2, 3, 4, 7]),
+    (3, 25, [1, 2, 4, 5, 8, 9, 12]),
+    (7, 25, [1, 2, 3, 4, 6, 8, 11]),
+    (16, 0, [1, 3, 4]), (31, 103, [1, 2, 4, 6, 8]),
+    (128, 40, [1, 4, 8]), (512, 10, [1, 4, 8])
+] for p in ranks]
+references = {}
+for n, i, _ in cases:
+    if (n, i) not in references:
+        references[n, i] = subprocess.check_output([serial, '-n', str(n), '-i', str(i), '-r', '-v'], text=True)
+
+def results(output):
+    digest = re.search(r'Result hash: (\\w+)', output).group(1)
+    block = re.search(r'=== RESULTS ===.*?=== END RESULTS ===', output, re.S).group(0)
+    flux = re.search(r'Flux sum: (.+)', output).group(1)
+    extrema = re.search(r'Energy range: (.+)', output).group(1)
+    return digest, block, flux, extrema
+
+def check(case):
+    n, i, p = case
+    output = subprocess.check_output(['mpirun', '--oversubscribe', '--bind-to', 'none', '-np', str(p), parallel, '-n', str(n), '-i', str(i), '-r', '-v'], text=True, stderr=subprocess.STDOUT, timeout=30)
+    expected = results(references[n, i])
+    actual = results(output)
+    assert actual == expected, f'Mismatch for {case}:\\nExpected {expected}\\nActual {actual}'
+    assert output.count('Unstructured Mesh Energy Transfer Benchmark') == 1
+    assert output.count('Validation: PASSED') == 1
+    return case
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    for case in pool.map(check, cases):
+        print('MATCH n=%d iterations=%d processes=%d' % case, flush=True)
+print(f'All {len(cases)} serial/MPI comparisons matched exact energy and cumulative-flux hashes and external results.')
+PY" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+
+exec
+/bin/bash -lc "sed -n '1,260p' unstructured/unstructured.cpp && sed -n '260,540p' unstructured/unstructured.cpp && cat unstructured/CMakeLists.txt" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ succeeded in 0ms:
+#include <mpi.h>
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cerrno>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <limits>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+using idx_t = uint64_t;
+using val_t = double;
+
+// The generated mesh has at most four connections, all with unit flux.
+constexpr int MAX_CONNECTIONS = 4;
+constexpr val_t CONNECTION_FLUX = 1.0;
+constexpr uint8_t DEFAULT_MAT_ID = 0;
+constexpr uint8_t INFLOW_MAT_ID = 1;
+constexpr uint8_t OUTFLOW_MAT_ID = 2;
+
+struct Material {
+    val_t transfer_coeff;
+    val_t external_flow;
+};
+
+// Indices address local energies, including the one-cell ghost layer.
+// Unit connection coefficients are shared rather than repeated per element.
+struct ElementStatic {
+    idx_t connected_idx[MAX_CONNECTIONS];
+    uint8_t material_idx;
+    uint8_t num_connections;
+};
+
+struct World {
+    std::array<Material, 3> materials{{{0.8, 0.0}, {0.8, 0.5}, {0.8, -0.5}}};
+    std::vector<ElementStatic> elements_static;
+    std::array<std::vector<val_t>, 2> energy;
+    // Neighbors only read energy, so cumulative flux can be updated in place.
+    std::vector<val_t> total_flux;
+    MPI_Comm comm = MPI_COMM_NULL;
+    MPI_Datatype column_type = MPI_DATATYPE_NULL;
+    std::array<std::array<MPI_Request, 8>, 2> requests;
+    int request_count = 0;
+    int current_buffer = 0;
+    int rank = 0;
+    int size = 1;
+    int grid_size = 0;
+    int dims[2] = {1, 1};
+    int coords[2] = {0, 0};
+    int start[2] = {0, 0};
+    int extent[2] = {0, 0};
+    size_t stride = 0;
+};
+
+void partition(const int n, const int parts, const int coordinate,
+               int& start, int& extent) {
+    const int base = n / parts;
+    const int remainder = n % parts;
+    extent = base + (coordinate < remainder);
+    start = coordinate * base + std::min(coordinate, remainder);
+}
+
+// Use as many nonempty rectangular blocks as possible, preferring a square
+// process grid. Extra processes participate in world-level finalization only.
+int chooseProcessGrid(const int n, const int processes, int dims[2]) {
+    int active = 0;
+    int best_difference = std::numeric_limits<int>::max();
+    for (int x = 1; x <= std::min(n, processes); ++x) {
+        const int y = std::min(n, processes / x);
+        const int count = x * y;
+        const int difference = std::abs(x - y);
+        if (count > active || (count == active && difference < best_difference)) {
+            active = count;
+            best_difference = difference;
+            dims[0] = x;
+            dims[1] = y;
+        }
+    }
+    return active;
+}
+
+void setupHaloExchange(World& world) {
+    int x_minus, x_plus, y_minus, y_plus;
+    MPI_Cart_shift(world.comm, 0, 1, &x_minus, &x_plus);
+    MPI_Cart_shift(world.comm, 1, 1, &y_minus, &y_plus);
+    const int nx = world.extent[0];
+    const int ny = world.extent[1];
+    const size_t stride = world.stride;
+
+    if (y_minus != MPI_PROC_NULL || y_plus != MPI_PROC_NULL) {
+        MPI_Type_vector(nx, 1, static_cast<int>(stride), MPI_DOUBLE, &world.column_type);
+        MPI_Type_commit(&world.column_type);
+    }
+
+    // Persistent requests amortize setup and refer to each fixed energy buffer.
+    // Tags identify the direction in which the sender's data travels.
+    for (int buffer = 0; buffer < 2; ++buffer) {
+        val_t* energy = world.energy[buffer].data();
+        auto& requests = world.requests[buffer];
+        int count = 0;
+        if (x_minus != MPI_PROC_NULL)
+            MPI_Recv_init(energy + 1, ny, MPI_DOUBLE, x_minus, 0,
+                          world.comm, &requests[count++]);
+        if (x_plus != MPI_PROC_NULL)
+            MPI_Recv_init(energy + (nx + 1) * stride + 1, ny, MPI_DOUBLE, x_plus, 1,
+                          world.comm, &requests[count++]);
+        if (y_minus != MPI_PROC_NULL)
+            MPI_Recv_init(energy + stride, 1, world.column_type, y_minus, 2,
+                          world.comm, &requests[count++]);
+        if (y_plus != MPI_PROC_NULL)
+            MPI_Recv_init(energy + stride + ny + 1, 1, world.column_type, y_plus, 3,
+                          world.comm, &requests[count++]);
+        if (x_minus != MPI_PROC_NULL)
+            MPI_Send_init(energy + stride + 1, ny, MPI_DOUBLE, x_minus, 1,
+                          world.comm, &requests[count++]);
+        if (x_plus != MPI_PROC_NULL)
+            MPI_Send_init(energy + nx * stride + 1, ny, MPI_DOUBLE, x_plus, 0,
+                          world.comm, &requests[count++]);
+        if (y_minus != MPI_PROC_NULL)
+            MPI_Send_init(energy + stride + 1, 1, world.column_type, y_minus, 3,
+                          world.comm, &requests[count++]);
+        if (y_plus != MPI_PROC_NULL)
+            MPI_Send_init(energy + stride + ny, 1, world.column_type, y_plus, 2,
+                          world.comm, &requests[count++]);
+        world.request_count = count;
+    }
+}
+
+void freeHaloExchange(World& world) {
+    for (auto& requests : world.requests)
+        for (int i = 0; i < world.request_count; ++i)
+            MPI_Request_free(&requests[i]);
+    if (world.column_type != MPI_DATATYPE_NULL)
+        MPI_Type_free(&world.column_type);
+}
+
+// Build only the owned portion of the original unstructured square mesh.
+void buildSquare2D(World& world, const int n_elems_root) {
+    world.grid_size = n_elems_root;
+    MPI_Comm_rank(world.comm, &world.rank);
+    MPI_Comm_size(world.comm, &world.size);
+    MPI_Cart_get(world.comm, 2, world.dims, world.start, world.coords);
+    for (int axis = 0; axis < 2; ++axis)
+        partition(n_elems_root, world.dims[axis], world.coords[axis],
+                  world.start[axis], world.extent[axis]);
+    const int nx = world.extent[0];
+    const int ny = world.extent[1];
+    world.stride = static_cast<size_t>(ny) + 2;
+    const size_t storage = (static_cast<size_t>(nx) + 2) * world.stride;
+    world.elements_static.resize(static_cast<size_t>(nx) * ny);
+    for (auto& energy : world.energy)
+        energy.assign(storage, 0.0);
+    world.total_flux.assign(storage, 0.0);
+
+    for (int x = 1; x <= nx; ++x) {
+        const int global_x = world.start[0] + x - 1;
+        for (int y = 1; y <= ny; ++y) {
+            const int global_y = world.start[1] + y - 1;
+            const size_t i = static_cast<size_t>(x) * world.stride + y;
+            ElementStatic& elem = world.elements_static[static_cast<size_t>(x - 1) * ny + y - 1];
+            elem.material_idx = DEFAULT_MAT_ID;
+            elem.num_connections = 0;
+            // Preserve the original summation order: +x, -x, +y, -y.
+            if (global_x + 1 < n_elems_root)
+                elem.connected_idx[elem.num_connections++] = i + world.stride;
+            if (global_x > 0)
+                elem.connected_idx[elem.num_connections++] = i - world.stride;
+            if (global_y + 1 < n_elems_root)
+                elem.connected_idx[elem.num_connections++] = i + 1;
+            if (global_y > 0)
+                elem.connected_idx[elem.num_connections++] = i - 1;
+
+            const int last = n_elems_root - 1;
+            // Separate assignments also preserve the 1x1 mesh's final inflow.
+            if (global_x == 0 && global_y == 0) elem.material_idx = INFLOW_MAT_ID;
+            if (global_x == 0 && global_y == last) elem.material_idx = OUTFLOW_MAT_ID;
+            if (global_x == last && global_y == 0) elem.material_idx = OUTFLOW_MAT_ID;
+            if (global_x == last && global_y == last) elem.material_idx = INFLOW_MAT_ID;
+        }
+    }
+    setupHaloExchange(world);
+}
+
+inline val_t computeFlux(const Material& mat, val_t energy, val_t other_energy) {
+    return (other_energy - energy) * mat.transfer_coeff * CONNECTION_FLUX * 0.25;
+}
+
+template <bool full_connectivity>
+inline void updateElement(World& world, const val_t* energy, val_t* next,
+                          const size_t element_index, const size_t energy_index) {
+    const ElementStatic& elem = world.elements_static[element_index];
+    const Material& mat = world.materials[elem.material_idx];
+    const val_t current = energy[energy_index];
+    val_t flux = mat.external_flow;
+    const int connections = full_connectivity ? MAX_CONNECTIONS : elem.num_connections;
+    for (int j = 0; j < connections; ++j)
+        flux += computeFlux(mat, current, energy[elem.connected_idx[j]]);
+    next[energy_index] = current + flux;
+    world.total_flux[energy_index] += std::abs(flux);
+}
+
+void runSimulation(World& world, const int n_iters) {
+    const int nx = world.extent[0];
+    const int ny = world.extent[1];
+    const size_t stride = world.stride;
+    for (int iter = 0; iter < n_iters; ++iter) {
+        const int buffer = world.current_buffer;
+        const val_t* energy = world.energy[buffer].data();
+        val_t* next = world.energy[1 - buffer].data();
+        if (world.request_count)
+            MPI_Startall(world.request_count, world.requests[buffer].data());
+
+        // No ghost values are read here, allowing communication to overlap work.
+        for (int x = 2; x < nx; ++x) {
+            const size_t row = static_cast<size_t>(x) * stride;
+            const size_t element_row = static_cast<size_t>(x - 1) * ny;
+            for (int y = 2; y < ny; ++y)
+                updateElement<true>(world, energy, next, element_row + y - 1, row + y);
+        }
+        if (world.request_count)
+            MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+
+        // Update the block perimeter exactly once, including thin 1-cell blocks.
+        for (int y = 1; y <= ny; ++y)
+            updateElement<false>(world, energy, next, y - 1, stride + y);
+        if (nx > 1) {
+            const size_t row = static_cast<size_t>(nx) * stride;
+            const size_t element_row = static_cast<size_t>(nx - 1) * ny;
+            for (int y = 1; y <= ny; ++y)
+                updateElement<false>(world, energy, next, element_row + y - 1, row + y);
+        }
+        for (int x = 2; x < nx; ++x) {
+            const size_t row = static_cast<size_t>(x) * stride;
+            const size_t element_row = static_cast<size_t>(x - 1) * ny;
+            updateElement<false>(world, energy, next, element_row, row + 1);
+            if (ny > 1)
+                updateElement<false>(world, energy, next, element_row + ny - 1, row + ny);
+        }
+        world.current_buffer = 1 - buffer;
+    }
+}
+
+bool validateResults(const World& world) {
+    val_t sums[2] = {0.0, 0.0};
+    val_t energy_max = std::numeric_limits<val_t>::lowest();
+    val_t energy_min = std::numeric_limits<val_t>::max();
+    const auto& energy = world.energy[world.current_buffer];
+    for (int x = 1; x <= world.extent[0]; ++x) {
+        const size_t row = static_cast<size_t>(x) * world.stride;
+        for (int y = 1; y <= world.extent[1]; ++y) {
+            const size_t i = row + y;
+            sums[0] += energy[i];
+            sums[1] += world.total_flux[i];
+            sums[1] += world.total_flux[i];
+            energy_max = std::max(energy[i], energy_max);
+            energy_min = std::min(energy[i], energy_min);
+        }
+    }
+    val_t global_sums[2], global_max, global_min;
+    MPI_Reduce(sums, global_sums, 2, MPI_DOUBLE, MPI_SUM, 0, world.comm);
+    MPI_Reduce(&energy_max, &global_max, 1, MPI_DOUBLE, MPI_MAX, 0, world.comm);
+    MPI_Reduce(&energy_min, &global_min, 1, MPI_DOUBLE, MPI_MIN, 0, world.comm);
+    if (world.rank != 0) return true;
+
+    printf("Validation results:\n");
+    printf("  Energy sum: %.12f\n", global_sums[0]);
+    printf("  Flux sum: %.2f\n", global_sums[1]);
+    printf("  Energy range: [%.6f, %.6f]\n", global_min, global_max);
+    constexpr val_t energy_epsilon = 1e-8;
+    if (!std::isfinite(global_sums[0])) {
+        printf("  ERROR: Energy sum is not finite\n");
+        return false;
+    }
+    if (std::abs(global_sums[0]) > energy_epsilon)
+        printf("  WARNING: Energy sum diverged from 0 (expected conservation)\n");
+    if (!std::isfinite(global_sums[1])) {
+        printf("  ERROR: Flux sum is not finite\n");
+        return false;
+    }
+    if (!std::isfinite(global_max) || !std::isfinite(global_min)) {
+        printf("  ERROR: Energy extrema are not finite\n");
+        return false;
+    }
+    printf("  Validation: PASSED\n");
+    return true;
+}
+
+uint64_t computeHash(const World& world) {
+    uint64_t local_hash = 0;
+    const auto& energy = world.energy[world.current_buffer];
+    for (int x = 1; x <= world.extent[0]; ++x) {
+        const idx_t global_row = static_cast<idx_t>(world.start[0] + x - 1) * world.grid_size;
+        const size_t row = static_cast<size_t>(x) * world.stride;
+        for (int y = 1; y <= world.extent[1]; ++y) {
+            const size_t local_i = row + y;
+            const idx_t global_i = global_row + world.start[1] + y - 1;
+            const uint64_t e_bits = std::bit_cast<uint64_t>(energy[local_i]);
+            const uint64_t f_bits = std::bit_cast<uint64_t>(world.total_flux[local_i]);
+            local_hash ^= (e_bits + global_i) * 0x9e3779b97f4a7c15ULL;
+            local_hash ^= (f_bits + global_i) * 0xbf58476d1ce4e5b9ULL;
+        }
+    }
+    uint64_t global_hash = 0;
+    MPI_Reduce(&local_hash, &global_hash, 1, MPI_UINT64_T, MPI_BXOR, 0, world.comm);
+    return global_hash;
+}
+
+// Only -r needs a global array: preserve print_results' row-major Kahan sum,
+// samples and order-sensitive FNV hash. Datatypes place tiles directly into it.
+void printDistributedResults(const World& world) {
+    constexpr int result_tag = 4;
+    const auto& energy = world.energy[world.current_buffer];
+    if (world.rank != 0) {
+        MPI_Datatype tile;
+        MPI_Type_vector(world.extent[0], world.extent[1], static_cast<int>(world.stride),
+                        MPI_DOUBLE, &tile);
+        MPI_Type_commit(&tile);
+        MPI_Send(energy.data() + world.stride + 1, 1, tile, 0, result_tag, world.comm);
+        MPI_Type_free(&tile);
+        return;
+    }
+
+    const int n = world.grid_size;
+    std::vector<val_t> results(static_cast<size_t>(n) * n);
+    std::vector<MPI_Request> requests;
+    requests.reserve(world.size - 1);
+    for (int rank = 1; rank < world.size; ++rank) {
+        int coords[2], start[2], extent[2];
+        MPI_Cart_coords(world.comm, rank, 2, coords);
+        for (int axis = 0; axis < 2; ++axis)
+            partition(n, world.dims[axis], coords[axis], start[axis], extent[axis]);
+        MPI_Datatype tile;
+        MPI_Type_vector(extent[0], extent[1], n, MPI_DOUBLE, &tile);
+        MPI_Type_commit(&tile);
+        MPI_Request request;
+        MPI_Irecv(results.data() + static_cast<size_t>(start[0]) * n + start[1],
+                  1, tile, rank, result_tag, world.comm, &request);
+        requests.push_back(request);
+        MPI_Type_free(&tile);
+    }
+    for (int x = 0; x < world.extent[0]; ++x)
+        std::copy_n(energy.data() + static_cast<size_t>(x + 1) * world.stride + 1,
+                    world.extent[1],
+                    results.data() + static_cast<size_t>(world.start[0] + x) * n + world.start[1]);
+    if (!requests.empty())
+        MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+    print_results(results, "ElementEnergy");
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Grid size (NxN elements) (default: 512)\n");
+    printf("  -i <num>     Number of simulation iterations (default: 10)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+bool parseInteger(const char* text, int& value) {
+    char* end;
+    errno = 0;
+    const long parsed = std::strtol(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != '\0' || parsed < 0 ||
+        parsed > std::numeric_limits<int>::max())
+        return false;
+    value = static_cast<int>(parsed);
+    return true;
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    int rank, processes;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &processes);
+    // grid size, iterations, validation, external results, parse status
+    int options[5] = {512, 10, 0, 0, 0};
+    if (rank == 0) {
+        for (int i = 1; i < argc; ++i) {
+            if ((strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "-i") == 0) && i + 1 < argc) {
+                const int option = strcmp(argv[i], "-n") == 0 ? 0 : 1;
+                if (!parseInteger(argv[++i], options[option])) {
+                    printf("Invalid numeric argument: %s\n", argv[i]);
+                    options[4] = 1;
+                    break;
+                }
+            } else if (strcmp(argv[i], "-v") == 0) {
+                options[2] = 1;
+            } else if (strcmp(argv[i], "-r") == 0) {
+                options[3] = 1;
+            } else if (strcmp(argv[i], "-h") == 0) {
+                options[4] = 2;
+                break;
+            } else {
+                printf("Unknown option: %s\n", argv[i]);
+                options[4] = 1;
+                break;
+            }
+        }
+        if (options[4] == 0 && (options[0] < 1 || options[0] > std::numeric_limits<int>::max() - 2)) {
+            printf("Grid size must be positive and leave room for ghost cells.\n");
+            options[4] = 1;
+        }
+        if (options[4] != 0) printUsage(argv[0]);
+    }
+    MPI_Bcast(options, 5, MPI_INT, 0, MPI_COMM_WORLD);
+    if (options[4] != 0) {
+        MPI_Finalize();
+        return options[4] == 2 ? 0 : 1;
+    }
+
+    const int n_elems_root = options[0];
+    const int n_iters = options[1];
+    const idx_t n_elems = static_cast<idx_t>(n_elems_root) * n_elems_root;
+    int dims[2];
+    const int active_processes = chooseProcessGrid(n_elems_root, processes, dims);
+    MPI_Comm active_comm;
+    MPI_Comm_split(MPI_COMM_WORLD, rank < active_processes ? 0 : MPI_UNDEFINED, rank, &active_comm);
+    int exit_status = 0;
+    try {
+        if (rank < active_processes) {
+            World world;
+            const int periods[2] = {0, 0};
+            // Retain rank zero as the sole output process.
+            MPI_Cart_create(active_comm, 2, dims, periods, 0, &world.comm);
+            MPI_Comm_free(&active_comm);
+            if (rank == 0) {
+                printf("Unstructured Mesh Energy Transfer Benchmark\n");
+                printf("============================================\n");
+                printf("Grid size: %d x %d = %" PRIu64 " elements\n", n_elems_root, n_elems_root, n_elems);
+                printf("Iterations: %d\n", n_iters);
+                printf("Validation: %s\n", options[2] ? "enabled" : "disabled");
+                printf("MPI processes: %d (%d active, %d x %d blocks)\n\n",
+                       processes, active_processes, dims[0], dims[1]);
+                printf("Building unstructured mesh...\n");
+            }
+            buildSquare2D(world, n_elems_root);
+            const uint64_t memory[2] = {
+                world.elements_static.size() * sizeof(ElementStatic),
+                (world.energy[0].size() * 2 + world.total_flux.size()) * sizeof(val_t)
+            };
+            uint64_t global_memory[2];
+            MPI_Reduce(memory, global_memory, 2, MPI_UINT64_T, MPI_SUM, 0, world.comm);
+            if (rank == 0) {
+                printf("Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\n\n",
+                       (global_memory[0] + global_memory[1]) / (1024.0 * 1024.0),
+                       global_memory[0] / (1024.0 * 1024.0),
+                       global_memory[1] / (1024.0 * 1024.0));
+                printf("Running simulation...\n");
+            }
+            MPI_Barrier(world.comm);
+            const double start_time = MPI_Wtime();
+            runSimulation(world, n_iters);
+            const double local_time = MPI_Wtime() - start_time;
+            double elapsed;
+            MPI_Reduce(&local_time, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, world.comm);
+            freeHaloExchange(world);
+            const uint64_t result_hash = computeHash(world);
+            if (rank == 0) {
+                const double duration_ms = elapsed * 1000.0;
+                const double time_per_iter = duration_ms / std::max(n_iters, 1);
+                const double giga_elems_per_sec = elapsed > 0.0
+                    ? static_cast<double>(n_iters) * n_elems / elapsed / 1e9 : 0.0;
+                printf("Computation time: %.3f ms\n", duration_ms);
+                printf("Performance:\n");
+                printf("  Time per iteration: %.4f ms\n", time_per_iter);
+                printf("  Elements/sec: %.4f GigaElements/s\n", giga_elems_per_sec);
+                printf("  Performance: %.4f GFLOPS\n", giga_elems_per_sec * 22.0);
+                printf("  Result hash: %016" PRIX64 "\n\n", result_hash);
+            }
+            if (options[3]) printDistributedResults(world);
+            if (options[2] && !validateResults(world)) exit_status = 1;
+            MPI_Comm_free(&world.comm);
+        }
+    } catch (const std::exception& error) {
+        fprintf(stderr, "Rank %d: %s\n", rank, error.what());
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    // Includes idle ranks and propagates root's validation status to every rank.
+    MPI_Bcast(&exit_status, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Finalize();
+    return exit_status;
+}
+cmake_minimum_required(VERSION 3.10)
+project(unstructured_benchmark)
+
+find_package(MPI REQUIRED COMPONENTS CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(unstructured unstructured.cpp)
+
+# Enable optimizations
+target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+
+# MPI is required, including for single-process runs.
+target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+
+exec
+/bin/bash -lc 'mpirun --oversubscribe -np 4 /tmp/unstructured_mpi_build/unstructured -h && mpirun --oversubscribe -np 3 /tmp/unstructured_mpi_build/unstructured -n 5 -i 2' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+exec
+/bin/bash -lc "python3 - <<'PY'
+import subprocess
+binary='/tmp/unstructured_mpi_build/unstructured'
+for args in [['-n','0'], ['-n','-1'], ['-n','abc'], ['-n','2147483648'], ['-n','2147483647'], ['-i','-1'], ['-i','abc'], ['-n'], ['--unknown']]:
+    p=subprocess.run(['mpirun','--oversubscribe','--bind-to','none','-np','3',binary,*args],capture_output=True,text=True,timeout=15)
+    assert p.returncode "'!= 0, args
+    assert p.stdout.count('"'Usage:') == 1, (args,p.stdout)
+    print('Clean collective error:', ' '.join(args))
+PY" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ succeeded in 6610ms:
+Usage: /tmp/unstructured_mpi_build/unstructured [options]
+Options:
+  -n <num>     Grid size (NxN elements) (default: 512)
+  -i <num>     Number of simulation iterations (default: 10)
+  -v           Enable validation
+  -r           Print results for external validation
+  -h           Show this help message
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 5 x 5 = 25 elements
+Iterations: 2
+Validation: disabled
+MPI processes: 3 (3 active, 1 x 3 blocks)
+
+Building unstructured mesh...
+Memory usage: 0.00 MB (static: 0.00 MB, dynamic: 0.00 MB)
+
+Running simulation...
+Computation time: 0.038 ms
+Performance:
+  Time per iteration: 0.0190 ms
+  Elements/sec: 0.0013 GigaElements/s
+  Performance: 0.0289 GFLOPS
+  Result hash: FE93FC6EAF8248F0
+
+
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+
+ succeeded in 42846ms:
+MATCH n=1 iterations=0 processes=1
+MATCH n=1 iterations=0 processes=2
+MATCH n=1 iterations=0 processes=5
+MATCH n=1 iterations=13 processes=1
+MATCH n=1 iterations=13 processes=2
+MATCH n=1 iterations=13 processes=5
+MATCH n=2 iterations=1 processes=1
+MATCH n=2 iterations=1 processes=2
+MATCH n=2 iterations=1 processes=3
+MATCH n=2 iterations=1 processes=4
+MATCH n=2 iterations=1 processes=7
+MATCH n=2 iterations=19 processes=1
+MATCH n=2 iterations=19 processes=2
+MATCH n=2 iterations=19 processes=3
+MATCH n=2 iterations=19 processes=4
+MATCH n=2 iterations=19 processes=7
+MATCH n=3 iterations=25 processes=1
+MATCH n=3 iterations=25 processes=2
+MATCH n=3 iterations=25 processes=4
+MATCH n=3 iterations=25 processes=5
+MATCH n=3 iterations=25 processes=8
+MATCH n=3 iterations=25 processes=9
+MATCH n=3 iterations=25 processes=12
+MATCH n=7 iterations=25 processes=1
+MATCH n=7 iterations=25 processes=2
+MATCH n=7 iterations=25 processes=3
+MATCH n=7 iterations=25 processes=4
+MATCH n=7 iterations=25 processes=6
+MATCH n=7 iterations=25 processes=8
+MATCH n=7 iterations=25 processes=11
+MATCH n=16 iterations=0 processes=1
+MATCH n=16 iterations=0 processes=3
+MATCH n=16 iterations=0 processes=4
+MATCH n=31 iterations=103 processes=1
+MATCH n=31 iterations=103 processes=2
+MATCH n=31 iterations=103 processes=4
+MATCH n=31 iterations=103 processes=6
+MATCH n=31 iterations=103 processes=8
+MATCH n=128 iterations=40 processes=1
+MATCH n=128 iterations=40 processes=4
+MATCH n=128 iterations=40 processes=8
+MATCH n=512 iterations=10 processes=1
+MATCH n=512 iterations=10 processes=4
+MATCH n=512 iterations=10 processes=8
+All 44 serial/MPI comparisons matched exact energy and cumulative-flux hashes and external results.
+
+ succeeded in 27951ms:
+Clean collective error: -n 0
+Clean collective error: -n -1
+Clean collective error: -n abc
+Clean collective error: -n 2147483648
+Clean collective error: -n 2147483647
+Clean collective error: -i -1
+Clean collective error: -i abc
+Clean collective error: -n
+Clean collective error: --unknown
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1/unstructured/unstructured.cpp
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 40be8736c2289647d7d821e0eacb021728519a17..aa5c616aef9e7acdee44afab0f3ccc530acf6f43
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -76,7 +76,9 @@
+         const int y = std::min(n, processes / x);
+         const int count = x * y;
+         const int difference = std::abs(x - y);
+-        if (count > active || (count == active && difference < best_difference)) {
++        // Favor contiguous row exchanges when both orientations are equivalent.
++        if (count > active || (count == active &&
++            (difference < best_difference || (difference == best_difference && x > dims[0])))) {
+             active = count;
+             best_difference = difference;
+             dims[0] = x;
+@@ -146,7 +148,8 @@
+     world.grid_size = n_elems_root;
+     MPI_Comm_rank(world.comm, &world.rank);
+     MPI_Comm_size(world.comm, &world.size);
+-    MPI_Cart_get(world.comm, 2, world.dims, world.start, world.coords);
++    int periods[2];
++    MPI_Cart_get(world.comm, 2, world.dims, periods, world.coords);
+     for (int axis = 0; axis < 2; ++axis)
+         partition(n_elems_root, world.dims[axis], world.coords[axis],
+                   world.start[axis], world.extent[axis]);
+@@ -214,7 +217,8 @@
+         const int buffer = world.current_buffer;
+         const val_t* energy = world.energy[buffer].data();
+         val_t* next = world.energy[1 - buffer].data();
+-        if (world.request_count)
++        bool pending = world.request_count != 0;
++        if (pending)
+             MPI_Startall(world.request_count, world.requests[buffer].data());
+ 
+         // No ghost values are read here, allowing communication to overlap work.
+@@ -223,8 +227,15 @@
+             const size_t element_row = static_cast<size_t>(x - 1) * ny;
+             for (int y = 2; y < ny; ++y)
+                 updateElement<true>(world, energy, next, element_row + y - 1, row + y);
++            // Drive progress on MPI implementations without a progress thread.
++            if (pending && (x & 31) == 0) {
++                int completed;
++                MPI_Testall(world.request_count, world.requests[buffer].data(),
++                            &completed, MPI_STATUSES_IGNORE);
++                pending = !completed;
++            }
+         }
+-        if (world.request_count)
++        if (pending)
+             MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+ 
+         // Update the block perimeter exactly once, including thin 1-cell blocks.
+
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 40be8736c2289647d7d821e0eacb021728519a17..aa5c616aef9e7acdee44afab0f3ccc530acf6f43
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -76,7 +76,9 @@
+         const int y = std::min(n, processes / x);
+         const int count = x * y;
+         const int difference = std::abs(x - y);
+-        if (count > active || (count == active && difference < best_difference)) {
++        // Favor contiguous row exchanges when both orientations are equivalent.
++        if (count > active || (count == active &&
++            (difference < best_difference || (difference == best_difference && x > dims[0])))) {
+             active = count;
+             best_difference = difference;
+             dims[0] = x;
+@@ -146,7 +148,8 @@
+     world.grid_size = n_elems_root;
+     MPI_Comm_rank(world.comm, &world.rank);
+     MPI_Comm_size(world.comm, &world.size);
+-    MPI_Cart_get(world.comm, 2, world.dims, world.start, world.coords);
++    int periods[2];
++    MPI_Cart_get(world.comm, 2, world.dims, periods, world.coords);
+     for (int axis = 0; axis < 2; ++axis)
+         partition(n_elems_root, world.dims[axis], world.coords[axis],
+                   world.start[axis], world.extent[axis]);
+@@ -214,7 +217,8 @@
+         const int buffer = world.current_buffer;
+         const val_t* energy = world.energy[buffer].data();
+         val_t* next = world.energy[1 - buffer].data();
+-        if (world.request_count)
++        bool pending = world.request_count != 0;
++        if (pending)
+             MPI_Startall(world.request_count, world.requests[buffer].data());
+ 
+         // No ghost values are read here, allowing communication to overlap work.
+@@ -223,8 +227,15 @@
+             const size_t element_row = static_cast<size_t>(x - 1) * ny;
+             for (int y = 2; y < ny; ++y)
+                 updateElement<true>(world, energy, next, element_row + y - 1, row + y);
++            // Drive progress on MPI implementations without a progress thread.
++            if (pending && (x & 31) == 0) {
++                int completed;
++                MPI_Testall(world.request_count, world.requests[buffer].data(),
++                            &completed, MPI_STATUSES_IGNORE);
++                pending = !completed;
++            }
+         }
+-        if (world.request_count)
++        if (pending)
+             MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+ 
+         // Update the block perimeter exactly once, including thin 1-cell blocks.
+
+exec
+/bin/bash -lc "free -h && rg --files unstructured common && rg -n 'sums\\[1\\]|MPI_|runSimulation|buildSquare2D' unstructured/unstructured.cpp" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ succeeded in 0ms:
+               total        used        free      shared  buff/cache   available
+Mem:           1.0Ti        32Gi       858Gi       623Mi       123Gi       975Gi
+Swap:             0B          0B          0B
+common/hash.hpp
+common/results_output.hpp
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+47:    MPI_Comm comm = MPI_COMM_NULL;
+48:    MPI_Datatype column_type = MPI_DATATYPE_NULL;
+49:    std::array<std::array<MPI_Request, 8>, 2> requests;
+93:    MPI_Cart_shift(world.comm, 0, 1, &x_minus, &x_plus);
+94:    MPI_Cart_shift(world.comm, 1, 1, &y_minus, &y_plus);
+99:    if (y_minus != MPI_PROC_NULL || y_plus != MPI_PROC_NULL) {
+100:        MPI_Type_vector(nx, 1, static_cast<int>(stride), MPI_DOUBLE, &world.column_type);
+101:        MPI_Type_commit(&world.column_type);
+110:        if (x_minus != MPI_PROC_NULL)
+111:            MPI_Recv_init(energy + 1, ny, MPI_DOUBLE, x_minus, 0,
+113:        if (x_plus != MPI_PROC_NULL)
+114:            MPI_Recv_init(energy + (nx + 1) * stride + 1, ny, MPI_DOUBLE, x_plus, 1,
+116:        if (y_minus != MPI_PROC_NULL)
+117:            MPI_Recv_init(energy + stride, 1, world.column_type, y_minus, 2,
+119:        if (y_plus != MPI_PROC_NULL)
+120:            MPI_Recv_init(energy + stride + ny + 1, 1, world.column_type, y_plus, 3,
+122:        if (x_minus != MPI_PROC_NULL)
+123:            MPI_Send_init(energy + stride + 1, ny, MPI_DOUBLE, x_minus, 1,
+125:        if (x_plus != MPI_PROC_NULL)
+126:            MPI_Send_init(energy + nx * stride + 1, ny, MPI_DOUBLE, x_plus, 0,
+128:        if (y_minus != MPI_PROC_NULL)
+129:            MPI_Send_init(energy + stride + 1, 1, world.column_type, y_minus, 3,
+131:        if (y_plus != MPI_PROC_NULL)
+132:            MPI_Send_init(energy + stride + ny, 1, world.column_type, y_plus, 2,
+141:            MPI_Request_free(&requests[i]);
+142:    if (world.column_type != MPI_DATATYPE_NULL)
+143:        MPI_Type_free(&world.column_type);
+147:void buildSquare2D(World& world, const int n_elems_root) {
+149:    MPI_Comm_rank(world.comm, &world.rank);
+150:    MPI_Comm_size(world.comm, &world.size);
+152:    MPI_Cart_get(world.comm, 2, world.dims, periods, world.coords);
+212:void runSimulation(World& world, const int n_iters) {
+222:            MPI_Startall(world.request_count, world.requests[buffer].data());
+233:                MPI_Testall(world.request_count, world.requests[buffer].data(),
+234:                            &completed, MPI_STATUSES_IGNORE);
+239:            MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+271:            sums[1] += world.total_flux[i];
+277:    MPI_Reduce(sums, global_sums, 2, MPI_DOUBLE, MPI_SUM, 0, world.comm);
+278:    MPI_Reduce(&energy_max, &global_max, 1, MPI_DOUBLE, MPI_MAX, 0, world.comm);
+279:    MPI_Reduce(&energy_min, &global_min, 1, MPI_DOUBLE, MPI_MIN, 0, world.comm);
+284:    printf("  Flux sum: %.2f\n", global_sums[1]);
+293:    if (!std::isfinite(global_sums[1])) {
+321:    MPI_Reduce(&local_hash, &global_hash, 1, MPI_UINT64_T, MPI_BXOR, 0, world.comm);
+331:        MPI_Datatype tile;
+332:        MPI_Type_vector(world.extent[0], world.extent[1], static_cast<int>(world.stride),
+333:                        MPI_DOUBLE, &tile);
+334:        MPI_Type_commit(&tile);
+335:        MPI_Send(energy.data() + world.stride + 1, 1, tile, 0, result_tag, world.comm);
+336:        MPI_Type_free(&tile);
+342:    std::vector<MPI_Request> requests;
+346:        MPI_Cart_coords(world.comm, rank, 2, coords);
+349:        MPI_Datatype tile;
+350:        MPI_Type_vector(extent[0], extent[1], n, MPI_DOUBLE, &tile);
+351:        MPI_Type_commit(&tile);
+352:        MPI_Request request;
+353:        MPI_Irecv(results.data() + static_cast<size_t>(start[0]) * n + start[1],
+356:        MPI_Type_free(&tile);
+363:        MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+389:    MPI_Init(&argc, &argv);
+391:    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+392:    MPI_Comm_size(MPI_COMM_WORLD, &processes);
+423:    MPI_Bcast(options, 5, MPI_INT, 0, MPI_COMM_WORLD);
+425:        MPI_Finalize();
+434:    MPI_Comm active_comm;
+435:    MPI_Comm_split(MPI_COMM_WORLD, rank < active_processes ? 0 : MPI_UNDEFINED, rank, &active_comm);
+442:            MPI_Cart_create(active_comm, 2, dims, periods, 0, &world.comm);
+443:            MPI_Comm_free(&active_comm);
+454:            buildSquare2D(world, n_elems_root);
+460:            MPI_Reduce(memory, global_memory, 2, MPI_UINT64_T, MPI_SUM, 0, world.comm);
+468:            MPI_Barrier(world.comm);
+469:            const double start_time = MPI_Wtime();
+470:            runSimulation(world, n_iters);
+471:            const double local_time = MPI_Wtime() - start_time;
+473:            MPI_Reduce(&local_time, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, world.comm);
+490:            MPI_Comm_free(&world.comm);
+494:        MPI_Abort(MPI_COMM_WORLD, 1);
+497:    MPI_Bcast(&exit_status, 1, MPI_INT, 0, MPI_COMM_WORLD);
+498:    MPI_Finalize();
+
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 40be8736c2289647d7d821e0eacb021728519a17..aa5c616aef9e7acdee44afab0f3ccc530acf6f43
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -76,7 +76,9 @@
+         const int y = std::min(n, processes / x);
+         const int count = x * y;
+         const int difference = std::abs(x - y);
+-        if (count > active || (count == active && difference < best_difference)) {
++        // Favor contiguous row exchanges when both orientations are equivalent.
++        if (count > active || (count == active &&
++            (difference < best_difference || (difference == best_difference && x > dims[0])))) {
+             active = count;
+             best_difference = difference;
+             dims[0] = x;
+@@ -146,7 +148,8 @@
+     world.grid_size = n_elems_root;
+     MPI_Comm_rank(world.comm, &world.rank);
+     MPI_Comm_size(world.comm, &world.size);
+-    MPI_Cart_get(world.comm, 2, world.dims, world.start, world.coords);
++    int periods[2];
++    MPI_Cart_get(world.comm, 2, world.dims, periods, world.coords);
+     for (int axis = 0; axis < 2; ++axis)
+         partition(n_elems_root, world.dims[axis], world.coords[axis],
+                   world.start[axis], world.extent[axis]);
+@@ -214,7 +217,8 @@
+         const int buffer = world.current_buffer;
+         const val_t* energy = world.energy[buffer].data();
+         val_t* next = world.energy[1 - buffer].data();
+-        if (world.request_count)
++        bool pending = world.request_count != 0;
++        if (pending)
+             MPI_Startall(world.request_count, world.requests[buffer].data());
+ 
+         // No ghost values are read here, allowing communication to overlap work.
+@@ -223,8 +227,15 @@
+             const size_t element_row = static_cast<size_t>(x - 1) * ny;
+             for (int y = 2; y < ny; ++y)
+                 updateElement<true>(world, energy, next, element_row + y - 1, row + y);
++            // Drive progress on MPI implementations without a progress thread.
++            if (pending && (x & 31) == 0) {
++                int completed;
++                MPI_Testall(world.request_count, world.requests[buffer].data(),
++                            &completed, MPI_STATUSES_IGNORE);
++                pending = !completed;
++            }
+         }
+-        if (world.request_count)
++        if (pending)
+             MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+ 
+         // Update the block perimeter exactly once, including thin 1-cell blocks.
+
+codex
+All 44 comparisons matched the serial version’s exact energy and cumulative-flux hash and full external results block. Tiny grids, uneven blocks, idle ranks, and invalid arguments also behaved correctly. I’m checking the final communication tuning and measuring local scaling on larger grids.
+
+exec
+/bin/bash -lc "cmake --build /tmp/unstructured_mpi_build -j 4 && python3 -u - <<'PY'
+import re
+import subprocess
+
+serial='/tmp/unstructured_serial_reference'
+parallel='/tmp/unstructured_mpi_build/unstructured'
+for n, i, p in [(1,7,4), (2,17,3), (3,25,5), (7,35,3), (127,300,6), (257,105,5), (512,20,8), (65,10000,4)]:
+    args=['-n',str(n),'-i',str(i),'-r','-v']
+    ref=subprocess.check_output([serial,*args],text=True)
+    result=subprocess.check_output(['mpirun','--oversubscribe','--bind-to','none','-np',str(p),parallel,*args],text=True,stderr=subprocess.STDOUT,timeout=60)
+    for pattern in [r'Result hash: (\\w+)',r'=== RESULTS ===.*?=== END RESULTS ===',r'Flux sum: (.+)',r'Energy range: (.+)']:
+        assert re.search(pattern,ref,re.S).group(0)==re.search(pattern,result,re.S).group(0), (n,i,p,pattern,ref,result)
+    print(f'Final tuning matches serial: n={n}, iterations={i}, processes={p}',flush=True)
+PY" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 40be8736c2289647d7d821e0eacb021728519a17..aa5c616aef9e7acdee44afab0f3ccc530acf6f43
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -76,7 +76,9 @@
+         const int y = std::min(n, processes / x);
+         const int count = x * y;
+         const int difference = std::abs(x - y);
+-        if (count > active || (count == active && difference < best_difference)) {
++        // Favor contiguous row exchanges when both orientations are equivalent.
++        if (count > active || (count == active &&
++            (difference < best_difference || (difference == best_difference && x > dims[0])))) {
+             active = count;
+             best_difference = difference;
+             dims[0] = x;
+@@ -146,7 +148,8 @@
+     world.grid_size = n_elems_root;
+     MPI_Comm_rank(world.comm, &world.rank);
+     MPI_Comm_size(world.comm, &world.size);
+-    MPI_Cart_get(world.comm, 2, world.dims, world.start, world.coords);
++    int periods[2];
++    MPI_Cart_get(world.comm, 2, world.dims, periods, world.coords);
+     for (int axis = 0; axis < 2; ++axis)
+         partition(n_elems_root, world.dims[axis], world.coords[axis],
+                   world.start[axis], world.extent[axis]);
+@@ -214,7 +217,8 @@
+         const int buffer = world.current_buffer;
+         const val_t* energy = world.energy[buffer].data();
+         val_t* next = world.energy[1 - buffer].data();
+-        if (world.request_count)
++        bool pending = world.request_count != 0;
++        if (pending)
+             MPI_Startall(world.request_count, world.requests[buffer].data());
+ 
+         // No ghost values are read here, allowing communication to overlap work.
+@@ -223,8 +227,15 @@
+             const size_t element_row = static_cast<size_t>(x - 1) * ny;
+             for (int y = 2; y < ny; ++y)
+                 updateElement<true>(world, energy, next, element_row + y - 1, row + y);
++            // Drive progress on MPI implementations without a progress thread.
++            if (pending && (x & 31) == 0) {
++                int completed;
++                MPI_Testall(world.request_count, world.requests[buffer].data(),
++                            &completed, MPI_STATUSES_IGNORE);
++                pending = !completed;
++            }
+         }
+-        if (world.request_count)
++        if (pending)
+             MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+ 
+         // Update the block perimeter exactly once, including thin 1-cell blocks.
+
+exec
+/bin/bash -lc 'mpirun --bind-to core --map-by core -np 1 /tmp/unstructured_mpi_build/unstructured -n 1024 -i 100 && /tmp/unstructured_serial_reference -n 1024 -i 100' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 40be8736c2289647d7d821e0eacb021728519a17..aa5c616aef9e7acdee44afab0f3ccc530acf6f43
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -76,7 +76,9 @@
+         const int y = std::min(n, processes / x);
+         const int count = x * y;
+         const int difference = std::abs(x - y);
+-        if (count > active || (count == active && difference < best_difference)) {
++        // Favor contiguous row exchanges when both orientations are equivalent.
++        if (count > active || (count == active &&
++            (difference < best_difference || (difference == best_difference && x > dims[0])))) {
+             active = count;
+             best_difference = difference;
+             dims[0] = x;
+@@ -146,7 +148,8 @@
+     world.grid_size = n_elems_root;
+     MPI_Comm_rank(world.comm, &world.rank);
+     MPI_Comm_size(world.comm, &world.size);
+-    MPI_Cart_get(world.comm, 2, world.dims, world.start, world.coords);
++    int periods[2];
++    MPI_Cart_get(world.comm, 2, world.dims, periods, world.coords);
+     for (int axis = 0; axis < 2; ++axis)
+         partition(n_elems_root, world.dims[axis], world.coords[axis],
+                   world.start[axis], world.extent[axis]);
+@@ -214,7 +217,8 @@
+         const int buffer = world.current_buffer;
+         const val_t* energy = world.energy[buffer].data();
+         val_t* next = world.energy[1 - buffer].data();
+-        if (world.request_count)
++        bool pending = world.request_count != 0;
++        if (pending)
+             MPI_Startall(world.request_count, world.requests[buffer].data());
+ 
+         // No ghost values are read here, allowing communication to overlap work.
+@@ -223,8 +227,15 @@
+             const size_t element_row = static_cast<size_t>(x - 1) * ny;
+             for (int y = 2; y < ny; ++y)
+                 updateElement<true>(world, energy, next, element_row + y - 1, row + y);
++            // Drive progress on MPI implementations without a progress thread.
++            if (pending && (x & 31) == 0) {
++                int completed;
++                MPI_Testall(world.request_count, world.requests[buffer].data(),
++                            &completed, MPI_STATUSES_IGNORE);
++                pending = !completed;
++            }
+         }
+-        if (world.request_count)
++        if (pending)
+             MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+ 
+         // Update the block perimeter exactly once, including thin 1-cell blocks.
+
+ succeeded in 4604ms:
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 1024 x 1024 = 1048576 elements
+Iterations: 100
+Validation: disabled
+MPI processes: 1 (1 active, 1 x 1 blocks)
+
+Building unstructured mesh...
+Memory usage: 64.09 MB (static: 40.00 MB, dynamic: 24.09 MB)
+
+Running simulation...
+Computation time: 691.093 ms
+Performance:
+  Time per iteration: 6.9109 ms
+  Elements/sec: 0.1517 GigaElements/s
+  Performance: 3.3380 GFLOPS
+  Result hash: BA0F5AA337D39800
+
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 1024 x 1024 = 1048576 elements
+Iterations: 100
+Validation: disabled
+
+Building unstructured mesh...
+Memory usage: 176.00 MB (static: 144.00 MB, dynamic: 32.00 MB)
+
+Running simulation...
+Computation time: 969 ms
+Performance:
+  Time per iteration: 9.7879 ms
+  Elements/sec: 0.1071 GigaElements/s
+  Performance: 2.3569 GFLOPS
+  Result hash: BA0F5AA337D39800
+
+
+ succeeded in 35554ms:
+[ 50%] Building CXX object CMakeFiles/unstructured.dir/unstructured.cpp.o
+[100%] Linking CXX executable unstructured
+[100%] Built target unstructured
+Final tuning matches serial: n=1, iterations=7, processes=4
+Final tuning matches serial: n=2, iterations=17, processes=3
+Final tuning matches serial: n=3, iterations=25, processes=5
+Final tuning matches serial: n=7, iterations=35, processes=3
+Final tuning matches serial: n=127, iterations=300, processes=6
+Final tuning matches serial: n=257, iterations=105, processes=5
+Final tuning matches serial: n=512, iterations=20, processes=8
+Final tuning matches serial: n=65, iterations=10000, processes=4
+
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 40be8736c2289647d7d821e0eacb021728519a17..aa5c616aef9e7acdee44afab0f3ccc530acf6f43
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -76,7 +76,9 @@
+         const int y = std::min(n, processes / x);
+         const int count = x * y;
+         const int difference = std::abs(x - y);
+-        if (count > active || (count == active && difference < best_difference)) {
++        // Favor contiguous row exchanges when both orientations are equivalent.
++        if (count > active || (count == active &&
++            (difference < best_difference || (difference == best_difference && x > dims[0])))) {
+             active = count;
+             best_difference = difference;
+             dims[0] = x;
+@@ -146,7 +148,8 @@
+     world.grid_size = n_elems_root;
+     MPI_Comm_rank(world.comm, &world.rank);
+     MPI_Comm_size(world.comm, &world.size);
+-    MPI_Cart_get(world.comm, 2, world.dims, world.start, world.coords);
++    int periods[2];
++    MPI_Cart_get(world.comm, 2, world.dims, periods, world.coords);
+     for (int axis = 0; axis < 2; ++axis)
+         partition(n_elems_root, world.dims[axis], world.coords[axis],
+                   world.start[axis], world.extent[axis]);
+@@ -214,7 +217,8 @@
+         const int buffer = world.current_buffer;
+         const val_t* energy = world.energy[buffer].data();
+         val_t* next = world.energy[1 - buffer].data();
+-        if (world.request_count)
++        bool pending = world.request_count != 0;
++        if (pending)
+             MPI_Startall(world.request_count, world.requests[buffer].data());
+ 
+         // No ghost values are read here, allowing communication to overlap work.
+@@ -223,8 +227,15 @@
+             const size_t element_row = static_cast<size_t>(x - 1) * ny;
+             for (int y = 2; y < ny; ++y)
+                 updateElement<true>(world, energy, next, element_row + y - 1, row + y);
++            // Drive progress on MPI implementations without a progress thread.
++            if (pending && (x & 31) == 0) {
++                int completed;
++                MPI_Testall(world.request_count, world.requests[buffer].data(),
++                            &completed, MPI_STATUSES_IGNORE);
++                pending = !completed;
++            }
+         }
+-        if (world.request_count)
++        if (pending)
+             MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+ 
+         // Update the block perimeter exactly once, including thin 1-cell blocks.
+
+exec
+/bin/bash -lc "python3 -u - <<'PY'
+import re
+import statistics
+import subprocess
+
+n=2048
+iterations=60
+reference='/tmp/unstructured_serial_reference'
+parallel='/tmp/unstructured_mpi_build/unstructured'
+args=['-n',str(n),'-i',str(iterations)]
+launcher=['mpirun','--bind-to','core','--map-by','core','--mca','orte_base_help_aggregate','0']
+output=subprocess.check_output([*launcher,'-np','1',reference,*args],text=True,stderr=subprocess.PIPE,timeout=60)
+serial_time=float(re.search(r'Computation time: ([\\d.]+) ms',output).group(1))
+expected_hash=re.search(r'Result hash: (\\w+)',output).group(1)
+print(f'Original serial: {serial_time:.3f} ms, hash={expected_hash}',flush=True)
+for processes in [1,2,4,8,16]:
+    times=[]
+    for repeat in range(2):
+        output=subprocess.check_output([*launcher,'-np',str(processes),parallel,*args],text=True,stderr=subprocess.PIPE,timeout=60)
+        digest=re.search(r'Result hash: (\\w+)',output).group(1)
+        assert digest==expected_hash, (processes,digest,expected_hash)
+        times.append(float(re.search(r'Computation time: ([\\d.]+) ms',output).group(1)))
+    elapsed=statistics.median(times)
+    print(f'MPI processes={processes}: median={elapsed:.3f} ms, speedup over original={serial_time/elapsed:.2f}x, runs={times}',flush=True)
+PY" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 40be8736c2289647d7d821e0eacb021728519a17..aa5c616aef9e7acdee44afab0f3ccc530acf6f43
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -76,7 +76,9 @@
+         const int y = std::min(n, processes / x);
+         const int count = x * y;
+         const int difference = std::abs(x - y);
+-        if (count > active || (count == active && difference < best_difference)) {
++        // Favor contiguous row exchanges when both orientations are equivalent.
++        if (count > active || (count == active &&
++            (difference < best_difference || (difference == best_difference && x > dims[0])))) {
+             active = count;
+             best_difference = difference;
+             dims[0] = x;
+@@ -146,7 +148,8 @@
+     world.grid_size = n_elems_root;
+     MPI_Comm_rank(world.comm, &world.rank);
+     MPI_Comm_size(world.comm, &world.size);
+-    MPI_Cart_get(world.comm, 2, world.dims, world.start, world.coords);
++    int periods[2];
++    MPI_Cart_get(world.comm, 2, world.dims, periods, world.coords);
+     for (int axis = 0; axis < 2; ++axis)
+         partition(n_elems_root, world.dims[axis], world.coords[axis],
+                   world.start[axis], world.extent[axis]);
+@@ -214,7 +217,8 @@
+         const int buffer = world.current_buffer;
+         const val_t* energy = world.energy[buffer].data();
+         val_t* next = world.energy[1 - buffer].data();
+-        if (world.request_count)
++        bool pending = world.request_count != 0;
++        if (pending)
+             MPI_Startall(world.request_count, world.requests[buffer].data());
+ 
+         // No ghost values are read here, allowing communication to overlap work.
+@@ -223,8 +227,15 @@
+             const size_t element_row = static_cast<size_t>(x - 1) * ny;
+             for (int y = 2; y < ny; ++y)
+                 updateElement<true>(world, energy, next, element_row + y - 1, row + y);
++            // Drive progress on MPI implementations without a progress thread.
++            if (pending && (x & 31) == 0) {
++                int completed;
++                MPI_Testall(world.request_count, world.requests[buffer].data(),
++                            &completed, MPI_STATUSES_IGNORE);
++                pending = !completed;
++            }
+         }
+-        if (world.request_count)
++        if (pending)
+             MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+ 
+         // Update the block perimeter exactly once, including thin 1-cell blocks.
+
+exec
+/bin/bash -lc 'mpicxx -std=c++20 -O3 -march=native -fopt-info-vec-optimized -Wall -Wextra -fsyntax-only unstructured/unstructured.cpp' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+exec
+/bin/bash -lc 'mpirun --bind-to none -np 4 /tmp/unstructured_mpi_build/unstructured -n 1 -i 0 -r -v && /tmp/unstructured_mpi_build/unstructured -n 7 -i 25 -r -v' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ succeeded in 1047ms:
+In file included from /usr/lib/x86_64-linux-gnu/openmpi/include/openmpi/ompi/mpi/cxx/mpicxx.h:277,
+                 from /usr/lib/x86_64-linux-gnu/openmpi/include/mpi.h:2911,
+                 from unstructured/unstructured.cpp:1:
+/usr/lib/x86_64-linux-gnu/openmpi/include/openmpi/ompi/mpi/cxx/op_inln.h: In member function ‘virtual void MPI::Op::Init(void (*)(const void*, void*, int, const MPI::Datatype&), bool)’:
+/usr/lib/x86_64-linux-gnu/openmpi/include/openmpi/ompi/mpi/cxx/op_inln.h:121:25: warning: cast between incompatible function types from ‘void (*)(void*, void*, int*, ompi_datatype_t**, void (*)(void*, void*, int*, ompi_datatype_t**))’ to ‘void (*)(void*, void*, int*, ompi_datatype_t**)’ [-Wcast-function-type]
+  121 |     (void)MPI_Op_create((MPI_User_function*) ompi_mpi_cxx_op_intercept,
+      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/lib/x86_64-linux-gnu/openmpi/include/openmpi/ompi/mpi/cxx/op_inln.h:123:38: warning: cast between incompatible function types from ‘void (*)(const void*, void*, int, const MPI::Datatype&)’ to ‘void (*)(void*, void*, int*, ompi_datatype_t**)’ [-Wcast-function-type]
+  123 |     ompi_op_set_cxx_callback(mpi_op, (MPI_User_function*) func);
+      |                                      ^~~~~~~~~~~~~~~~~~~~~~~~~
+
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 40be8736c2289647d7d821e0eacb021728519a17..aa5c616aef9e7acdee44afab0f3ccc530acf6f43
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -76,7 +76,9 @@
+         const int y = std::min(n, processes / x);
+         const int count = x * y;
+         const int difference = std::abs(x - y);
+-        if (count > active || (count == active && difference < best_difference)) {
++        // Favor contiguous row exchanges when both orientations are equivalent.
++        if (count > active || (count == active &&
++            (difference < best_difference || (difference == best_difference && x > dims[0])))) {
+             active = count;
+             best_difference = difference;
+             dims[0] = x;
+@@ -146,7 +148,8 @@
+     world.grid_size = n_elems_root;
+     MPI_Comm_rank(world.comm, &world.rank);
+     MPI_Comm_size(world.comm, &world.size);
+-    MPI_Cart_get(world.comm, 2, world.dims, world.start, world.coords);
++    int periods[2];
++    MPI_Cart_get(world.comm, 2, world.dims, periods, world.coords);
+     for (int axis = 0; axis < 2; ++axis)
+         partition(n_elems_root, world.dims[axis], world.coords[axis],
+                   world.start[axis], world.extent[axis]);
+@@ -214,7 +217,8 @@
+         const int buffer = world.current_buffer;
+         const val_t* energy = world.energy[buffer].data();
+         val_t* next = world.energy[1 - buffer].data();
+-        if (world.request_count)
++        bool pending = world.request_count != 0;
++        if (pending)
+             MPI_Startall(world.request_count, world.requests[buffer].data());
+ 
+         // No ghost values are read here, allowing communication to overlap work.
+@@ -223,8 +227,15 @@
+             const size_t element_row = static_cast<size_t>(x - 1) * ny;
+             for (int y = 2; y < ny; ++y)
+                 updateElement<true>(world, energy, next, element_row + y - 1, row + y);
++            // Drive progress on MPI implementations without a progress thread.
++            if (pending && (x & 31) == 0) {
++                int completed;
++                MPI_Testall(world.request_count, world.requests[buffer].data(),
++                            &completed, MPI_STATUSES_IGNORE);
++                pending = !completed;
++            }
+         }
+-        if (world.request_count)
++        if (pending)
+             MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+ 
+         // Update the block perimeter exactly once, including thin 1-cell blocks.
+
+ succeeded in 3340ms:
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 1 x 1 = 1 elements
+Iterations: 0
+Validation: enabled
+MPI processes: 4 (1 active, 1 x 1 blocks)
+
+Building unstructured mesh...
+Memory usage: 0.00 MB (static: 0.00 MB, dynamic: 0.00 MB)
+
+Running simulation...
+Computation time: 0.001 ms
+Performance:
+  Time per iteration: 0.0006 ms
+  Elements/sec: 0.0000 GigaElements/s
+  Performance: 0.0000 GFLOPS
+  Result hash: 0000000000000000
+
+=== RESULTS ===
+Name: ElementEnergy
+Elements: 1
+Sum: 0.00000000000000000e+00
+Min: 0.00000000000000000e+00
+Max: 0.00000000000000000e+00
+Sample[0]: 0.00000000000000000e+00
+Sample[0]: 0.00000000000000000e+00
+Sample[0]: 0.00000000000000000e+00
+Sample[0]: 0.00000000000000000e+00
+Sample[0]: 0.00000000000000000e+00
+Hash: a8c7f832281a39c5
+=== END RESULTS ===
+Validation results:
+  Energy sum: 0.000000000000
+  Flux sum: 0.00
+  Energy range: [0.000000, 0.000000]
+  Validation: PASSED
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 7 x 7 = 49 elements
+Iterations: 25
+Validation: enabled
+MPI processes: 1 (1 active, 1 x 1 blocks)
+
+Building unstructured mesh...
+Memory usage: 0.00 MB (static: 0.00 MB, dynamic: 0.00 MB)
+
+Running simulation...
+Computation time: 0.006 ms
+Performance:
+  Time per iteration: 0.0003 ms
+  Elements/sec: 0.1951 GigaElements/s
+  Performance: 4.2914 GFLOPS
+  Result hash: 3F8EA2AD02CE7930
+
+=== RESULTS ===
+Name: ElementEnergy
+Elements: 49
+Sum: 0.00000000000000000e+00
+Min: -2.39283726607975034e+00
+Max: 2.39283726607975034e+00
+Sample[0]: 2.39283726607975034e+00
+Sample[12]: -7.53107697461421588e-01
+Sample[24]: 0.00000000000000000e+00
+Sample[36]: -7.53107697461421588e-01
+Sample[48]: 2.39283726607975034e+00
+Hash: f5f1bf34137bcfe5
+=== END RESULTS ===
+Validation results:
+  Energy sum: 0.000000000000
+  Flux sum: 29.53
+  Energy range: [-2.392837, 2.392837]
+  Validation: PASSED
+
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 40be8736c2289647d7d821e0eacb021728519a17..aa5c616aef9e7acdee44afab0f3ccc530acf6f43
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -76,7 +76,9 @@
+         const int y = std::min(n, processes / x);
+         const int count = x * y;
+         const int difference = std::abs(x - y);
+-        if (count > active || (count == active && difference < best_difference)) {
++        // Favor contiguous row exchanges when both orientations are equivalent.
++        if (count > active || (count == active &&
++            (difference < best_difference || (difference == best_difference && x > dims[0])))) {
+             active = count;
+             best_difference = difference;
+             dims[0] = x;
+@@ -146,7 +148,8 @@
+     world.grid_size = n_elems_root;
+     MPI_Comm_rank(world.comm, &world.rank);
+     MPI_Comm_size(world.comm, &world.size);
+-    MPI_Cart_get(world.comm, 2, world.dims, world.start, world.coords);
++    int periods[2];
++    MPI_Cart_get(world.comm, 2, world.dims, periods, world.coords);
+     for (int axis = 0; axis < 2; ++axis)
+         partition(n_elems_root, world.dims[axis], world.coords[axis],
+                   world.start[axis], world.extent[axis]);
+@@ -214,7 +217,8 @@
+         const int buffer = world.current_buffer;
+         const val_t* energy = world.energy[buffer].data();
+         val_t* next = world.energy[1 - buffer].data();
+-        if (world.request_count)
++        bool pending = world.request_count != 0;
++        if (pending)
+             MPI_Startall(world.request_count, world.requests[buffer].data());
+ 
+         // No ghost values are read here, allowing communication to overlap work.
+@@ -223,8 +227,15 @@
+             const size_t element_row = static_cast<size_t>(x - 1) * ny;
+             for (int y = 2; y < ny; ++y)
+                 updateElement<true>(world, energy, next, element_row + y - 1, row + y);
++            // Drive progress on MPI implementations without a progress thread.
++            if (pending && (x & 31) == 0) {
++                int completed;
++                MPI_Testall(world.request_count, world.requests[buffer].data(),
++                            &completed, MPI_STATUSES_IGNORE);
++                pending = !completed;
++            }
+         }
+-        if (world.request_count)
++        if (pending)
+             MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+ 
+         // Update the block perimeter exactly once, including thin 1-cell blocks.
+
+ succeeded in 49830ms:
+Original serial: 2342.000 ms, hash=38D5D3726772D000
+MPI processes=1: median=1283.019 ms, speedup over original=1.83x, runs=[1280.962, 1285.076]
+MPI processes=2: median=680.162 ms, speedup over original=3.44x, runs=[671.445, 688.878]
+MPI processes=4: median=385.619 ms, speedup over original=6.07x, runs=[389.235, 382.003]
+MPI processes=8: median=380.136 ms, speedup over original=6.16x, runs=[379.638, 380.635]
+MPI processes=16: median=187.923 ms, speedup over original=12.46x, runs=[187.716, 188.129]
+
+exec
+/bin/bash -lc "cat /sys/fs/cgroup/cpu.max && nl -ba unstructured/CMakeLists.txt && nl -ba unstructured/unstructured.cpp | sed -n '60,92p;140,162p;212,252p;380,405p;462,505p'" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_mpi_r1
+ exited 1 in 0ms:
+cat: /sys/fs/cgroup/cpu.max: No such file or directory
+
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 40be8736c2289647d7d821e0eacb021728519a17..aa5c616aef9e7acdee44afab0f3ccc530acf6f43
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -76,7 +76,9 @@
+         const int y = std::min(n, processes / x);
+         const int count = x * y;
+         const int difference = std::abs(x - y);
+-        if (count > active || (count == active && difference < best_difference)) {
++        // Favor contiguous row exchanges when both orientations are equivalent.
++        if (count > active || (count == active &&
++            (difference < best_difference || (difference == best_difference && x > dims[0])))) {
+             active = count;
+             best_difference = difference;
+             dims[0] = x;
+@@ -146,7 +148,8 @@
+     world.grid_size = n_elems_root;
+     MPI_Comm_rank(world.comm, &world.rank);
+     MPI_Comm_size(world.comm, &world.size);
+-    MPI_Cart_get(world.comm, 2, world.dims, world.start, world.coords);
++    int periods[2];
++    MPI_Cart_get(world.comm, 2, world.dims, periods, world.coords);
+     for (int axis = 0; axis < 2; ++axis)
+         partition(n_elems_root, world.dims[axis], world.coords[axis],
+                   world.start[axis], world.extent[axis]);
+@@ -214,7 +217,8 @@
+         const int buffer = world.current_buffer;
+         const val_t* energy = world.energy[buffer].data();
+         val_t* next = world.energy[1 - buffer].data();
+-        if (world.request_count)
++        bool pending = world.request_count != 0;
++        if (pending)
+             MPI_Startall(world.request_count, world.requests[buffer].data());
+ 
+         // No ghost values are read here, allowing communication to overlap work.
+@@ -223,8 +227,15 @@
+             const size_t element_row = static_cast<size_t>(x - 1) * ny;
+             for (int y = 2; y < ny; ++y)
+                 updateElement<true>(world, energy, next, element_row + y - 1, row + y);
++            // Drive progress on MPI implementations without a progress thread.
++            if (pending && (x & 31) == 0) {
++                int completed;
++                MPI_Testall(world.request_count, world.requests[buffer].data(),
++                            &completed, MPI_STATUSES_IGNORE);
++                pending = !completed;
++            }
+         }
+-        if (world.request_count)
++        if (pending)
+             MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+ 
+         // Update the block perimeter exactly once, including thin 1-cell blocks.
+
+codex
+Implemented MPI in the two existing files, keeping the executable name `unstructured`.
+
+Uses 2D domain decomposition, persistent halo exchanges, overlapped computation, compact local storage, and distributed validation/hashing. CMake now requires MPI.
+
+Exact serial hashes and external results matched across tested partitions. A local 2048×2048, 60-iteration benchmark achieved **12.5× speedup with 16 ranks**.
+
+Run with `mpirun -np 4 ./unstructured -n 512 -i 10 -v`.
+diff --git a/unstructured/CMakeLists.txt b/unstructured/CMakeLists.txt
+index 50ca718b11462d3f6ecd6eac1da82178aa9febe1..8dad0c31cd8cbf549f2c3ee5f0d91daef253119e
+--- a/unstructured/CMakeLists.txt
++++ b/unstructured/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.10)
+ project(unstructured_benchmark)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+@@ -9,5 +11,5 @@
+ # Enable optimizations
+ target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(unstructured m)
++# MPI is required, including for single-process runs.
++target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 40be8736c2289647d7d821e0eacb021728519a17..aa5c616aef9e7acdee44afab0f3ccc530acf6f43
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -76,7 +76,9 @@
+         const int y = std::min(n, processes / x);
+         const int count = x * y;
+         const int difference = std::abs(x - y);
+-        if (count > active || (count == active && difference < best_difference)) {
++        // Favor contiguous row exchanges when both orientations are equivalent.
++        if (count > active || (count == active &&
++            (difference < best_difference || (difference == best_difference && x > dims[0])))) {
+             active = count;
+             best_difference = difference;
+             dims[0] = x;
+@@ -146,7 +148,8 @@
+     world.grid_size = n_elems_root;
+     MPI_Comm_rank(world.comm, &world.rank);
+     MPI_Comm_size(world.comm, &world.size);
+-    MPI_Cart_get(world.comm, 2, world.dims, world.start, world.coords);
++    int periods[2];
++    MPI_Cart_get(world.comm, 2, world.dims, periods, world.coords);
+     for (int axis = 0; axis < 2; ++axis)
+         partition(n_elems_root, world.dims[axis], world.coords[axis],
+                   world.start[axis], world.extent[axis]);
+@@ -214,7 +217,8 @@
+         const int buffer = world.current_buffer;
+         const val_t* energy = world.energy[buffer].data();
+         val_t* next = world.energy[1 - buffer].data();
+-        if (world.request_count)
++        bool pending = world.request_count != 0;
++        if (pending)
+             MPI_Startall(world.request_count, world.requests[buffer].data());
+ 
+         // No ghost values are read here, allowing communication to overlap work.
+@@ -223,8 +227,15 @@
+             const size_t element_row = static_cast<size_t>(x - 1) * ny;
+             for (int y = 2; y < ny; ++y)
+                 updateElement<true>(world, energy, next, element_row + y - 1, row + y);
++            // Drive progress on MPI implementations without a progress thread.
++            if (pending && (x & 31) == 0) {
++                int completed;
++                MPI_Testall(world.request_count, world.requests[buffer].data(),
++                            &completed, MPI_STATUSES_IGNORE);
++                pending = !completed;
++            }
+         }
+-        if (world.request_count)
++        if (pending)
+             MPI_Waitall(world.request_count, world.requests[buffer].data(), MPI_STATUSES_IGNORE);
+ 
+         // Update the block perimeter exactly once, including thin 1-cell blocks.
+
+tokens used
+92,520
+Implemented MPI in the two existing files, keeping the executable name `unstructured`.
+
+Uses 2D domain decomposition, persistent halo exchanges, overlapped computation, compact local storage, and distributed validation/hashing. CMake now requires MPI.
+
+Exact serial hashes and external results matched across tested partitions. A local 2048×2048, 60-iteration benchmark achieved **12.5× speedup with 16 ranks**.
+
+Run with `mpirun -np 4 ./unstructured -n 512 -i 10 -v`.

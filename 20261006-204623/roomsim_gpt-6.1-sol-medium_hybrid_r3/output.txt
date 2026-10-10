@@ -1,0 +1,4232 @@
+Reading additional input from stdin...
+OpenAI Codex v0.160.1
+--------
+workdir: /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+model: gpt-6.1-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a11fba-5320-7852-8ae1-2aa67d2a3300
+--------
+user
+Parallelize the roomsim benchmark code found in ./roomsim/ with a hybrid approach combining MPI, OpenMP, and CUDA as appropriate for the problem for maximum parallel performance on an accelerator cluster. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the simulation and build setup, then implement the MPI/OpenMP/CUDA split and check correctness with the available tools.
+exec
+/bin/bash -lc 'ls -la; rg --files roomsim; rg --files -g AGENTS.md -g CMakeLists.txt' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 0ms:
+total 4
+drwxrwxrwx 4 petert  petert   69 Oct  9 10:14 .
+drwxrwxr-x 3 petert  petert   58 Oct  9 10:14 ..
+drwxrwxrwx 2 petert  petert   60 Oct  9 10:14 common
+-rw-r--r-- 1 llmtest users  1113 Oct  9 10:14 output.txt
+drwxrwxrwx 2 petert  petert   59 Oct  9 10:14 roomsim
+roomsim/roomsim.cpp
+roomsim/CMakeLists.txt
+roomsim/CMakeLists.txt
+
+exec
+/bin/bash -lc 'cat roomsim/CMakeLists.txt; cat roomsim/roomsim.cpp; ls -la common; command -v nvcc; command -v mpicxx; command -v cmake' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 0ms:
+cmake_minimum_required(VERSION 3.10)
+project(roomsim_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(roomsim roomsim.cpp)
+
+# Enable optimizations and warnings
+target_compile_options(roomsim PRIVATE -O3 -march=native -Wall -Wextra -Wpedantic)
+
+# Link math library
+target_link_libraries(roomsim m)
+/**
+ * Room Response Simulation Benchmark
+ * 
+ * This is a simplified, purely sequential implementation of room impulse response
+ * simulation using radiosity-based wave propagation. It models how sound/light
+ * waves propagate between surfaces in a room by computing:
+ * 
+ * 1. Form factors (Kij) between all pairs of triangles based on visibility and geometry
+ * 2. Wave propagation using radiosity equations with time delays (Tau)
+ * 3. Distance estimation via cross-correlation of radiosity values
+ * 
+ * The implementation generates a procedural icosphere mesh to simulate a room.
+ */
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <map>
+#include <memory>
+#include <random>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+// ============================================================================
+// Types and Constants
+// ============================================================================
+
+using idx_t = uint32_t;
+using val_t = float;
+
+constexpr val_t PI = 3.14159265358979323846f;
+constexpr val_t ZERO = 0.0f;
+constexpr val_t ONE = 1.0f;
+constexpr val_t WAVE_SPEED = 0.5f;        // Wave propagation speed (units per timestep)
+constexpr val_t INV_WAVE_SPEED = 1.0f / WAVE_SPEED;
+constexpr int NUM_RAYS = 16;              // Number of rays for visibility sampling
+constexpr val_t INV_NUM_RAYS = 1.0f / NUM_RAYS;
+constexpr val_t EPSILON = 1e-6f;
+
+// ============================================================================
+// Vector and Triangle Types
+// ============================================================================
+
+struct Vec3 {
+    val_t x, y, z;
+
+    constexpr Vec3() : x(0), y(0), z(0) {}
+    constexpr Vec3(val_t x, val_t y, val_t z) : x(x), y(y), z(z) {}
+    explicit constexpr Vec3(val_t v) : x(v), y(v), z(v) {}
+
+    Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+    Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+    Vec3 operator*(val_t s) const { return {x * s, y * s, z * s}; }
+    Vec3 operator/(val_t s) const { return {x / s, y / s, z / s}; }
+    Vec3 operator-() const { return {-x, -y, -z}; }
+
+    val_t dot(const Vec3& o) const { return x * o.x + y * o.y + z * o.z; }
+    Vec3 cross(const Vec3& o) const {
+        return {y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x};
+    }
+
+    val_t squaredNorm() const { return x * x + y * y + z * z; }
+    val_t norm() const { return std::sqrt(squaredNorm()); }
+    Vec3 normalized() const {
+        val_t n = norm();
+        return n > EPSILON ? *this / n : Vec3();
+    }
+
+    bool operator==(const Vec3& o) const {
+        return std::abs(x - o.x) < EPSILON && std::abs(y - o.y) < EPSILON && std::abs(z - o.z) < EPSILON;
+    }
+};
+
+struct Triangle {
+    Vec3 a, b, c;
+    Vec3 _normal;
+
+    Triangle() = default;
+    Triangle(const Vec3& a, const Vec3& b, const Vec3& c)
+        : a(a), b(b), c(c), _normal((b - a).cross(c - a).normalized()) {}
+
+    Vec3 center() const { return (a + b + c) / 3.0f; }
+    Vec3 normal() const { return _normal; }
+
+    val_t area() const {
+        Vec3 ab = b - a;
+        Vec3 ac = c - a;
+        return 0.5f * ab.cross(ac).norm();
+    }
+
+    bool operator==(const Triangle& o) const { return a == o.a && b == o.b && c == o.c; }
+};
+
+// ============================================================================
+// Triangle-Box Overlap Test (for octree construction)
+// ============================================================================
+
+// Separating axis test for triangle-box overlap
+bool triangleBoxOverlap(const Vec3& boxCenter, const Vec3& boxHalfSize, const Triangle& tri) {
+    // Translate triangle to box center
+    Vec3 v0 = tri.a - boxCenter;
+    Vec3 v1 = tri.b - boxCenter;
+    Vec3 v2 = tri.c - boxCenter;
+
+    // Triangle edges
+    Vec3 e0 = v1 - v0;
+    Vec3 e1 = v2 - v1;
+    Vec3 e2 = v0 - v2;
+
+    // Test box normals (AABB axes)
+    auto minMax3 = [](val_t a, val_t b, val_t c) {
+        return std::make_pair(std::min({a, b, c}), std::max({a, b, c}));
+    };
+
+    auto [minX, maxX] = minMax3(v0.x, v1.x, v2.x);
+    if (minX > boxHalfSize.x || maxX < -boxHalfSize.x) return false;
+
+    auto [minY, maxY] = minMax3(v0.y, v1.y, v2.y);
+    if (minY > boxHalfSize.y || maxY < -boxHalfSize.y) return false;
+
+    auto [minZ, maxZ] = minMax3(v0.z, v1.z, v2.z);
+    if (minZ > boxHalfSize.z || maxZ < -boxHalfSize.z) return false;
+
+    // Test triangle normal
+    Vec3 triNormal = e0.cross(e1);
+    val_t d = triNormal.dot(v0);
+    val_t r = boxHalfSize.x * std::abs(triNormal.x) +
+              boxHalfSize.y * std::abs(triNormal.y) +
+              boxHalfSize.z * std::abs(triNormal.z);
+    if (std::abs(d) > r) return false;
+
+    // Test 9 edge cross products
+    auto testAxis = [&](const Vec3& axis) {
+        val_t p0 = axis.dot(v0);
+        val_t p1 = axis.dot(v1);
+        val_t p2 = axis.dot(v2);
+        val_t r = boxHalfSize.x * std::abs(axis.x) +
+                  boxHalfSize.y * std::abs(axis.y) +
+                  boxHalfSize.z * std::abs(axis.z);
+        auto [minP, maxP] = minMax3(p0, p1, p2);
+        return !(minP > r || maxP < -r);
+    };
+
+    Vec3 axes[3] = {{1,0,0}, {0,1,0}, {0,0,1}};
+    Vec3 edges[3] = {e0, e1, e2};
+    for (const auto& axis : axes) {
+        for (const auto& edge : edges) {
+            Vec3 crossAxis = axis.cross(edge);
+            if (crossAxis.squaredNorm() > EPSILON) {
+                if (!testAxis(crossAxis)) return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Octree for Spatial Acceleration
+// ============================================================================
+
+constexpr size_t MAX_OCTREE_TRIS = 8;
+constexpr val_t MAX_OCTREE_LEAF_SIZE = 0.5f;
+
+class Octree {
+public:
+    Vec3 minBound, maxBound;
+    Vec3 halfExtent, center;
+    std::unique_ptr<Octree> children[8];
+    std::vector<size_t> triangleIndices;  // Indices into the global triangle list
+    const std::vector<Triangle>* allTriangles;  // Pointer to all triangles
+
+    Octree() : allTriangles(nullptr) {}
+
+    void build(const std::vector<Triangle>& triangles) {
+        allTriangles = &triangles;
+        if (triangles.empty()) return;
+
+        // Compute bounding box
+        minBound = triangles[0].a;
+        maxBound = triangles[0].a;
+        for (const auto& tri : triangles) {
+            for (const auto* v : {&tri.a, &tri.b, &tri.c}) {
+                minBound.x = std::min(minBound.x, v->x);
+                minBound.y = std::min(minBound.y, v->y);
+                minBound.z = std::min(minBound.z, v->z);
+                maxBound.x = std::max(maxBound.x, v->x);
+                maxBound.y = std::max(maxBound.y, v->y);
+                maxBound.z = std::max(maxBound.z, v->z);
+            }
+        }
+
+        // Collect all indices
+        std::vector<size_t> allIndices(triangles.size());
+        for (size_t i = 0; i < triangles.size(); ++i) allIndices[i] = i;
+
+        buildNode(allIndices, minBound, maxBound);
+    }
+
+private:
+    void buildNode(const std::vector<size_t>& indices, const Vec3& nodeMin, const Vec3& nodeMax) {
+        minBound = nodeMin;
+        maxBound = nodeMax;
+        halfExtent = (maxBound - minBound) * 0.5f;
+        center = (minBound + maxBound) * 0.5f;
+
+        // If few enough triangles or too small, make this a leaf
+        if (indices.size() <= MAX_OCTREE_TRIS ||
+            (maxBound - minBound).norm() < MAX_OCTREE_LEAF_SIZE) {
+            triangleIndices = indices;
+            return;
+        }
+
+        // Subdivide into 8 children
+        Vec3 childHalfSize = halfExtent * 0.5f;
+        std::vector<size_t> childIndices[8];
+
+        for (size_t idx : indices) {
+            const Triangle& tri = (*allTriangles)[idx];
+
+            // Check which children this triangle overlaps
+            for (int i = 0; i < 8; ++i) {
+                Vec3 childCenter = center;
+                childCenter.x += (i & 1) ? childHalfSize.x : -childHalfSize.x;
+                childCenter.y += (i & 2) ? childHalfSize.y : -childHalfSize.y;
+                childCenter.z += (i & 4) ? childHalfSize.z : -childHalfSize.z;
+
+                if (triangleBoxOverlap(childCenter, childHalfSize, tri)) {
+                    childIndices[i].push_back(idx);
+                }
+            }
+        }
+
+        // Check if we can't split further (all triangles in one child)
+        bool canSplit = false;
+        for (int i = 0; i < 8; ++i) {
+            if (!childIndices[i].empty() && childIndices[i].size() < indices.size()) {
+                canSplit = true;
+                break;
+            }
+        }
+
+        if (!canSplit) {
+            triangleIndices = indices;
+            return;
+        }
+
+        // Build children
+        for (int i = 0; i < 8; ++i) {
+            if (!childIndices[i].empty()) {
+                Vec3 childMin = center;
+                Vec3 childMax = center;
+                childMin.x = (i & 1) ? center.x : minBound.x;
+                childMax.x = (i & 1) ? maxBound.x : center.x;
+                childMin.y = (i & 2) ? center.y : minBound.y;
+                childMax.y = (i & 2) ? maxBound.y : center.y;
+                childMin.z = (i & 4) ? center.z : minBound.z;
+                childMax.z = (i & 4) ? maxBound.z : center.z;
+
+                children[i] = std::make_unique<Octree>();
+                children[i]->allTriangles = allTriangles;
+                children[i]->buildNode(childIndices[i], childMin, childMax);
+            }
+        }
+    }
+
+public:
+    // Check if a ray intersects this node's bounding box
+    bool rayIntersectsBox(const Vec3& p1, const Vec3& p2) const {
+        Vec3 d = (p2 - p1) * 0.5f;
+        Vec3 c = p1 + d - center;
+        Vec3 ad = {std::abs(d.x), std::abs(d.y), std::abs(d.z)};
+
+        if (std::abs(c.x) > halfExtent.x + ad.x) return false;
+        if (std::abs(c.y) > halfExtent.y + ad.y) return false;
+        if (std::abs(c.z) > halfExtent.z + ad.z) return false;
+
+        if (std::abs(d.y * c.z - d.z * c.y) > halfExtent.y * ad.z + halfExtent.z * ad.y + EPSILON) return false;
+        if (std::abs(d.z * c.x - d.x * c.z) > halfExtent.z * ad.x + halfExtent.x * ad.z + EPSILON) return false;
+        if (std::abs(d.x * c.y - d.y * c.x) > halfExtent.x * ad.y + halfExtent.y * ad.x + EPSILON) return false;
+
+        return true;
+    }
+
+    // Apply a function to all triangles potentially intersecting the ray
+    // Returns true if the function returns true for any triangle
+    template<typename Func>
+    bool applyToTris(const Vec3& p1, const Vec3& p2, Func&& func) const {
+        // If leaf node, check triangles directly
+        if (!triangleIndices.empty()) {
+            for (size_t idx : triangleIndices) {
+                if (func(idx, (*allTriangles)[idx])) return true;
+            }
+            return false;
+        }
+
+        // Otherwise, descend to children
+        for (int i = 0; i < 8; ++i) {
+            if (children[i] && children[i]->rayIntersectsBox(p1, p2)) {
+                if (children[i]->applyToTris(p1, p2, func)) return true;
+            }
+        }
+        return false;
+    }
+};
+
+// ============================================================================
+// Mesh Generation: Icosphere
+// ============================================================================
+
+// Generate an icosphere by subdividing an icosahedron
+class IcosphereMesh {
+public:
+    std::vector<Triangle> triangles;
+
+    IcosphereMesh(int subdivisions, val_t radius) {
+        // Initial icosahedron vertices
+        const val_t t = (1.0f + std::sqrt(5.0f)) / 2.0f;
+
+        std::vector<Vec3> vertices = {
+            Vec3(-1,  t,  0).normalized() * radius,
+            Vec3( 1,  t,  0).normalized() * radius,
+            Vec3(-1, -t,  0).normalized() * radius,
+            Vec3( 1, -t,  0).normalized() * radius,
+            Vec3( 0, -1,  t).normalized() * radius,
+            Vec3( 0,  1,  t).normalized() * radius,
+            Vec3( 0, -1, -t).normalized() * radius,
+            Vec3( 0,  1, -t).normalized() * radius,
+            Vec3( t,  0, -1).normalized() * radius,
+            Vec3( t,  0,  1).normalized() * radius,
+            Vec3(-t,  0, -1).normalized() * radius,
+            Vec3(-t,  0,  1).normalized() * radius
+        };
+
+        // Initial icosahedron faces (20 triangles)
+        std::vector<std::array<idx_t, 3>> faces = {
+            {0, 11, 5}, {0, 5, 1}, {0, 1, 7}, {0, 7, 10}, {0, 10, 11},
+            {1, 5, 9}, {5, 11, 4}, {11, 10, 2}, {10, 7, 6}, {7, 1, 8},
+            {3, 9, 4}, {3, 4, 2}, {3, 2, 6}, {3, 6, 8}, {3, 8, 9},
+            {4, 9, 5}, {2, 4, 11}, {6, 2, 10}, {8, 6, 7}, {9, 8, 1}
+        };
+
+        // Subdivide
+        for (int i = 0; i < subdivisions; ++i) {
+            std::vector<std::array<idx_t, 3>> newFaces;
+            std::map<std::pair<idx_t, idx_t>, idx_t> midpointCache;
+
+            auto getMidpoint = [&](idx_t i1, idx_t i2) -> idx_t {
+                auto key = std::make_pair(std::min(i1, i2), std::max(i1, i2));
+                auto it = midpointCache.find(key);
+                if (it != midpointCache.end()) return it->second;
+
+                Vec3 mid = (vertices[i1] + vertices[i2]) / 2.0f;
+                mid = mid.normalized() * radius;
+                idx_t idx = static_cast<idx_t>(vertices.size());
+                vertices.push_back(mid);
+                midpointCache[key] = idx;
+                return idx;
+            };
+
+            for (const auto& face : faces) {
+                idx_t a = getMidpoint(face[0], face[1]);
+                idx_t b = getMidpoint(face[1], face[2]);
+                idx_t c = getMidpoint(face[2], face[0]);
+
+                newFaces.push_back({face[0], a, c});
+                newFaces.push_back({face[1], b, a});
+                newFaces.push_back({face[2], c, b});
+                newFaces.push_back({a, b, c});
+            }
+            faces = std::move(newFaces);
+        }
+
+        // Build triangles (normals pointing inward for a "room")
+        triangles.reserve(faces.size());
+        for (const auto& face : faces) {
+            // Reverse winding to make normals point inward
+            triangles.emplace_back(vertices[face[2]], vertices[face[1]], vertices[face[0]]);
+        }
+    }
+};
+
+// ============================================================================
+// Random Number Generation
+// ============================================================================
+
+class RandomGenerator {
+    std::mt19937 rng;
+    std::uniform_real_distribution<val_t> dist;
+public:
+    explicit RandomGenerator(uint32_t seed = 42) : rng(seed), dist(0.0f, 1.0f) {}
+    val_t rand() { return dist(rng); }
+};
+
+// Generate a random point inside a triangle using barycentric coordinates
+Vec3 randomPointInTriangle(const Triangle& t, RandomGenerator& rng) {
+    val_t u = rng.rand();
+    val_t v = rng.rand();
+    if (u + v > 1.0f) {
+        u = 1.0f - u;
+        v = 1.0f - v;
+    }
+    Vec3 ab = t.b - t.a;
+    Vec3 ac = t.c - t.a;
+    return t.a + ab * u + ac * v;
+}
+
+// ============================================================================
+// Ray-Triangle Intersection (Möller-Trumbore algorithm)
+// ============================================================================
+
+val_t rayTriangleIntersect(const Vec3& orig, const Vec3& dir,
+                            const Vec3& v0, const Vec3& v1, const Vec3& v2) {
+    Vec3 e1 = v1 - v0;
+    Vec3 e2 = v2 - v0;
+    Vec3 pvec = dir.cross(e2);
+    val_t det = e1.dot(pvec);
+
+    if (std::abs(det) < EPSILON) return std::numeric_limits<val_t>::max();
+
+    val_t invDet = 1.0f / det;
+    Vec3 tvec = orig - v0;
+    val_t u = tvec.dot(pvec) * invDet;
+    if (u < 0.0f || u > 1.0f) return std::numeric_limits<val_t>::max();
+
+    Vec3 qvec = tvec.cross(e1);
+    val_t v = dir.dot(qvec) * invDet;
+    if (v < 0.0f || u + v > 1.0f) return std::numeric_limits<val_t>::max();
+
+    return e2.dot(qvec) * invDet;
+}
+
+// ============================================================================
+// Visibility Testing (Octree-accelerated)
+// ============================================================================
+
+// Check if a ray between two triangles is blocked by any other triangle
+// Uses octree for O(log N) instead of O(N) search
+bool isRayBlocked(const Vec3& from, const Vec3& to,
+                  const Octree& octree,
+                  size_t srcTriIdx, size_t dstTriIdx) {
+    Vec3 dir = to - from;
+    val_t rayLen = dir.norm();
+    if (rayLen < EPSILON) return true;
+    Vec3 dirNorm = dir / rayLen;
+
+    return octree.applyToTris(from, to, [&](size_t idx, const Triangle& tri) {
+        if (idx == srcTriIdx || idx == dstTriIdx) return false;
+
+        val_t dist = rayTriangleIntersect(from, dirNorm, tri.a, tri.b, tri.c);
+        if (dist > EPSILON && dist < rayLen - EPSILON) {
+            return true;  // Ray is blocked
+        }
+        return false;
+    });
+}
+
+// ============================================================================
+// Form Factor Computation (Kij)
+// ============================================================================
+
+// Compute the cosine of angle between vector and triangle normal
+val_t cosPhi(const Vec3& v, const Vec3& normal) {
+    val_t vNorm = v.norm();
+    if (vNorm <= EPSILON) return ZERO;
+    return std::max(ZERO, v.dot(normal) / vNorm);
+}
+
+// Compute form factor Kij between triangle i (receiver) and triangle j (emitter)
+val_t computeKij(size_t idxI, size_t idxJ,
+                  const std::vector<Triangle>& triangles,
+                  const Octree& octree,
+                  RandomGenerator& rng) {
+    const Triangle& triI = triangles[idxI];
+    const Triangle& triJ = triangles[idxJ];
+
+    // Cull triangles facing the same direction
+    if (triI.normal().dot(triJ.normal()) > 0.99f) return ZERO;
+
+    val_t kij = ZERO;
+
+    for (int r = 0; r < NUM_RAYS; ++r) {
+        Vec3 pI = randomPointInTriangle(triI, rng);
+        Vec3 pJ = randomPointInTriangle(triJ, rng);
+
+        if (isRayBlocked(pI, pJ, octree, idxI, idxJ)) continue;
+
+        Vec3 v = pJ - pI;
+        val_t distSqr = v.squaredNorm();
+        if (distSqr < EPSILON) continue;
+
+        val_t cosPhiI = cosPhi(v, triI.normal());
+        val_t cosPhiJ = cosPhi(-v, triJ.normal());
+
+        if (cosPhiI <= ZERO || cosPhiJ <= ZERO) continue;
+
+        kij += (cosPhiI * cosPhiJ) / (PI * distSqr);
+    }
+
+    return kij * INV_NUM_RAYS;
+}
+
+// ============================================================================
+// Tau (time delay) Computation
+// ============================================================================
+
+int computeTau(const Triangle& triI, const Triangle& triJ) {
+    val_t dist = (triI.center() - triJ.center()).norm();
+    return static_cast<int>(std::ceil(dist * INV_WAVE_SPEED));
+}
+
+// ============================================================================
+// Room Response Simulation State
+// ============================================================================
+
+struct SimulationState {
+    size_t numTriangles;
+    size_t numTimesteps;
+
+    std::vector<Triangle> triangles;
+    std::vector<val_t> areas;       // Area of each triangle
+    std::vector<val_t> rho;         // Reflectivity (0.0 to 1.0)
+    std::vector<val_t> kij;         // Form factors (N x N matrix, row-major)
+    std::vector<int> tau;           // Time delays (N x N matrix, row-major)
+    std::vector<val_t> radE;        // Emission radiosity (T x N matrix)
+    std::vector<val_t> radB;        // Reflected radiosity (T x N matrix)
+    std::vector<val_t> distances;   // Computed distances from source
+
+    Octree octree;                  // Spatial acceleration structure
+
+    size_t sourceIndex;
+
+    size_t idx2d(size_t i, size_t j) const { return i * numTriangles + j; }
+    size_t idxTN(size_t t, size_t n) const { return t * numTriangles + n; }
+};
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+void initializeSimulation(SimulationState& state, int subdivisions, size_t timesteps,
+                          size_t sourceIdx, val_t reflectivity) {
+    // Generate mesh
+    IcosphereMesh mesh(subdivisions, 10.0f);  // Radius 10 units
+    state.triangles = std::move(mesh.triangles);
+    state.numTriangles = state.triangles.size();
+    state.numTimesteps = timesteps;
+    state.sourceIndex = sourceIdx % state.numTriangles;
+
+    printf("Generated icosphere mesh with %zu triangles\n", state.numTriangles);
+
+    // Build octree for spatial acceleration
+    printf("Building octree...\n");
+    state.octree.build(state.triangles);
+
+    // Initialize areas
+    state.areas.resize(state.numTriangles);
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        state.areas[i] = state.triangles[i].area();
+    }
+
+    // Initialize reflectivity
+    state.rho.resize(state.numTriangles, reflectivity);
+
+    // Initialize matrices
+    state.kij.resize(state.numTriangles * state.numTriangles, ZERO);
+    state.tau.resize(state.numTriangles * state.numTriangles, 0);
+    state.radE.resize(timesteps * state.numTriangles, ZERO);
+    state.radB.resize(timesteps * state.numTriangles, ZERO);
+    state.distances.resize(state.numTriangles, ZERO);
+
+    // Set source emission (active for first half of timesteps)
+    size_t timeOn = 0;
+    size_t timeOff = timesteps / 2;
+    for (size_t t = timeOn; t < timeOff; ++t) {
+        state.radE[state.idxTN(t, state.sourceIndex)] = 1.0f;
+    }
+}
+
+// ============================================================================
+// Precomputation Phase
+// ============================================================================
+
+void computeFormFactors(SimulationState& state) {
+    printf("Computing form factors (Kij)...\n");
+    RandomGenerator rng(42);
+
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        for (size_t j = 0; j < state.numTriangles; ++j) {
+            if (i == j) continue;
+            state.kij[state.idx2d(i, j)] = computeKij(
+                i, j, state.triangles, state.octree, rng);
+        }
+        if ((i + 1) % 100 == 0 || i + 1 == state.numTriangles) {
+            printf("  Progress: %zu/%zu triangles\n", i + 1, state.numTriangles);
+        }
+    }
+}
+
+void computeTimeDelays(SimulationState& state) {
+    printf("Computing time delays (Tau)...\n");
+
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        for (size_t j = 0; j < state.numTriangles; ++j) {
+            if (i == j) continue;
+            state.tau[state.idx2d(i, j)] = computeTau(
+                state.triangles[i], state.triangles[j]);
+        }
+    }
+}
+
+// ============================================================================
+// Simulation Phase (Wave Propagation)
+// ============================================================================
+
+void runSimulation(SimulationState& state) {
+    printf("Running wave propagation simulation...\n");
+
+    for (size_t t = 0; t < state.numTimesteps; ++t) {
+        for (size_t i = 0; i < state.numTriangles; ++i) {
+            val_t sumB = ZERO;
+
+            for (size_t j = 0; j < state.numTriangles; ++j) {
+                if (i == j) continue;
+
+                int tauij = state.tau[state.idx2d(i, j)];
+
+                // Skip if wave hasn't yet propagated from j to i
+                if (static_cast<int>(t) < tauij) continue;
+
+                val_t kij = state.kij[state.idx2d(i, j)];
+                if (kij <= ZERO) continue;
+
+                // Get radiosity from source triangle at time when emission occurred
+                size_t srcTime = t - static_cast<size_t>(tauij);
+                val_t radJ = state.radB[state.idxTN(srcTime, j)];
+                if (radJ <= ZERO) continue;
+
+                // Accumulate contribution: form factor * area * source radiosity
+                sumB += std::min(kij * state.areas[j], ONE) * radJ;
+            }
+
+            // Update radiosity: reflection + emission
+            state.radB[state.idxTN(t, i)] = state.rho[i] * sumB + state.radE[state.idxTN(t, i)];
+        }
+
+        if ((t + 1) % 10 == 0 || t + 1 == state.numTimesteps) {
+            printf("  Timestep %zu/%zu\n", t + 1, state.numTimesteps);
+        }
+    }
+}
+
+// ============================================================================
+// Distance Computation (Cross-Correlation)
+// ============================================================================
+
+void computeDistances(SimulationState& state) {
+    printf("Computing distances via cross-correlation...\n");
+
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        val_t maxCorr = ZERO;
+        int bestT = 0;
+
+        // Discrete cross-correlation to find time delay
+        for (size_t t = 0; t < state.numTimesteps; ++t) {
+            val_t sum = ZERO;
+
+            for (size_t tt = t; tt < state.numTimesteps; ++tt) {
+                val_t pB = state.radB[state.idxTN(tt, i)];
+                val_t pS = state.radB[state.idxTN(tt - t, state.sourceIndex)];
+                sum += pS * pB;
+            }
+
+            if (sum > maxCorr) {
+                maxCorr = sum;
+                bestT = static_cast<int>(t);
+            }
+        }
+
+        state.distances[i] = WAVE_SPEED * static_cast<val_t>(bestT);
+    }
+}
+
+// ============================================================================
+// Validation
+// ============================================================================
+
+bool validateResults(const SimulationState& state) {
+    printf("\nValidation:\n");
+
+    // Check that distances are non-negative
+    bool allNonNegative = true;
+    val_t minDist = std::numeric_limits<val_t>::max();
+    val_t maxDist = std::numeric_limits<val_t>::lowest();
+    val_t sumDist = ZERO;
+    int nonZeroCount = 0;
+
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        val_t d = state.distances[i];
+        if (d < 0) {
+            allNonNegative = false;
+            printf("  ERROR: Negative distance at triangle %zu: %f\n", i, d);
+        }
+        if (!std::isfinite(d)) {
+            printf("  ERROR: Non-finite distance at triangle %zu: %f\n", i, d);
+            return false;
+        }
+        minDist = std::min(minDist, d);
+        maxDist = std::max(maxDist, d);
+        sumDist += d;
+        if (d > EPSILON) nonZeroCount++;
+    }
+
+    printf("  Distance range: [%.4f, %.4f]\n", minDist, maxDist);
+    printf("  Average distance: %.4f\n", sumDist / static_cast<val_t>(state.numTriangles));
+    printf("  Non-zero distances: %d/%zu\n", nonZeroCount, state.numTriangles);
+
+    // Check source distance is zero or very small
+    val_t srcDist = state.distances[state.sourceIndex];
+    if (srcDist > WAVE_SPEED * 2) {
+        printf("  WARNING: Source triangle distance is non-zero: %.4f\n", srcDist);
+    }
+
+    // Check radiosity propagation (some triangles should have received energy)
+    int receivedEnergy = 0;
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        for (size_t t = 0; t < state.numTimesteps; ++t) {
+            if (state.radB[state.idxTN(t, i)] > EPSILON) {
+                receivedEnergy++;
+                break;
+            }
+        }
+    }
+
+    printf("  Triangles receiving energy: %d/%zu\n", receivedEnergy, state.numTriangles);
+
+    if (receivedEnergy == 0) {
+        printf("  ERROR: No triangles received energy - simulation failed\n");
+        return false;
+    }
+
+    // Check Kij matrix (should have some non-zero entries)
+    int nonZeroKij = 0;
+    for (size_t i = 0; i < state.numTriangles * state.numTriangles; ++i) {
+        if (state.kij[i] > EPSILON) nonZeroKij++;
+    }
+    printf("  Non-zero form factors: %d/%zu (%.2f%%)\n",
+           nonZeroKij, state.numTriangles * state.numTriangles,
+           100.0f * nonZeroKij / static_cast<val_t>(state.numTriangles * state.numTriangles));
+
+    if (nonZeroKij == 0) {
+        printf("  ERROR: All form factors are zero - visibility computation failed\n");
+        return false;
+    }
+
+    if (!allNonNegative) {
+        return false;
+    }
+
+    printf("  Validation: PASSED\n");
+    return true;
+}
+
+// ============================================================================
+// Hash for Verification
+// ============================================================================
+
+uint64_t computeHash(const SimulationState& state) {
+    uint64_t hash = 0;
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        const uint32_t* ptr = reinterpret_cast<const uint32_t*>(&state.distances[i]);
+        hash ^= (static_cast<uint64_t>(*ptr) + i) * 0x9e3779b97f4a7c15ULL;
+    }
+    return hash;
+}
+
+// ============================================================================
+// Helper: Compute subdivision level from target triangle count
+// ============================================================================
+
+int getSubdivisionsForTriangleCount(int targetTriangles) {
+    // Icosphere: 20 triangles initially, 4x per subdivision
+    // subdivisions: 0->20, 1->80, 2->320, 3->1280, 4->5120, 5->20480
+    int subdivisions = 0;
+    int triangles = 20;
+    while (triangles < targetTriangles && subdivisions < 6) {
+        subdivisions++;
+        triangles *= 4;
+    }
+    return subdivisions;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Target number of triangles (default: 320)\n");
+    printf("               Actual count will be rounded to nearest icosphere level:\n");
+    printf("               20, 80, 320, 1280, 5120, 20480\n");
+    printf("  -t <num>     Number of timesteps (default: 50)\n");
+    printf("  -s <num>     Source triangle index (default: 0)\n");
+    printf("  -r <val>     Reflectivity 0.0-1.0 (default: 0.8)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -o           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    int targetTriangles = 320;
+    int timesteps = 50;
+    int sourceIdx = 0;
+    val_t reflectivity = 0.8f;
+    bool validate = false;
+    bool printResults = false;
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            targetTriangles = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+            timesteps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            sourceIdx = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
+            reflectivity = static_cast<val_t>(atof(argv[++i]));
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-o") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+
+    int subdivisions = getSubdivisionsForTriangleCount(targetTriangles);
+
+    printf("Room Response Simulation Benchmark\n");
+    printf("===================================\n");
+    printf("Target triangles: %d (using %d subdivisions)\n", targetTriangles, subdivisions);
+    printf("Timesteps: %d\n", timesteps);
+    printf("Source triangle: %d\n", sourceIdx);
+    printf("Reflectivity: %.2f\n", reflectivity);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    printf("\n");
+
+    // Initialize
+    SimulationState state;
+    initializeSimulation(state, subdivisions, static_cast<size_t>(timesteps),
+                         static_cast<size_t>(sourceIdx), reflectivity);
+
+    printf("\n");
+
+    // Precomputation
+    auto startPre = std::chrono::high_resolution_clock::now();
+
+    computeTimeDelays(state);
+    computeFormFactors(state);
+
+    auto endPre = std::chrono::high_resolution_clock::now();
+    auto preDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count();
+
+    printf("Precomputation time: %ld ms\n", preDuration);
+    printf("\n");
+
+    // Simulation
+    auto startSim = std::chrono::high_resolution_clock::now();
+
+    runSimulation(state);
+
+    auto endSim = std::chrono::high_resolution_clock::now();
+    auto simDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count();
+
+    printf("Simulation time: %ld ms\n", simDuration);
+    printf("\n");
+
+    // Distance computation
+    auto startDist = std::chrono::high_resolution_clock::now();
+
+    computeDistances(state);
+
+    auto endDist = std::chrono::high_resolution_clock::now();
+    auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
+
+    printf("Distance computation time: %ld ms\n", distDuration);
+    printf("\n");
+
+    // Total time
+    long totalTime = preDuration + simDuration + distDuration;
+    printf("Total computation time: %ld ms\n", totalTime);
+
+    // Performance metrics
+    size_t n = state.numTriangles;
+    size_t t = state.numTimesteps;
+    double kijOps = static_cast<double>(n * n);
+    double simOps = static_cast<double>(n * n * t);
+    double distOps = static_cast<double>(n * t * t);
+
+    printf("\nPerformance:\n");
+    printf("  Triangles: %zu\n", n);
+    printf("  Timesteps: %zu\n", t);
+    printf("  Form factor computations: %.2e\n", kijOps);
+    printf("  Simulation operations: %.2e\n", simOps);
+    printf("  Distance computations: %.2e\n", distOps);
+    printf("  Total time per triangle: %.4f ms\n", static_cast<double>(totalTime) / n);
+
+    // Memory usage
+    size_t memKij = n * n * sizeof(val_t);
+    size_t memTau = n * n * sizeof(int);
+    size_t memRad = 2 * t * n * sizeof(val_t);
+    size_t totalMem = memKij + memTau + memRad;
+    printf("  Memory usage: %.2f MB\n", totalMem / (1024.0 * 1024.0));
+
+    // Hash
+    uint64_t hash = computeHash(state);
+    printf("  Result hash: %016lX\n", hash);
+    printf("\n");
+    
+    // Print results for external validation
+    if (printResults) {
+        // Convert distances to double for output
+        std::vector<double> distData(state.distances.begin(), state.distances.end());
+        print_results(distData, "Distances");
+    }
+
+    // Validation
+    if (validate) {
+        if (!validateResults(state)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+total 8
+drwxrwxrwx 2 petert petert   60 Oct  9 10:14 .
+drwxrwxrwx 4 petert petert   69 Oct  9 10:14 ..
+-rwxrwxrwx 1 petert petert  420 Oct  9 10:14 hash.hpp
+-rwxrwxrwx 1 petert petert 2964 Oct  9 10:14 results_output.hpp
+/usr/bin/nvcc
+/usr/bin/mpicxx
+/usr/bin/cmake
+
+exec
+/bin/bash -lc 'nvcc --version; nvidia-smi; mpicxx --version; cat common/results_output.hpp; cat output.txt; ls /usr/local' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 101ms:
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2023 NVIDIA Corporation
+Built on Fri_Jan__6_16:45:21_PST_2023
+Cuda compilation tools, release 12.0, V12.0.140
+Build cuda_12.0.r12.0/compiler.32267302_0
+Fri Oct  9 10:15:04 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 560.35.03              Driver Version: 560.35.03      CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3090        Off |   00000000:25:00.0 Off |                  N/A |
+| 30%   32C    P8             28W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 3090        Off |   00000000:41:00.0 Off |                  N/A |
+| 30%   29C    P8             25W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA GeForce RTX 3090        Off |   00000000:81:00.0 Off |                  N/A |
+| 30%   29C    P8             26W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA GeForce RTX 3090        Off |   00000000:E1:00.0 Off |                  N/A |
+| 30%   28C    P8             28W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+g++ (Ubuntu 13.2.0-23ubuntu4) 13.2.0
+Copyright (C) 2023 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+#pragma once
+
+#include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+#include "hash.hpp"
+
+// Kahan summation for numerically stable sum
+template <typename T>
+T kahan_sum(const std::vector<T>& data) {
+    T sum = 0.0;
+    T c = 0.0;
+    for (const auto& val : data) {
+        T y = val - c;
+        T t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    return sum;
+}
+
+// Print results for floating-point arrays
+template <typename T>
+void print_results(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute statistics
+    T sum = kahan_sum(data);
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Sum: %.17e\n", static_cast<double>(sum));
+    printf("Min: %.17e\n", static_cast<double>(min_val));
+    printf("Max: %.17e\n", static_cast<double>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %.17e\n", indices[i], static_cast<double>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+// Print results for integer arrays (uses exact hash comparison)
+template <typename T>
+void print_results_int(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Compute min/max
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Min: %lld\n", static_cast<long long>(min_val));
+    printf("Max: %lld\n", static_cast<long long>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %lld\n", indices[i], static_cast<long long>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+Reading additional input from stdin...
+OpenAI Codex v0.160.1
+--------
+workdir: /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+model: gpt-6.1-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a11fba-5320-7852-8ae1-2aa67d2a3300
+--------
+user
+Parallelize the roomsim benchmark code found in ./roomsim/ with a hybrid approach combining MPI, OpenMP, and CUDA as appropriate for the problem for maximum parallel performance on an accelerator cluster. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the simulation and build setup, then implement the MPI/OpenMP/CUDA split and check correctness with the available tools.
+exec
+/bin/bash -lc 'ls -la; rg --files roomsim; rg --files -g AGENTS.md -g CMakeLists.txt' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 0ms:
+total 4
+drwxrwxrwx 4 petert  petert   69 Oct  9 10:14 .
+drwxrwxr-x 3 petert  petert   58 Oct  9 10:14 ..
+drwxrwxrwx 2 petert  petert   60 Oct  9 10:14 common
+-rw-r--r-- 1 llmtest users  1113 Oct  9 10:14 output.txt
+drwxrwxrwx 2 petert  petert   59 Oct  9 10:14 roomsim
+roomsim/roomsim.cpp
+roomsim/CMakeLists.txt
+roomsim/CMakeLists.txt
+
+exec
+/bin/bash -lc 'cat roomsim/CMakeLists.txt; cat roomsim/roomsim.cpp; ls -la common; command -v nvcc; command -v mpicxx; command -v cmake' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 0ms:
+cmake_minimum_required(VERSION 3.10)
+project(roomsim_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(roomsim roomsim.cpp)
+
+# Enable optimizations and warnings
+target_compile_options(roomsim PRIVATE -O3 -march=native -Wall -Wextra -Wpedantic)
+
+# Link math library
+target_link_libraries(roomsim m)
+/**
+ * Room Response Simulation Benchmark
+ * 
+ * This is a simplified, purely sequential implementation of room impulse response
+ * simulation using radiosity-based wave propagation. It models how sound/light
+ * waves propagate between surfaces in a room by computing:
+ * 
+ * 1. Form factors (Kij) between all pairs of triangles based on visibility and geometry
+ * 2. Wave propagation using radiosity equations with time delays (Tau)
+ * 3. Distance estimation via cross-correlation of radiosity values
+ * 
+ * The implementation generates a procedural icosphere mesh to simulate a room.
+ */
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <map>
+#include <memory>
+#include <random>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+// ============================================================================
+// Types and Constants
+// ============================================================================
+
+using idx_t = uint32_t;
+using val_t = float;
+
+constexpr val_t PI = 3.14159265358979323846f;
+constexpr val_t ZERO = 0.0f;
+constexpr val_t ONE = 1.0f;
+constexpr val_t WAVE_SPEED = 0.5f;        // Wave propagation speed (units per timestep)
+constexpr val_t INV_WAVE_SPEED = 1.0f / WAVE_SPEED;
+constexpr int NUM_RAYS = 16;              // Number of rays for visibility sampling
+constexpr val_t INV_NUM_RAYS = 1.0f / NUM_RAYS;
+constexpr val_t EPSILON = 1e-6f;
+
+// ============================================================================
+// Vector and Triangle Types
+// ============================================================================
+
+struct Vec3 {
+    val_t x, y, z;
+
+    constexpr Vec3() : x(0), y(0), z(0) {}
+    constexpr Vec3(val_t x, val_t y, val_t z) : x(x), y(y), z(z) {}
+    explicit constexpr Vec3(val_t v) : x(v), y(v), z(v) {}
+
+    Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+    Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+    Vec3 operator*(val_t s) const { return {x * s, y * s, z * s}; }
+    Vec3 operator/(val_t s) const { return {x / s, y / s, z / s}; }
+    Vec3 operator-() const { return {-x, -y, -z}; }
+
+    val_t dot(const Vec3& o) const { return x * o.x + y * o.y + z * o.z; }
+    Vec3 cross(const Vec3& o) const {
+        return {y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x};
+    }
+
+    val_t squaredNorm() const { return x * x + y * y + z * z; }
+    val_t norm() const { return std::sqrt(squaredNorm()); }
+    Vec3 normalized() const {
+        val_t n = norm();
+        return n > EPSILON ? *this / n : Vec3();
+    }
+
+    bool operator==(const Vec3& o) const {
+        return std::abs(x - o.x) < EPSILON && std::abs(y - o.y) < EPSILON && std::abs(z - o.z) < EPSILON;
+    }
+};
+
+struct Triangle {
+    Vec3 a, b, c;
+    Vec3 _normal;
+
+    Triangle() = default;
+    Triangle(const Vec3& a, const Vec3& b, const Vec3& c)
+        : a(a), b(b), c(c), _normal((b - a).cross(c - a).normalized()) {}
+
+    Vec3 center() const { return (a + b + c) / 3.0f; }
+    Vec3 normal() const { return _normal; }
+
+    val_t area() const {
+        Vec3 ab = b - a;
+        Vec3 ac = c - a;
+        return 0.5f * ab.cross(ac).norm();
+    }
+
+    bool operator==(const Triangle& o) const { return a == o.a && b == o.b && c == o.c; }
+};
+
+// ============================================================================
+// Triangle-Box Overlap Test (for octree construction)
+// ============================================================================
+
+// Separating axis test for triangle-box overlap
+bool triangleBoxOverlap(const Vec3& boxCenter, const Vec3& boxHalfSize, const Triangle& tri) {
+    // Translate triangle to box center
+    Vec3 v0 = tri.a - boxCenter;
+    Vec3 v1 = tri.b - boxCenter;
+    Vec3 v2 = tri.c - boxCenter;
+
+    // Triangle edges
+    Vec3 e0 = v1 - v0;
+    Vec3 e1 = v2 - v1;
+    Vec3 e2 = v0 - v2;
+
+    // Test box normals (AABB axes)
+    auto minMax3 = [](val_t a, val_t b, val_t c) {
+        return std::make_pair(std::min({a, b, c}), std::max({a, b, c}));
+    };
+
+    auto [minX, maxX] = minMax3(v0.x, v1.x, v2.x);
+    if (minX > boxHalfSize.x || maxX < -boxHalfSize.x) return false;
+
+    auto [minY, maxY] = minMax3(v0.y, v1.y, v2.y);
+    if (minY > boxHalfSize.y || maxY < -boxHalfSize.y) return false;
+
+    auto [minZ, maxZ] = minMax3(v0.z, v1.z, v2.z);
+    if (minZ > boxHalfSize.z || maxZ < -boxHalfSize.z) return false;
+
+    // Test triangle normal
+    Vec3 triNormal = e0.cross(e1);
+    val_t d = triNormal.dot(v0);
+    val_t r = boxHalfSize.x * std::abs(triNormal.x) +
+              boxHalfSize.y * std::abs(triNormal.y) +
+              boxHalfSize.z * std::abs(triNormal.z);
+    if (std::abs(d) > r) return false;
+
+    // Test 9 edge cross products
+    auto testAxis = [&](const Vec3& axis) {
+        val_t p0 = axis.dot(v0);
+        val_t p1 = axis.dot(v1);
+        val_t p2 = axis.dot(v2);
+        val_t r = boxHalfSize.x * std::abs(axis.x) +
+                  boxHalfSize.y * std::abs(axis.y) +
+                  boxHalfSize.z * std::abs(axis.z);
+        auto [minP, maxP] = minMax3(p0, p1, p2);
+        return !(minP > r || maxP < -r);
+    };
+
+    Vec3 axes[3] = {{1,0,0}, {0,1,0}, {0,0,1}};
+    Vec3 edges[3] = {e0, e1, e2};
+    for (const auto& axis : axes) {
+        for (const auto& edge : edges) {
+            Vec3 crossAxis = axis.cross(edge);
+            if (crossAxis.squaredNorm() > EPSILON) {
+                if (!testAxis(crossAxis)) return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Octree for Spatial Acceleration
+// ============================================================================
+
+constexpr size_t MAX_OCTREE_TRIS = 8;
+constexpr val_t MAX_OCTREE_LEAF_SIZE = 0.5f;
+
+class Octree {
+public:
+    Vec3 minBound, maxBound;
+    Vec3 halfExtent, center;
+    std::unique_ptr<Octree> children[8];
+    std::vector<size_t> triangleIndices;  // Indices into the global triangle list
+    const std::vector<Triangle>* allTriangles;  // Pointer to all triangles
+
+    Octree() : allTriangles(nullptr) {}
+
+    void build(const std::vector<Triangle>& triangles) {
+        allTriangles = &triangles;
+        if (triangles.empty()) return;
+
+        // Compute bounding box
+        minBound = triangles[0].a;
+        maxBound = triangles[0].a;
+        for (const auto& tri : triangles) {
+            for (const auto* v : {&tri.a, &tri.b, &tri.c}) {
+                minBound.x = std::min(minBound.x, v->x);
+                minBound.y = std::min(minBound.y, v->y);
+                minBound.z = std::min(minBound.z, v->z);
+                maxBound.x = std::max(maxBound.x, v->x);
+                maxBound.y = std::max(maxBound.y, v->y);
+                maxBound.z = std::max(maxBound.z, v->z);
+            }
+        }
+
+        // Collect all indices
+        std::vector<size_t> allIndices(triangles.size());
+        for (size_t i = 0; i < triangles.size(); ++i) allIndices[i] = i;
+
+        buildNode(allIndices, minBound, maxBound);
+    }
+
+private:
+    void buildNode(const std::vector<size_t>& indices, const Vec3& nodeMin, const Vec3& nodeMax) {
+        minBound = nodeMin;
+        maxBound = nodeMax;
+        halfExtent = (maxBound - minBound) * 0.5f;
+        center = (minBound + maxBound) * 0.5f;
+
+        // If few enough triangles or too small, make this a leaf
+        if (indices.size() <= MAX_OCTREE_TRIS ||
+            (maxBound - minBound).norm() < MAX_OCTREE_LEAF_SIZE) {
+            triangleIndices = indices;
+            return;
+        }
+
+        // Subdivide into 8 children
+        Vec3 childHalfSize = halfExtent * 0.5f;
+        std::vector<size_t> childIndices[8];
+
+        for (size_t idx : indices) {
+            const Triangle& tri = (*allTriangles)[idx];
+
+            // Check which children this triangle overlaps
+            for (int i = 0; i < 8; ++i) {
+                Vec3 childCenter = center;
+                childCenter.x += (i & 1) ? childHalfSize.x : -childHalfSize.x;
+                childCenter.y += (i & 2) ? childHalfSize.y : -childHalfSize.y;
+                childCenter.z += (i & 4) ? childHalfSize.z : -childHalfSize.z;
+
+                if (triangleBoxOverlap(childCenter, childHalfSize, tri)) {
+                    childIndices[i].push_back(idx);
+                }
+            }
+        }
+
+        // Check if we can't split further (all triangles in one child)
+        bool canSplit = false;
+        for (int i = 0; i < 8; ++i) {
+            if (!childIndices[i].empty() && childIndices[i].size() < indices.size()) {
+                canSplit = true;
+                break;
+            }
+        }
+
+        if (!canSplit) {
+            triangleIndices = indices;
+            return;
+        }
+
+        // Build children
+        for (int i = 0; i < 8; ++i) {
+            if (!childIndices[i].empty()) {
+                Vec3 childMin = center;
+                Vec3 childMax = center;
+                childMin.x = (i & 1) ? center.x : minBound.x;
+                childMax.x = (i & 1) ? maxBound.x : center.x;
+                childMin.y = (i & 2) ? center.y : minBound.y;
+                childMax.y = (i & 2) ? maxBound.y : center.y;
+                childMin.z = (i & 4) ? center.z : minBound.z;
+                childMax.z = (i & 4) ? maxBound.z : center.z;
+
+                children[i] = std::make_unique<Octree>();
+                children[i]->allTriangles = allTriangles;
+                children[i]->buildNode(childIndices[i], childMin, childMax);
+            }
+        }
+    }
+
+public:
+    // Check if a ray intersects this node's bounding box
+    bool rayIntersectsBox(const Vec3& p1, const Vec3& p2) const {
+        Vec3 d = (p2 - p1) * 0.5f;
+        Vec3 c = p1 + d - center;
+        Vec3 ad = {std::abs(d.x), std::abs(d.y), std::abs(d.z)};
+
+        if (std::abs(c.x) > halfExtent.x + ad.x) return false;
+        if (std::abs(c.y) > halfExtent.y + ad.y) return false;
+        if (std::abs(c.z) > halfExtent.z + ad.z) return false;
+
+        if (std::abs(d.y * c.z - d.z * c.y) > halfExtent.y * ad.z + halfExtent.z * ad.y + EPSILON) return false;
+        if (std::abs(d.z * c.x - d.x * c.z) > halfExtent.z * ad.x + halfExtent.x * ad.z + EPSILON) return false;
+        if (std::abs(d.x * c.y - d.y * c.x) > halfExtent.x * ad.y + halfExtent.y * ad.x + EPSILON) return false;
+
+        return true;
+    }
+
+    // Apply a function to all triangles potentially intersecting the ray
+    // Returns true if the function returns true for any triangle
+    template<typename Func>
+    bool applyToTris(const Vec3& p1, const Vec3& p2, Func&& func) const {
+        // If leaf node, check triangles directly
+        if (!triangleIndices.empty()) {
+            for (size_t idx : triangleIndices) {
+                if (func(idx, (*allTriangles)[idx])) return true;
+            }
+            return false;
+        }
+
+        // Otherwise, descend to children
+        for (int i = 0; i < 8; ++i) {
+            if (children[i] && children[i]->rayIntersectsBox(p1, p2)) {
+                if (children[i]->applyToTris(p1, p2, func)) return true;
+            }
+        }
+        return false;
+    }
+};
+
+// ============================================================================
+// Mesh Generation: Icosphere
+// ============================================================================
+
+// Generate an icosphere by subdividing an icosahedron
+class IcosphereMesh {
+public:
+    std::vector<Triangle> triangles;
+
+    IcosphereMesh(int subdivisions, val_t radius) {
+        // Initial icosahedron vertices
+        const val_t t = (1.0f + std::sqrt(5.0f)) / 2.0f;
+
+        std::vector<Vec3> vertices = {
+            Vec3(-1,  t,  0).normalized() * radius,
+            Vec3( 1,  t,  0).normalized() * radius,
+            Vec3(-1, -t,  0).normalized() * radius,
+            Vec3( 1, -t,  0).normalized() * radius,
+            Vec3( 0, -1,  t).normalized() * radius,
+            Vec3( 0,  1,  t).normalized() * radius,
+            Vec3( 0, -1, -t).normalized() * radius,
+            Vec3( 0,  1, -t).normalized() * radius,
+            Vec3( t,  0, -1).normalized() * radius,
+            Vec3( t,  0,  1).normalized() * radius,
+            Vec3(-t,  0, -1).normalized() * radius,
+            Vec3(-t,  0,  1).normalized() * radius
+        };
+
+        // Initial icosahedron faces (20 triangles)
+        std::vector<std::array<idx_t, 3>> faces = {
+            {0, 11, 5}, {0, 5, 1}, {0, 1, 7}, {0, 7, 10}, {0, 10, 11},
+            {1, 5, 9}, {5, 11, 4}, {11, 10, 2}, {10, 7, 6}, {7, 1, 8},
+            {3, 9, 4}, {3, 4, 2}, {3, 2, 6}, {3, 6, 8}, {3, 8, 9},
+            {4, 9, 5}, {2, 4, 11}, {6, 2, 10}, {8, 6, 7}, {9, 8, 1}
+        };
+
+        // Subdivide
+        for (int i = 0; i < subdivisions; ++i) {
+            std::vector<std::array<idx_t, 3>> newFaces;
+            std::map<std::pair<idx_t, idx_t>, idx_t> midpointCache;
+
+            auto getMidpoint = [&](idx_t i1, idx_t i2) -> idx_t {
+                auto key = std::make_pair(std::min(i1, i2), std::max(i1, i2));
+                auto it = midpointCache.find(key);
+                if (it != midpointCache.end()) return it->second;
+
+                Vec3 mid = (vertices[i1] + vertices[i2]) / 2.0f;
+                mid = mid.normalized() * radius;
+                idx_t idx = static_cast<idx_t>(vertices.size());
+                vertices.push_back(mid);
+                midpointCache[key] = idx;
+                return idx;
+            };
+
+            for (const auto& face : faces) {
+                idx_t a = getMidpoint(face[0], face[1]);
+                idx_t b = getMidpoint(face[1], face[2]);
+                idx_t c = getMidpoint(face[2], face[0]);
+
+                newFaces.push_back({face[0], a, c});
+                newFaces.push_back({face[1], b, a});
+                newFaces.push_back({face[2], c, b});
+                newFaces.push_back({a, b, c});
+            }
+            faces = std::move(newFaces);
+        }
+
+        // Build triangles (normals pointing inward for a "room")
+        triangles.reserve(faces.size());
+        for (const auto& face : faces) {
+            // Reverse winding to make normals point inward
+            triangles.emplace_back(vertices[face[2]], vertices[face[1]], vertices[face[0]]);
+        }
+    }
+};
+
+// ============================================================================
+// Random Number Generation
+// ============================================================================
+
+class RandomGenerator {
+    std::mt19937 rng;
+    std::uniform_real_distribution<val_t> dist;
+public:
+    explicit RandomGenerator(uint32_t seed = 42) : rng(seed), dist(0.0f, 1.0f) {}
+    val_t rand() { return dist(rng); }
+};
+
+// Generate a random point inside a triangle using barycentric coordinates
+Vec3 randomPointInTriangle(const Triangle& t, RandomGenerator& rng) {
+    val_t u = rng.rand();
+    val_t v = rng.rand();
+    if (u + v > 1.0f) {
+        u = 1.0f - u;
+        v = 1.0f - v;
+    }
+    Vec3 ab = t.b - t.a;
+    Vec3 ac = t.c - t.a;
+    return t.a + ab * u + ac * v;
+}
+
+// ============================================================================
+// Ray-Triangle Intersection (Möller-Trumbore algorithm)
+// ============================================================================
+
+val_t rayTriangleIntersect(const Vec3& orig, const Vec3& dir,
+                            const Vec3& v0, const Vec3& v1, const Vec3& v2) {
+    Vec3 e1 = v1 - v0;
+    Vec3 e2 = v2 - v0;
+    Vec3 pvec = dir.cross(e2);
+    val_t det = e1.dot(pvec);
+
+    if (std::abs(det) < EPSILON) return std::numeric_limits<val_t>::max();
+
+    val_t invDet = 1.0f / det;
+    Vec3 tvec = orig - v0;
+    val_t u = tvec.dot(pvec) * invDet;
+    if (u < 0.0f || u > 1.0f) return std::numeric_limits<val_t>::max();
+
+    Vec3 qvec = tvec.cross(e1);
+    val_t v = dir.dot(qvec) * invDet;
+    if (v < 0.0f || u + v > 1.0f) return std::numeric_limits<val_t>::max();
+
+    return e2.dot(qvec) * invDet;
+}
+
+// ============================================================================
+// Visibility Testing (Octree-accelerated)
+// ============================================================================
+
+// Check if a ray between two triangles is blocked by any other triangle
+// Uses octree for O(log N) instead of O(N) search
+bool isRayBlocked(const Vec3& from, const Vec3& to,
+                  const Octree& octree,
+                  size_t srcTriIdx, size_t dstTriIdx) {
+    Vec3 dir = to - from;
+    val_t rayLen = dir.norm();
+    if (rayLen < EPSILON) return true;
+    Vec3 dirNorm = dir / rayLen;
+
+    return octree.applyToTris(from, to, [&](size_t idx, const Triangle& tri) {
+        if (idx == srcTriIdx || idx == dstTriIdx) return false;
+
+        val_t dist = rayTriangleIntersect(from, dirNorm, tri.a, tri.b, tri.c);
+        if (dist > EPSILON && dist < rayLen - EPSILON) {
+            return true;  // Ray is blocked
+        }
+        return false;
+    });
+}
+
+// ============================================================================
+// Form Factor Computation (Kij)
+// ============================================================================
+
+// Compute the cosine of angle between vector and triangle normal
+val_t cosPhi(const Vec3& v, const Vec3& normal) {
+    val_t vNorm = v.norm();
+    if (vNorm <= EPSILON) return ZERO;
+    return std::max(ZERO, v.dot(normal) / vNorm);
+}
+
+// Compute form factor Kij between triangle i (receiver) and triangle j (emitter)
+val_t computeKij(size_t idxI, size_t idxJ,
+                  const std::vector<Triangle>& triangles,
+                  const Octree& octree,
+                  RandomGenerator& rng) {
+    const Triangle& triI = triangles[idxI];
+    const Triangle& triJ = triangles[idxJ];
+
+    // Cull triangles facing the same direction
+    if (triI.normal().dot(triJ.normal()) > 0.99f) return ZERO;
+
+    val_t kij = ZERO;
+
+    for (int r = 0; r < NUM_RAYS; ++r) {
+        Vec3 pI = randomPointInTriangle(triI, rng);
+        Vec3 pJ = randomPointInTriangle(triJ, rng);
+
+        if (isRayBlocked(pI, pJ, octree, idxI, idxJ)) continue;
+
+        Vec3 v = pJ - pI;
+        val_t distSqr = v.squaredNorm();
+        if (distSqr < EPSILON) continue;
+
+        val_t cosPhiI = cosPhi(v, triI.normal());
+        val_t cosPhiJ = cosPhi(-v, triJ.normal());
+
+        if (cosPhiI <= ZERO || cosPhiJ <= ZERO) continue;
+
+        kij += (cosPhiI * cosPhiJ) / (PI * distSqr);
+    }
+
+    return kij * INV_NUM_RAYS;
+}
+
+// ============================================================================
+// Tau (time delay) Computation
+// ============================================================================
+
+int computeTau(const Triangle& triI, const Triangle& triJ) {
+    val_t dist = (triI.center() - triJ.center()).norm();
+    return static_cast<int>(std::ceil(dist * INV_WAVE_SPEED));
+}
+
+// ============================================================================
+// Room Response Simulation State
+// ============================================================================
+
+struct SimulationState {
+    size_t numTriangles;
+    size_t numTimesteps;
+
+    std::vector<Triangle> triangles;
+    std::vector<val_t> areas;       // Area of each triangle
+    std::vector<val_t> rho;         // Reflectivity (0.0 to 1.0)
+    std::vector<val_t> kij;         // Form factors (N x N matrix, row-major)
+    std::vector<int> tau;           // Time delays (N x N matrix, row-major)
+    std::vector<val_t> radE;        // Emission radiosity (T x N matrix)
+    std::vector<val_t> radB;        // Reflected radiosity (T x N matrix)
+    std::vector<val_t> distances;   // Computed distances from source
+
+    Octree octree;                  // Spatial acceleration structure
+
+    size_t sourceIndex;
+
+    size_t idx2d(size_t i, size_t j) const { return i * numTriangles + j; }
+    size_t idxTN(size_t t, size_t n) const { return t * numTriangles + n; }
+};
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+void initializeSimulation(SimulationState& state, int subdivisions, size_t timesteps,
+                          size_t sourceIdx, val_t reflectivity) {
+    // Generate mesh
+    IcosphereMesh mesh(subdivisions, 10.0f);  // Radius 10 units
+    state.triangles = std::move(mesh.triangles);
+    state.numTriangles = state.triangles.size();
+    state.numTimesteps = timesteps;
+    state.sourceIndex = sourceIdx % state.numTriangles;
+
+    printf("Generated icosphere mesh with %zu triangles\n", state.numTriangles);
+
+    // Build octree for spatial acceleration
+    printf("Building octree...\n");
+    state.octree.build(state.triangles);
+
+    // Initialize areas
+    state.areas.resize(state.numTriangles);
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        state.areas[i] = state.triangles[i].area();
+    }
+
+    // Initialize reflectivity
+    state.rho.resize(state.numTriangles, reflectivity);
+
+    // Initialize matrices
+    state.kij.resize(state.numTriangles * state.numTriangles, ZERO);
+    state.tau.resize(state.numTriangles * state.numTriangles, 0);
+    state.radE.resize(timesteps * state.numTriangles, ZERO);
+    state.radB.resize(timesteps * state.numTriangles, ZERO);
+    state.distances.resize(state.numTriangles, ZERO);
+
+    // Set source emission (active for first half of timesteps)
+    size_t timeOn = 0;
+    size_t timeOff = timesteps / 2;
+    for (size_t t = timeOn; t < timeOff; ++t) {
+        state.radE[state.idxTN(t, state.sourceIndex)] = 1.0f;
+    }
+}
+
+// ============================================================================
+// Precomputation Phase
+// ============================================================================
+
+void computeFormFactors(SimulationState& state) {
+    printf("Computing form factors (Kij)...\n");
+    RandomGenerator rng(42);
+
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        for (size_t j = 0; j < state.numTriangles; ++j) {
+            if (i == j) continue;
+            state.kij[state.idx2d(i, j)] = computeKij(
+                i, j, state.triangles, state.octree, rng);
+        }
+        if ((i + 1) % 100 == 0 || i + 1 == state.numTriangles) {
+            printf("  Progress: %zu/%zu triangles\n", i + 1, state.numTriangles);
+        }
+    }
+}
+
+void computeTimeDelays(SimulationState& state) {
+    printf("Computing time delays (Tau)...\n");
+
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        for (size_t j = 0; j < state.numTriangles; ++j) {
+            if (i == j) continue;
+            state.tau[state.idx2d(i, j)] = computeTau(
+                state.triangles[i], state.triangles[j]);
+        }
+    }
+}
+
+// ============================================================================
+// Simulation Phase (Wave Propagation)
+// ============================================================================
+
+void runSimulation(SimulationState& state) {
+    printf("Running wave propagation simulation...\n");
+
+    for (size_t t = 0; t < state.numTimesteps; ++t) {
+        for (size_t i = 0; i < state.numTriangles; ++i) {
+            val_t sumB = ZERO;
+
+            for (size_t j = 0; j < state.numTriangles; ++j) {
+                if (i == j) continue;
+
+                int tauij = state.tau[state.idx2d(i, j)];
+
+                // Skip if wave hasn't yet propagated from j to i
+                if (static_cast<int>(t) < tauij) continue;
+
+                val_t kij = state.kij[state.idx2d(i, j)];
+                if (kij <= ZERO) continue;
+
+                // Get radiosity from source triangle at time when emission occurred
+                size_t srcTime = t - static_cast<size_t>(tauij);
+                val_t radJ = state.radB[state.idxTN(srcTime, j)];
+                if (radJ <= ZERO) continue;
+
+                // Accumulate contribution: form factor * area * source radiosity
+                sumB += std::min(kij * state.areas[j], ONE) * radJ;
+            }
+
+            // Update radiosity: reflection + emission
+            state.radB[state.idxTN(t, i)] = state.rho[i] * sumB + state.radE[state.idxTN(t, i)];
+        }
+
+        if ((t + 1) % 10 == 0 || t + 1 == state.numTimesteps) {
+            printf("  Timestep %zu/%zu\n", t + 1, state.numTimesteps);
+        }
+    }
+}
+
+// ============================================================================
+// Distance Computation (Cross-Correlation)
+// ============================================================================
+
+void computeDistances(SimulationState& state) {
+    printf("Computing distances via cross-correlation...\n");
+
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        val_t maxCorr = ZERO;
+        int bestT = 0;
+
+        // Discrete cross-correlation to find time delay
+        for (size_t t = 0; t < state.numTimesteps; ++t) {
+            val_t sum = ZERO;
+
+            for (size_t tt = t; tt < state.numTimesteps; ++tt) {
+                val_t pB = state.radB[state.idxTN(tt, i)];
+                val_t pS = state.radB[state.idxTN(tt - t, state.sourceIndex)];
+                sum += pS * pB;
+            }
+
+            if (sum > maxCorr) {
+                maxCorr = sum;
+                bestT = static_cast<int>(t);
+            }
+        }
+
+        state.distances[i] = WAVE_SPEED * static_cast<val_t>(bestT);
+    }
+}
+
+// ============================================================================
+// Validation
+// ============================================================================
+
+bool validateResults(const SimulationState& state) {
+    printf("\nValidation:\n");
+
+    // Check that distances are non-negative
+    bool allNonNegative = true;
+    val_t minDist = std::numeric_limits<val_t>::max();
+    val_t maxDist = std::numeric_limits<val_t>::lowest();
+    val_t sumDist = ZERO;
+    int nonZeroCount = 0;
+
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        val_t d = state.distances[i];
+        if (d < 0) {
+            allNonNegative = false;
+            printf("  ERROR: Negative distance at triangle %zu: %f\n", i, d);
+        }
+        if (!std::isfinite(d)) {
+            printf("  ERROR: Non-finite distance at triangle %zu: %f\n", i, d);
+            return false;
+        }
+        minDist = std::min(minDist, d);
+        maxDist = std::max(maxDist, d);
+        sumDist += d;
+        if (d > EPSILON) nonZeroCount++;
+    }
+
+    printf("  Distance range: [%.4f, %.4f]\n", minDist, maxDist);
+    printf("  Average distance: %.4f\n", sumDist / static_cast<val_t>(state.numTriangles));
+    printf("  Non-zero distances: %d/%zu\n", nonZeroCount, state.numTriangles);
+
+    // Check source distance is zero or very small
+    val_t srcDist = state.distances[state.sourceIndex];
+    if (srcDist > WAVE_SPEED * 2) {
+        printf("  WARNING: Source triangle distance is non-zero: %.4f\n", srcDist);
+    }
+
+    // Check radiosity propagation (some triangles should have received energy)
+    int receivedEnergy = 0;
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        for (size_t t = 0; t < state.numTimesteps; ++t) {
+            if (state.radB[state.idxTN(t, i)] > EPSILON) {
+                receivedEnergy++;
+                break;
+            }
+        }
+    }
+
+    printf("  Triangles receiving energy: %d/%zu\n", receivedEnergy, state.numTriangles);
+
+    if (receivedEnergy == 0) {
+        printf("  ERROR: No triangles received energy - simulation failed\n");
+        return false;
+    }
+
+    // Check Kij matrix (should have some non-zero entries)
+    int nonZeroKij = 0;
+    for (size_t i = 0; i < state.numTriangles * state.numTriangles; ++i) {
+        if (state.kij[i] > EPSILON) nonZeroKij++;
+    }
+    printf("  Non-zero form factors: %d/%zu (%.2f%%)\n",
+           nonZeroKij, state.numTriangles * state.numTriangles,
+           100.0f * nonZeroKij / static_cast<val_t>(state.numTriangles * state.numTriangles));
+
+    if (nonZeroKij == 0) {
+        printf("  ERROR: All form factors are zero - visibility computation failed\n");
+        return false;
+    }
+
+    if (!allNonNegative) {
+        return false;
+    }
+
+    printf("  Validation: PASSED\n");
+    return true;
+}
+
+// ============================================================================
+// Hash for Verification
+// ============================================================================
+
+uint64_t computeHash(const SimulationState& state) {
+    uint64_t hash = 0;
+    for (size_t i = 0; i < state.numTriangles; ++i) {
+        const uint32_t* ptr = reinterpret_cast<const uint32_t*>(&state.distances[i]);
+        hash ^= (static_cast<uint64_t>(*ptr) + i) * 0x9e3779b97f4a7c15ULL;
+    }
+    return hash;
+}
+
+// ============================================================================
+// Helper: Compute subdivision level from target triangle count
+// ============================================================================
+
+int getSubdivisionsForTriangleCount(int targetTriangles) {
+    // Icosphere: 20 triangles initially, 4x per subdivision
+    // subdivisions: 0->20, 1->80, 2->320, 3->1280, 4->5120, 5->20480
+    int subdivisions = 0;
+    int triangles = 20;
+    while (triangles < targetTriangles && subdivisions < 6) {
+        subdivisions++;
+        triangles *= 4;
+    }
+    return subdivisions;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Target number of triangles (default: 320)\n");
+    printf("               Actual count will be rounded to nearest icosphere level:\n");
+    printf("               20, 80, 320, 1280, 5120, 20480\n");
+    printf("  -t <num>     Number of timesteps (default: 50)\n");
+    printf("  -s <num>     Source triangle index (default: 0)\n");
+    printf("  -r <val>     Reflectivity 0.0-1.0 (default: 0.8)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -o           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    int targetTriangles = 320;
+    int timesteps = 50;
+    int sourceIdx = 0;
+    val_t reflectivity = 0.8f;
+    bool validate = false;
+    bool printResults = false;
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            targetTriangles = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+            timesteps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            sourceIdx = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
+            reflectivity = static_cast<val_t>(atof(argv[++i]));
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-o") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+
+    int subdivisions = getSubdivisionsForTriangleCount(targetTriangles);
+
+    printf("Room Response Simulation Benchmark\n");
+    printf("===================================\n");
+    printf("Target triangles: %d (using %d subdivisions)\n", targetTriangles, subdivisions);
+    printf("Timesteps: %d\n", timesteps);
+    printf("Source triangle: %d\n", sourceIdx);
+    printf("Reflectivity: %.2f\n", reflectivity);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    printf("\n");
+
+    // Initialize
+    SimulationState state;
+    initializeSimulation(state, subdivisions, static_cast<size_t>(timesteps),
+                         static_cast<size_t>(sourceIdx), reflectivity);
+
+    printf("\n");
+
+    // Precomputation
+    auto startPre = std::chrono::high_resolution_clock::now();
+
+    computeTimeDelays(state);
+    computeFormFactors(state);
+
+    auto endPre = std::chrono::high_resolution_clock::now();
+    auto preDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count();
+
+    printf("Precomputation time: %ld ms\n", preDuration);
+    printf("\n");
+
+    // Simulation
+    auto startSim = std::chrono::high_resolution_clock::now();
+
+    runSimulation(state);
+
+    auto endSim = std::chrono::high_resolution_clock::now();
+    auto simDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count();
+
+    printf("Simulation time: %ld ms\n", simDuration);
+    printf("\n");
+
+    // Distance computation
+    auto startDist = std::chrono::high_resolution_clock::now();
+
+    computeDistances(state);
+
+    auto endDist = std::chrono::high_resolution_clock::now();
+    auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
+
+    printf("Distance computation time: %ld ms\n", distDuration);
+    printf("\n");
+
+    // Total time
+    long totalTime = preDuration + simDuration + distDuration;
+    printf("Total computation time: %ld ms\n", totalTime);
+
+    // Performance metrics
+    size_t n = state.numTriangles;
+    size_t t = state.numTimesteps;
+    double kijOps = static_cast<double>(n * n);
+    double simOps = static_cast<double>(n * n * t);
+    double distOps = static_cast<double>(n * t * t);
+
+    printf("\nPerformance:\n");
+    printf("  Triangles: %zu\n", n);
+    printf("  Timesteps: %zu\n", t);
+    printf("  Form factor computations: %.2e\n", kijOps);
+    printf("  Simulation operations: %.2e\n", simOps);
+    printf("  Distance computations: %.2e\n", distOps);
+    printf("  Total time per triangle: %.4f ms\n", static_cast<double>(totalTime) / n);
+
+    // Memory usage
+    size_t memKij = n * n * sizeof(val_t);
+    size_t memTau = n * n * sizeof(int);
+    size_t memRad = 2 * t * n * sizeof(val_t);
+    size_t totalMem = memKij + memTau + memRad;
+    printf("  Memory usage: %.2f MB\n", totalMem / (1024.0 * 1024.0));
+
+    // Hash
+    uint64_t hash = computeHash(state);
+    printf("  Result hash: %016lX\n", hash);
+    printf("\n");
+    
+    // Print results for external validation
+    if (printResults) {
+        // Convert distances to double for output
+        std::vector<double> distData(state.distances.begin(), state.distances.end());
+        print_results(distData, "Distances");
+    }
+
+    // Validation
+    if (validate) {
+        if (!validateResults(state)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+total 8
+drwxrwxrwx 2 petert petert   60 Oct  9 10:14 .
+drwxrwxrwx 4 petert petert   69 Oct  9 10:14 ..
+-rwxrwxrwx 1 petert petert  420 Oct  9 10:14 hash.hpp
+-rwxrwxrwx 1 petert petert 2964 Oct  9 10:14 results_output.hpp
+/usr/bin/nvcc
+/usr/bin/mpicxx
+/usr/bin/cmake
+
+exec
+/bin/bash -lc 'nvcc --version; nvidia-smi; mpicxx --version; cat common/results_output.hpp; cat output.txt; ls /usr/local' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+bin
+cuda
+cuda-11.2
+cuda-11.6
+cuda-12
+cuda-12.6
+etc
+games
+include
+lib
+libexec
+man
+sbin
+share
+src
+stow
+
+codex
+The main cost is the sampled visibility calculation between triangle pairs. Its shared random stream also makes reproducibility important. I’ll distribute receiver rows across MPI ranks, use CUDA for visibility and propagation, and use OpenMP for host geometry and result processing. I’ll preserve the original random sequence and summation order.
+exec
+/bin/bash -lc 'ls /usr/bin/g++*; ls /usr/local/cuda-12.6/bin/nvcc; mpirun --version; git status --short' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ exited 128 in 0ms:
+/usr/bin/g++
+/usr/bin/g++-12
+/usr/bin/g++-13
+/usr/bin/g++-7
+/usr/local/cuda-12.6/bin/nvcc
+mpirun (Open MPI) 4.1.6
+
+Report bugs to http://www.open-mpi.org/community/help/
+fatal: not a git repository (or any parent up to mount point /)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+
+exec
+/bin/bash -lc 'g++ -std=c++20 -O3 -march=native roomsim/roomsim.cpp -o /tmp/roomsim-original && /tmp/roomsim-original -n 320 -t 50 -v -o' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 5961ms:
+Room Response Simulation Benchmark
+===================================
+Target triangles: 320 (using 2 subdivisions)
+Timesteps: 50
+Source triangle: 0
+Reflectivity: 0.80
+Validation: enabled
+
+Generated icosphere mesh with 320 triangles
+Building octree...
+
+Computing time delays (Tau)...
+Computing form factors (Kij)...
+  Progress: 100/320 triangles
+  Progress: 200/320 triangles
+  Progress: 300/320 triangles
+  Progress: 320/320 triangles
+Precomputation time: 1474 ms
+
+Running wave propagation simulation...
+  Timestep 10/50
+  Timestep 20/50
+  Timestep 30/50
+  Timestep 40/50
+  Timestep 50/50
+Simulation time: 15 ms
+
+Computing distances via cross-correlation...
+Distance computation time: 0 ms
+
+Total computation time: 1489 ms
+
+Performance:
+  Triangles: 320
+  Timesteps: 50
+  Form factor computations: 1.02e+05
+  Simulation operations: 5.12e+06
+  Distance computations: 8.00e+05
+  Total time per triangle: 4.6531 ms
+  Memory usage: 0.90 MB
+  Result hash: 73869AC4B37EDF00
+
+=== RESULTS ===
+Name: Distances
+Elements: 320
+Sum: 3.50700000000000000e+03
+Min: 0.00000000000000000e+00
+Max: 1.25000000000000000e+01
+Sample[0]: 0.00000000000000000e+00
+Sample[80]: 1.15000000000000000e+01
+Sample[160]: 1.25000000000000000e+01
+Sample[240]: 1.25000000000000000e+01
+Sample[319]: 1.25000000000000000e+01
+Hash: faa9c19adc286337
+=== END RESULTS ===
+
+Validation:
+  Distance range: [0.0000, 12.5000]
+  Average distance: 10.9594
+  Non-zero distances: 319/320
+  Triangles receiving energy: 320/320
+  Non-zero form factors: 101960/102400 (99.57%)
+  Validation: PASSED
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+p='roomsim/CMakeLists.txt'
+open(p,'w').write('''cmake_minimum_required(VERSION 3.18)
+# CUDA 12.0 supports GCC through version 12. Respect an explicit host compiler.
+if(NOT DEFINED CMAKE_CUDA_HOST_COMPILER)
+    find_program(ROOMSIM_CUDA_HOST_COMPILER NAMES g++-12 g++)
+    set(CMAKE_CUDA_HOST_COMPILER \""'${ROOMSIM_CUDA_HOST_COMPILER}" CACHE FILEPATH "CUDA host compiler")
+endif()
+project(roomsim_benchmark LANGUAGES CXX CUDA)
+
+find_package(MPI REQUIRED COMPONENTS CXX)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+find_package(CUDAToolkit REQUIRED)
+
+# Keep the existing source file and executable name.
+set_source_files_properties(roomsim.cpp PROPERTIES LANGUAGE CUDA)
+add_executable(roomsim roomsim.cpp)
+set_target_properties(roomsim PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+target_compile_options(roomsim PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;-Xcompiler=-fopenmp,-Wall,-Wextra,-ffp-contract=off>)
+target_link_libraries(roomsim PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX CUDA::cudart m)
+'"''')
+p='roomsim/roomsim.cpp'
+s=open(p).read().replace('This is a simplified, purely sequential implementation','This is a hybrid MPI/OpenMP/CUDA implementation')
+s=s.replace('#include <vector>','#include <vector>\\n#include <cstdarg>\\n#include <mpi.h>\\n#include <omp.h>\\n#include <cuda_runtime.h>')
+pos=s.index('// ============================================================================\\n// Types')
+s=s[:pos]+'''// Only the MPI main thread calls MPI (MPI_THREAD_FUNNELED).
+int worldRank = 0, worldSize = 1;
+void rootPrintf(const char* format, ...) {
+    if (worldRank "'!= 0) return;
+    va_list args;
+    va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+}
+#define printf rootPrintf
+
+void cudaCheck(cudaError_t status, const char* operation) {
+    if (status != cudaSuccess) {
+        fprintf(stderr, "Rank %d: %s: %s'"\\\\n\", worldRank, operation, cudaGetErrorString(status));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
+#define CUDA_CHECK(call) cudaCheck((call), #call)
+void mpiCheck(int status) {
+    if (status "'!= MPI_SUCCESS) MPI_Abort(MPI_COMM_WORLD, status);
+}
+struct ParallelRuntime {
+    ParallelRuntime(int& argc, char**& argv) {
+        int provided;
+        mpiCheck(MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided));
+        mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &worldRank));
+        mpiCheck(MPI_Comm_size(MPI_COMM_WORLD, &worldSize));
+        if (provided < MPI_THREAD_FUNNELED) MPI_Abort(MPI_COMM_WORLD, 1);
+        MPI_Comm local;
+        mpiCheck(MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, worldRank,
+                                     MPI_INFO_NULL, &local));
+        int localRank, devices;
+        mpiCheck(MPI_Comm_rank(local, &localRank));
+        CUDA_CHECK(cudaGetDeviceCount(&devices));
+        if (!devices) {
+            fprintf(stderr, "roomsim requires a CUDA device on every rank'"\\\\n\");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        CUDA_CHECK(cudaSetDevice(localRank % devices));
+        mpiCheck(MPI_Comm_free(&local));
+    }
+    ~ParallelRuntime() { MPI_Finalize(); }
+};
+
+// Allocation ownership stays on the host; there is no CPU execution fallback.
+template<class T> struct DeviceBuffer {
+    T* data = nullptr;
+    void allocate(size_t count) {
+        if (count) CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&data), count * sizeof(T)));
+    }
+    ~DeviceBuffer() { if (data) cudaFree(data); }
+    DeviceBuffer() = default;
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+};
+
+'''+s[pos:]
+# Geometry primitive operations shared with CUDA, preserving the original expressions.
+a=s.index('struct Vec3'); b=s.index('// ============================================================================\\n// Triangle-Box',a)
+geom=s[a:b]
+for prefix in ['    constexpr Vec3','    explicit constexpr Vec3','    Vec3 operator','    val_t dot','    Vec3 cross','    val_t squaredNorm','    val_t norm','    Vec3 normalized','    bool operator==','    Vec3 center','    Vec3 normal','    val_t area']:
+    geom=geom.replace(prefix,prefix.replace('    ','    __host__ __device__ ',1))
+s=s[:a]+geom+s[b:]
+s=s.replace('val_t rayTriangleIntersect(', '__host__ __device__ val_t rayTriangleIntersect(').replace('val_t cosPhi(', '__host__ __device__ val_t cosPhi(').replace('int computeTau(', '__host__ __device__ int computeTau(')
+# OpenMP mesh conversion with pre-sized output.
+s=s.replace('triangles.reserve(faces.size());\\n        for (const auto& face : faces) {','triangles.resize(faces.size());\\n        #pragma omp parallel for schedule(static)\\n        for (size_t f = 0; f < faces.size(); ++f) {\\n            const auto& face = faces[f];').replace('triangles.emplace_back(vertices[face[2]], vertices[face[1]], vertices[face[0]]);','triangles[f] = Triangle(vertices[face[2]], vertices[face[1]], vertices[face[0]]);')
+# OpenMP octree child tasks at upper levels, bounding spawning overhead.
+s=s.replace('const Vec3& nodeMax) {','const Vec3& nodeMax, int depth = 0) {')
+s=s.replace('children[i]->buildNode(childIndices[i], childMin, childMax);','''Octree* child = children[i].get();
+                #pragma omp task firstprivate(child, childMin, childMax, i, depth) shared(childIndices) if(depth < 3)
+                child->buildNode(childIndices[i], childMin, childMax, depth + 1);''')
+s=s.replace('''        }
+    }
+
+public:
+    // Check if a ray''','''        }
+        #pragma omp taskwait
+    }
+
+public:
+    // Check if a ray''')
+# additional state
+needle='    size_t sourceIndex;'
+s=s.replace(needle,'''    size_t sourceIndex;
+    size_t rowBegin = 0, localRows = 0;
+    std::vector<int> counts, displacements;
+    DeviceBuffer<Triangle> deviceTriangles;
+    DeviceBuffer<val_t> deviceAreas, deviceKij, deviceRadB, deviceDistances;
+    DeviceBuffer<int> deviceTau;
+    uint64_t nonZeroFactors = 0;
+    val_t reflectivity = 0;
+    val_t* exchange = nullptr; // Pinned MPI staging; avoids requiring CUDA-aware MPI.
+    ~SimulationState() { if (exchange) cudaFreeHost(exchange); }''')
+# initialization replacement
+start=s.index('    // Build octree for spatial acceleration',s.index('void initializeSimulation')); end=s.index('\\n}\\n',start)
+s=s[:start]+'''    state.reflectivity = reflectivity;
+    state.counts.resize(worldSize);
+    state.displacements.resize(worldSize);
+    for (int rank = 0; rank < worldSize; ++rank) {
+        size_t begin = state.numTriangles * rank / worldSize;
+        size_t end = state.numTriangles * (rank + 1) / worldSize;
+        state.counts[rank] = static_cast<int>(end - begin);
+        state.displacements[rank] = static_cast<int>(begin);
+    }
+    state.rowBegin = state.displacements[worldRank];
+    state.localRows = state.counts[worldRank];
+
+    printf(\"Building octree...\\\\n\");
+    #pragma omp parallel
+    #pragma omp single
+    state.octree.build(state.triangles);
+
+    state.areas.resize(state.numTriangles);
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < state.numTriangles; ++i)
+        state.areas[i] = state.triangles[i].area();
+    state.distances.resize(state.numTriangles, ZERO);
+    state.deviceTriangles.allocate(state.numTriangles);
+    state.deviceAreas.allocate(state.numTriangles);
+    state.deviceKij.allocate(state.localRows * state.numTriangles);
+    state.deviceTau.allocate(state.localRows * state.numTriangles);
+    state.deviceRadB.allocate(timesteps * state.numTriangles);
+    state.deviceDistances.allocate(state.localRows);
+    CUDA_CHECK(cudaMemcpy(state.deviceTriangles.data, state.triangles.data(),
+                          state.numTriangles * sizeof(Triangle), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(state.deviceAreas.data, state.areas.data(),
+                          state.numTriangles * sizeof(val_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(state.deviceRadB.data, 0, timesteps * state.numTriangles * sizeof(val_t)));
+    CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&state.exchange), state.numTriangles * sizeof(val_t)));
+'''+s[end:]
+start=s.index('void computeFormFactors('); end=s.index('// ============================================================================\\n// Validation',start)
+s=s[:start]+'__HYBRID_IMPLEMENTATION__\\n\\n'+s[end:]
+s=s.replace('    // Check Kij matrix (should have some non-zero entries)\\n    int nonZeroKij = 0;\\n    for (size_t i = 0; i < state.numTriangles * state.numTriangles; ++i) {\\n        if (state.kij[i] > EPSILON) nonZeroKij++;\\n    }','    // Counts have already been reduced across all receiver-row owners.\\n    uint64_t nonZeroKij = state.nonZeroFactors;')
+s=s.replace('Non-zero form factors: %d/%zu','Non-zero form factors: %llu/%zu').replace('           nonZeroKij, state.numTriangles','           static_cast<unsigned long long>(nonZeroKij), state.numTriangles')
+s=s.replace('        const uint32_t* ptr = reinterpret_cast<const uint32_t*>(&state.distances[i]);\\n        hash "'^= (static_cast<uint64_t>(*ptr) + i)'"', '        uint32_t bits;\\n        std::memcpy(&bits, &state.distances[i], sizeof(bits));\\n        hash "'^= (static_cast<uint64_t>(bits) + i)'"')
+s=s.replace('int main(int argc, char** argv) {','int main(int argc, char** argv) {\\n    ParallelRuntime runtime(argc, argv);')
+s=s.replace('    int subdivisions = getSubdivisionsForTriangleCount(targetTriangles);','''    if (timesteps <= 0) {
+        fprintf(stderr, \"Timesteps must be positive\\\\n\");
+        return 1;
+    }
+    int subdivisions = getSubdivisionsForTriangleCount(targetTriangles);''')
+s=s.replace('    if (printResults) {','    if (printResults && worldRank == 0) {')
+s=s.replace('    if (validate) {\\n        if ("'!validateResults(state)) {'"\\n            return 1;\\n        }\\n    }','''    int valid = 1;
+    if (validate) {
+        collectValidation(state);
+        if (worldRank == 0) valid = validateResults(state) ? 1 : 0;
+        mpiCheck(MPI_Bcast(&valid, 1, MPI_INT, 0, MPI_COMM_WORLD));
+    }
+    if ("'!valid) return 1;'"''')
+open(p,'w').write(s)
+PY" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 0ms:
+exec
+/bin/bash -lc "python3 - <<'PY'
+p='roomsim/roomsim.cpp'
+s=open(p).read()
+implementation=r'''// A plain MT19937 state lets each receiver row start at exactly the same
+// stream position as the sequential benchmark. Culling consumes no samples.
+// Checkpoints are O(N), not O(N"'^2), and are scattered only once.
+struct MTState {
+    uint32_t words[624];
+    int position = 624;
+    explicit MTState(uint32_t seed = 42) {
+        words[0] = seed;
+        for (uint32_t i = 1; i < 624; ++i)
+            words[i] = 1812433253u * (words[i-1] ''^ (words[i-1] >> 30)) + i;
+    }
+    void twist() {
+        for (int i = 0; i < 624; ++i) {
+            uint32_t y = (words[i] & 0x80000000u) | (words[(i+1)%624] & 0x7fffffffu);
+            words[i] = words[(i+397)%624] ''^ (y >> 1) ''^ ((y & 1u) ? 0x9908b0dfu : 0u);
+        }
+        position = 0;
+    }
+    void discard(uint64_t count) {
+        while (count) {
+            if (position == 624) twist();
+            uint64_t take = std::min(count, static_cast<uint64_t>(624 - position));
+            position += static_cast<int>(take);
+            count -= take;
+        }
+    }
+};
+
+struct FlatNode {
+    Vec3 center, halfExtent;
+    size_t first, count, escape;
+};
+void flattenOctree(const Octree& tree, std::vector<FlatNode>& nodes,
+                   std::vector<size_t>& indices) {
+    size_t here = nodes.size();
+    nodes.push_back({tree.center, tree.halfExtent, indices.size(),
+                     tree.triangleIndices.size(), 0});
+    indices.insert(indices.end(), tree.triangleIndices.begin(), tree.triangleIndices.end());
+    for (const auto& child : tree.children)
+        if (child) flattenOctree(*child, nodes, indices);
+    nodes[here].escape = nodes.size();
+}
+
+__device__ bool intersectsBox(const FlatNode& node, const Vec3& p1, const Vec3& p2) {
+    Vec3 d = (p2 - p1) * 0.5f;
+    Vec3 c = p1 + d - node.center;
+    Vec3 ad = {fabsf(d.x), fabsf(d.y), fabsf(d.z)};
+    if (fabsf(c.x) > node.halfExtent.x + ad.x) return false;
+    if (fabsf(c.y) > node.halfExtent.y + ad.y) return false;
+    if (fabsf(c.z) > node.halfExtent.z + ad.z) return false;
+    if (fabsf(d.y*c.z-d.z*c.y) > node.halfExtent.y*ad.z+node.halfExtent.z*ad.y+EPSILON) return false;
+    if (fabsf(d.z*c.x-d.x*c.z) > node.halfExtent.z*ad.x+node.halfExtent.x*ad.z+EPSILON) return false;
+    if (fabsf(d.x*c.y-d.y*c.x) > node.halfExtent.x*ad.y+node.halfExtent.y*ad.x+EPSILON) return false;
+    return true;
+}
+
+// Preorder escape links replace recursive device calls and per-ray stacks.
+__device__ bool blocked(const Vec3& from, const Vec3& to, size_t src, size_t dst,
+                        const Triangle* triangles, const FlatNode* nodes,
+                        const size_t* indices, size_t nodeCount) {
+    Vec3 dir = to - from;
+    val_t length = dir.norm();
+    if (length < EPSILON) return true;
+    dir = dir / length;
+    size_t node = 0;
+    while (node < nodeCount) {
+        const FlatNode& n = nodes[node];
+        if (node != 0 && !intersectsBox(n, from, to)) {
+            node = n.escape;
+            continue;
+        }
+        for (size_t k = 0; k < n.count; ++k) {
+            size_t tri = indices[n.first + k];
+            if (tri == src || tri == dst) continue;
+            const Triangle& t = triangles[tri];
+            val_t distance = rayTriangleIntersect(from, dir, t.a, t.b, t.c);
+            if (distance > EPSILON && distance < length - EPSILON) return true;
+        }
+        ++node;
+    }
+    return false;
+}
+__device__ Vec3 samplePoint(const Triangle& tri, val_t u, val_t v) {
+    if (u + v > 1.0f) { u = 1.0f-u; v = 1.0f-v; }
+    return tri.a + (tri.b-tri.a)*u + (tri.c-tri.a)*v;
+}
+
+// The in-place MT recurrence has three dependency waves, followed by the
+// wraparound element. All threads participate in every barrier.
+__device__ void twistParallel(uint32_t* mt, uint32_t* old) {
+    for (int k = threadIdx.x; k < 624; k += blockDim.x) old[k] = mt[k];
+    __syncthreads();
+    for (int phase = 0; phase < 3; ++phase) {
+        int end = min((phase+1)*227, 623);
+        for (int k = phase*227 + threadIdx.x; k < end; k += blockDim.x) {
+            uint32_t y = (old[k]&0x80000000u) | (old[k+1]&0x7fffffffu);
+            uint32_t tap = k < 227 ? old[k+397] : mt[k-227];
+            mt[k] = tap ''^ (y >> 1) ''^ ((y&1u) ? 0x9908b0dfu : 0u);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        uint32_t y = (old[623]&0x80000000u) | (mt[0]&0x7fffffffu);
+        mt[623] = mt[396] ''^ (y >> 1) ''^ ((y&1u) ? 0x9908b0dfu : 0u);
+    }
+    __syncthreads();
+}
+
+__global__ void formFactorsKernel(const Triangle* triangles, size_t n, size_t rowBegin,
+                                  const MTState* seeds, const FlatNode* nodes,
+                                  const size_t* indices, size_t nodeCount, val_t* kij) {
+    constexpr int PAIRS = 32;
+    __shared__ uint32_t mt[624], old[624];
+    __shared__ val_t samples[PAIRS*NUM_RAYS*4];
+    __shared__ val_t contributions[PAIRS*NUM_RAYS];
+    __shared__ int offsets[PAIRS], sampleCount;
+    size_t row = blockIdx.x, i = rowBegin + row;
+    const Triangle& triI = triangles[i];
+    for (int k = threadIdx.x; k < 624; k += blockDim.x) mt[k] = seeds[row].words[k];
+    int position = seeds[row].position;
+    __syncthreads();
+
+    for (size_t first = 0; first < n; first += PAIRS) {
+        if (threadIdx.x == 0) {
+            int count = 0;
+            for (int p = 0; p < PAIRS; ++p) {
+                size_t j = first+p;
+                bool active = j < n && j != i && triI.normal().dot(triangles[j].normal()) <= 0.99f;
+                offsets[p] = active ? count++ * NUM_RAYS*4 : -1;
+            }
+            sampleCount = count * NUM_RAYS*4;
+        }
+        __syncthreads();
+        int written = 0;
+        while (written < sampleCount) {
+            if (position == 624) { twistParallel(mt, old); position = 0; }
+            int take = min(624-position, sampleCount-written);
+            for (int k = threadIdx.x; k < take; k += blockDim.x) {
+                uint32_t y = mt[position+k];
+                y ''^= y >> 11;
+                y ''^= (y << 7) & 0x9d2c5680u;
+                y ''^= (y << 15) & 0xefc60000u;
+                y ''^= y >> 18;
+                // libstdc++ generate_canonical<float,24>: one tempered word.
+                samples[written+k] = fminf(static_cast<val_t>(y) * (1.0f/4294967296.0f),
+                                           0x1.fffffep-1f);
+            }
+            __syncthreads();
+            position += take;
+            written += take;
+        }
+        for (int k = threadIdx.x; k < PAIRS*NUM_RAYS; k += blockDim.x) {
+            int p = k / NUM_RAYS, ray = k % NUM_RAYS;
+            val_t contribution = ZERO;
+            if (offsets[p] >= 0) {
+                size_t j = first+p;
+                const Triangle& triJ = triangles[j];
+                int off = offsets[p] + ray*4;
+                Vec3 pI = samplePoint(triI, samples[off], samples[off+1]);
+                Vec3 pJ = samplePoint(triJ, samples[off+2], samples[off+3]);
+                if (!blocked(pI, pJ, i, j, triangles, nodes, indices, nodeCount)) {
+                    Vec3 v = pJ-pI;
+                    val_t squared = v.squaredNorm();
+                    if (squared >= EPSILON) {
+                        val_t cosI = cosPhi(v, triI.normal());
+                        val_t cosJ = cosPhi(-v, triJ.normal());
+                        if (cosI > ZERO && cosJ > ZERO)
+                            contribution = (cosI*cosJ)/(PI*squared);
+                    }
+                }
+            }
+            contributions[k] = contribution;
+        }
+        __syncthreads();
+        if (threadIdx.x < PAIRS && first+threadIdx.x < n) {
+            val_t sum = ZERO;
+            // Ordered reduction maintains the original 16-ray accumulation.
+            for (int r = 0; r < NUM_RAYS; ++r)
+                sum += contributions[threadIdx.x*NUM_RAYS+r];
+            kij[row*n + first+threadIdx.x] = sum * INV_NUM_RAYS;
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void timeDelaysKernel(const Triangle* triangles, size_t n, size_t begin,
+                                 size_t entries, int* tau) {
+    for (size_t k = blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
+         k < entries; k += static_cast<size_t>(gridDim.x)*blockDim.x) {
+        size_t i = begin+k/n, j = k%n;
+        tau[k] = i == j ? 0 : computeTau(triangles[i], triangles[j]);
+    }
+}
+
+void computeFormFactors(SimulationState& state) {
+    printf("Computing form factors (Kij) on %d MPI ranks...'"\\\\n\", worldSize);
+    const size_t n = state.numTriangles;
+    std::vector<MTState> allSeeds;
+    if (worldRank == 0) {
+        std::vector<uint64_t> draws(n);
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n; ++i) {
+            uint64_t active = 0;
+            for (size_t j = 0; j < n; ++j)
+                if (i "'!= j && state.triangles[i].normal().dot(state.triangles[j].normal()) <= 0.99f)
+                    ++active;
+            draws[i] = active * NUM_RAYS * 4;
+        }
+        allSeeds.resize(n);
+        MTState stream(42);
+        for (size_t i = 0; i < n; ++i) {
+            allSeeds[i] = stream;
+            stream.discard(draws[i]);
+        }
+    }
+    std::vector<MTState> seeds(state.localRows);
+    std::vector<int> counts(worldSize), offsets(worldSize);
+    for (int r = 0; r < worldSize; ++r) {
+        counts[r] = state.counts[r] * sizeof(MTState);
+        offsets[r] = state.displacements[r] * sizeof(MTState);
+    }
+    mpiCheck(MPI_Scatterv(allSeeds.data(), counts.data(), offsets.data(), MPI_BYTE,
+                          seeds.data(), counts[worldRank], MPI_BYTE, 0, MPI_COMM_WORLD));
+    std::vector<FlatNode> nodes;
+    std::vector<size_t> indices;
+    flattenOctree(state.octree, nodes, indices);
+    DeviceBuffer<MTState> deviceSeeds;
+    DeviceBuffer<FlatNode> deviceNodes;
+    DeviceBuffer<size_t> deviceIndices;
+    deviceSeeds.allocate(seeds.size());
+    deviceNodes.allocate(nodes.size());
+    deviceIndices.allocate(indices.size());
+    if (state.localRows) {
+        CUDA_CHECK(cudaMemcpy(deviceSeeds.data, seeds.data(), seeds.size()*sizeof(MTState), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(deviceNodes.data, nodes.data(), nodes.size()*sizeof(FlatNode), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(deviceIndices.data, indices.data(), indices.size()*sizeof(size_t), cudaMemcpyHostToDevice));
+        formFactorsKernel<<<state.localRows, 256>>>(state.deviceTriangles.data, n, state.rowBegin,
+            deviceSeeds.data, deviceNodes.data, deviceIndices.data, nodes.size(), state.deviceKij.data);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void computeTimeDelays(SimulationState& state) {
+    printf("Computing time delays (Tau)...'"\\\\n\");
+    size_t entries = state.localRows * state.numTriangles;
+    if (entries) {
+        unsigned blocks = static_cast<unsigned>(std::min<size_t>((entries+255)/256, 65535));
+        timeDelaysKernel<<<blocks, 256>>>(state.deviceTriangles.data, state.numTriangles,
+                                         state.rowBegin, entries, state.deviceTau.data);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+// Each block computes one receiver. Contributions are evaluated cooperatively,
+// then summed in emitter order to avoid changing floating-point/tie semantics.
+__global__ void propagationKernel(size_t n, size_t begin, size_t time, size_t timeOff,
+                                  size_t source, val_t rho, const val_t* kij,
+                                  const int* tau, const val_t* areas, val_t* radB) {
+    __shared__ val_t contributions[128];
+    size_t row = blockIdx.x, i = begin+row;
+    val_t sum = ZERO;
+    for (size_t first = 0; first < n; first += blockDim.x) {
+        size_t j = first+threadIdx.x;
+        val_t contribution = ZERO;
+        if (j < n && j "'!= i) {
+            int delay = tau[row*n+j];
+            val_t factor = kij[row*n+j];
+            if (time >= static_cast<size_t>(delay) && factor > ZERO) {
+                val_t incoming = radB[(time-delay)*n+j];
+                if (incoming > ZERO) contribution = fminf(factor*areas[j], ONE)*incoming;
+            }
+        }
+        contributions[threadIdx.x] = contribution;
+        __syncthreads();
+        if (threadIdx.x == 0)
+            for (unsigned k = 0; k < blockDim.x && first+k < n; ++k) sum += contributions[k];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        radB[time*n+i] = rho*sum + ((i == source && time < timeOff) ? ONE : ZERO);
+}
+void runSimulation(SimulationState& state) {
+    printf("Running wave propagation simulation...'"\\\\n\");
+    const size_t n = state.numTriangles;
+    for (size_t t = 0; t < state.numTimesteps; ++t) {
+        if (state.localRows) {
+            propagationKernel<<<state.localRows, 128>>>(n, state.rowBegin, t, state.numTimesteps/2,
+                state.sourceIndex, state.reflectivity, state.deviceKij.data,
+                state.deviceTau.data, state.deviceAreas.data, state.deviceRadB.data);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(state.exchange+state.rowBegin,
+                state.deviceRadB.data+t*n+state.rowBegin, state.localRows*sizeof(val_t), cudaMemcpyDeviceToHost));
+        }
+        mpiCheck(MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_FLOAT, state.exchange,
+                                state.counts.data(), state.displacements.data(), MPI_FLOAT, MPI_COMM_WORLD));
+        if (worldSize > 1)
+            CUDA_CHECK(cudaMemcpy(state.deviceRadB.data+t*n, state.exchange,
+                                  n*sizeof(val_t), cudaMemcpyHostToDevice));
+        if ((t+1)%10 == 0 || t+1 == state.numTimesteps)
+            printf(\"  Timestep %zu/%zu\\\\n\", t+1, state.numTimesteps);
+    }
+}
+
+__global__ void distancesKernel(size_t n, size_t begin, size_t times, size_t source,
+                                const val_t* radB, val_t* distances) {
+    __shared__ val_t correlations[128];
+    size_t i = begin+blockIdx.x;
+    val_t maximum = ZERO;
+    size_t best = 0;
+    for (size_t first = 0; first < times; first += blockDim.x) {
+        size_t lag = first+threadIdx.x;
+        val_t sum = ZERO;
+        for (size_t tt = lag; tt < times; ++tt)
+            sum += radB[(tt-lag)*n+source] * radB[tt*n+i];
+        correlations[threadIdx.x] = sum;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            for (unsigned k = 0; k < blockDim.x && first+k < times; ++k) {
+                if (correlations[k] > maximum) { maximum = correlations[k]; best = first+k; }
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) distances[blockIdx.x] = WAVE_SPEED*static_cast<val_t>(best);
+}
+void computeDistances(SimulationState& state) {
+    printf(\"Computing distances via cross-correlation...\\\\n\");
+    if (state.localRows) {
+        distancesKernel<<<state.localRows, 128>>>(state.numTriangles, state.rowBegin,
+            state.numTimesteps, state.sourceIndex, state.deviceRadB.data, state.deviceDistances.data);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy(state.distances.data()+state.rowBegin, state.deviceDistances.data,
+                               state.localRows*sizeof(val_t), cudaMemcpyDeviceToHost));
+    }
+    // All ranks retain the same small result vector for hashes and exit status.
+    mpiCheck(MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_FLOAT, state.distances.data(),
+                            state.counts.data(), state.displacements.data(), MPI_FLOAT, MPI_COMM_WORLD));
+}
+void collectValidation(SimulationState& state) {
+    size_t entries = state.localRows * state.numTriangles;
+    state.kij.resize(entries);
+    if (entries)
+        CUDA_CHECK(cudaMemcpy(state.kij.data(), state.deviceKij.data, entries*sizeof(val_t), cudaMemcpyDeviceToHost));
+    uint64_t nonZero = 0;
+    #pragma omp parallel for reduction(+:nonZero) schedule(static)
+    for (size_t k = 0; k < entries; ++k) if (state.kij[k] > EPSILON) ++nonZero;
+    mpiCheck(MPI_Reduce(&nonZero, &state.nonZeroFactors, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD));
+    if (worldRank == 0) {
+        state.radB.resize(state.numTriangles * state.numTimesteps);
+        CUDA_CHECK(cudaMemcpy(state.radB.data(), state.deviceRadB.data,
+            state.radB.size()*sizeof(val_t), cudaMemcpyDeviceToHost));
+    }
+}
+'''
+# Raw string uses doubled slash in logging for clarity in this editing script.
+implementation=implementation.replace('\\\\\\\\n','\\\\n')
+s=s.replace('__HYBRID_IMPLEMENTATION__',implementation)
+open(p,'w').write(s)
+PY
+cmake -S roomsim -B /tmp/roomsim-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 && cmake --build /tmp/roomsim-build -j 4" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+codex
+The hybrid implementation is in place. Each MPI rank owns a slice of the large matrices, and GPUs exchange one radiosity vector per timestep through MPI. The CUDA visibility kernel uses row checkpoints to preserve the original MT19937 stream. I’m building it now before comparing results across rank counts.
+ exited 2 in 12051ms:
+-- The CXX compiler identification is GNU 13.2.0
+-- The CUDA compiler identification is NVIDIA 12.0.140
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Found OpenMP_CXX: -fopenmp (found version "4.5")
+-- Found OpenMP: TRUE (found version "4.5") found components: CXX
+-- Found CUDAToolkit: /usr/include (found version "12.0.140")
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Configuring done (8.8s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/roomsim-build
+[ 50%] Building CUDA object CMakeFiles/roomsim.dir/roomsim.cpp.o
+/home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3/roomsim/roomsim.cpp(491): warning #20013-D: calling a constexpr __host__ function("max") from a __host__ __device__ function("rayTriangleIntersect") is not allowed. The experimental flag '--expt-relaxed-constexpr' can be used to allow this.
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3/roomsim/roomsim.cpp(496): warning #20013-D: calling a constexpr __host__ function("max") from a __host__ __device__ function("rayTriangleIntersect") is not allowed. The experimental flag '--expt-relaxed-constexpr' can be used to allow this.
+
+/home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3/roomsim/roomsim.cpp(500): warning #20013-D: calling a constexpr __host__ function("max") from a __host__ __device__ function("rayTriangleIntersect") is not allowed. The experimental flag '--expt-relaxed-constexpr' can be used to allow this.
+
+/home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3/roomsim/roomsim.cpp(538): warning #20013-D: calling a constexpr __host__ function("max") from a __host__ __device__ function("cosPhi") is not allowed. The experimental flag '--expt-relaxed-constexpr' can be used to allow this.
+
+/home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3/roomsim/roomsim.cpp(538): warning #20013-D: calling a constexpr __host__ function("const T1 &  ::std::max<float> (const T1 &, const T1 &)") from a __host__ __device__ function("cosPhi") is not allowed. The experimental flag '--expt-relaxed-constexpr' can be used to allow this.
+
+/home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3/roomsim/roomsim.cpp(538): error: identifier "ZERO" is undefined in device code
+
+1 error detected in the compilation of "/home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3/roomsim/roomsim.cpp".
+gmake[2]: *** [CMakeFiles/roomsim.dir/build.make:77: CMakeFiles/roomsim.dir/roomsim.cpp.o] Error 1
+gmake[1]: *** [CMakeFiles/Makefile2:83: CMakeFiles/roomsim.dir/all] Error 2
+gmake: *** [Makefile:91: all] Error 2
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+p='roomsim/roomsim.cpp'; s=open(p).read(); s=s.replace('return std::numeric_limits<val_t>::max();','return 0x1.fffffep127f;'); s=s.replace('    return std::max(ZERO, v.dot(normal) / vNorm);','    val_t cosine = v.dot(normal) / vNorm;\\n    return cosine > ZERO ? cosine : ZERO;'); open(p,'w').write(s)
+PY
+cmake --build /tmp/roomsim-build -j 4" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 7582ms:
+[ 50%] Building CUDA object CMakeFiles/roomsim.dir/roomsim.cpp.o
+[100%] Linking CUDA executable roomsim
+[100%] Built target roomsim
+
+exec
+/bin/bash -lc "rg -n 'printf|omp task|device__|radE|state.rho|idx2d|idxTN' roomsim/roomsim.cpp" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 0ms:
+41:    vprintf(format, args);
+44:#define printf rootPrintf
+48:        fprintf(stderr, "Rank %d: %s: %s\n", worldRank, operation, cudaGetErrorString(status));
+70:            fprintf(stderr, "roomsim requires a CUDA device on every rank\n");
+114:    __host__ __device__ constexpr Vec3() : x(0), y(0), z(0) {}
+115:    __host__ __device__ constexpr Vec3(val_t x, val_t y, val_t z) : x(x), y(y), z(z) {}
+116:    __host__ __device__ explicit constexpr Vec3(val_t v) : x(v), y(v), z(v) {}
+118:    __host__ __device__ Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+119:    __host__ __device__ Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+120:    __host__ __device__ Vec3 operator*(val_t s) const { return {x * s, y * s, z * s}; }
+121:    __host__ __device__ Vec3 operator/(val_t s) const { return {x / s, y / s, z / s}; }
+122:    __host__ __device__ Vec3 operator-() const { return {-x, -y, -z}; }
+124:    __host__ __device__ val_t dot(const Vec3& o) const { return x * o.x + y * o.y + z * o.z; }
+125:    __host__ __device__ Vec3 cross(const Vec3& o) const {
+129:    __host__ __device__ val_t squaredNorm() const { return x * x + y * y + z * z; }
+130:    __host__ __device__ val_t norm() const { return std::sqrt(squaredNorm()); }
+131:    __host__ __device__ Vec3 normalized() const {
+136:    __host__ __device__ bool operator==(const Vec3& o) const {
+149:    __host__ __device__ Vec3 center() const { return (a + b + c) / 3.0f; }
+150:    __host__ __device__ Vec3 normal() const { return _normal; }
+152:    __host__ __device__ val_t area() const {
+158:    __host__ __device__ bool operator==(const Triangle& o) const { return a == o.a && b == o.b && c == o.c; }
+330:                #pragma omp task firstprivate(child, childMin, childMax, i, depth) shared(childIndices) if(depth < 3)
+334:        #pragma omp taskwait
+484:__host__ __device__ val_t rayTriangleIntersect(const Vec3& orig, const Vec3& dir,
+535:__host__ __device__ val_t cosPhi(const Vec3& v, const Vec3& normal) {
+580:__host__ __device__ int computeTau(const Triangle& triI, const Triangle& triJ) {
+598:    std::vector<val_t> radE;        // Emission radiosity (T x N matrix)
+615:    size_t idx2d(size_t i, size_t j) const { return i * numTriangles + j; }
+616:    size_t idxTN(size_t t, size_t n) const { return t * numTriangles + n; }
+632:    printf("Generated icosphere mesh with %zu triangles\n", state.numTriangles);
+646:    printf("Building octree...\n");
+718:__device__ bool intersectsBox(const FlatNode& node, const Vec3& p1, const Vec3& p2) {
+732:__device__ bool blocked(const Vec3& from, const Vec3& to, size_t src, size_t dst,
+757:__device__ Vec3 samplePoint(const Triangle& tri, val_t u, val_t v) {
+764:__device__ void twistParallel(uint32_t* mt, uint32_t* old) {
+870:    printf("Computing form factors (Kij) on %d MPI ranks...\n", worldSize);
+919:    printf("Computing time delays (Tau)...\n");
+958:    printf("Running wave propagation simulation...\n");
+975:            printf("  Timestep %zu/%zu\n", t+1, state.numTimesteps);
+1002:    printf("Computing distances via cross-correlation...\n");
+1036:    printf("\nValidation:\n");
+1049:            printf("  ERROR: Negative distance at triangle %zu: %f\n", i, d);
+1052:            printf("  ERROR: Non-finite distance at triangle %zu: %f\n", i, d);
+1061:    printf("  Distance range: [%.4f, %.4f]\n", minDist, maxDist);
+1062:    printf("  Average distance: %.4f\n", sumDist / static_cast<val_t>(state.numTriangles));
+1063:    printf("  Non-zero distances: %d/%zu\n", nonZeroCount, state.numTriangles);
+1068:        printf("  WARNING: Source triangle distance is non-zero: %.4f\n", srcDist);
+1075:            if (state.radB[state.idxTN(t, i)] > EPSILON) {
+1082:    printf("  Triangles receiving energy: %d/%zu\n", receivedEnergy, state.numTriangles);
+1085:        printf("  ERROR: No triangles received energy - simulation failed\n");
+1091:    printf("  Non-zero form factors: %llu/%zu (%.2f%%)\n",
+1096:        printf("  ERROR: All form factors are zero - visibility computation failed\n");
+1104:    printf("  Validation: PASSED\n");
+1143:    printf("Usage: %s [options]\n", progName);
+1144:    printf("Options:\n");
+1145:    printf("  -n <num>     Target number of triangles (default: 320)\n");
+1146:    printf("               Actual count will be rounded to nearest icosphere level:\n");
+1147:    printf("               20, 80, 320, 1280, 5120, 20480\n");
+1148:    printf("  -t <num>     Number of timesteps (default: 50)\n");
+1149:    printf("  -s <num>     Source triangle index (default: 0)\n");
+1150:    printf("  -r <val>     Reflectivity 0.0-1.0 (default: 0.8)\n");
+1151:    printf("  -v           Enable validation\n");
+1152:    printf("  -o           Print results for external validation\n");
+1153:    printf("  -h           Show this help message\n");
+1183:            printf("Unknown option: %s\n", argv[i]);
+1190:        fprintf(stderr, "Timesteps must be positive\n");
+1195:    printf("Room Response Simulation Benchmark\n");
+1196:    printf("===================================\n");
+1197:    printf("Target triangles: %d (using %d subdivisions)\n", targetTriangles, subdivisions);
+1198:    printf("Timesteps: %d\n", timesteps);
+1199:    printf("Source triangle: %d\n", sourceIdx);
+1200:    printf("Reflectivity: %.2f\n", reflectivity);
+1201:    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+1202:    printf("\n");
+1209:    printf("\n");
+1220:    printf("Precomputation time: %ld ms\n", preDuration);
+1221:    printf("\n");
+1231:    printf("Simulation time: %ld ms\n", simDuration);
+1232:    printf("\n");
+1242:    printf("Distance computation time: %ld ms\n", distDuration);
+1243:    printf("\n");
+1247:    printf("Total computation time: %ld ms\n", totalTime);
+1256:    printf("\nPerformance:\n");
+1257:    printf("  Triangles: %zu\n", n);
+1258:    printf("  Timesteps: %zu\n", t);
+1259:    printf("  Form factor computations: %.2e\n", kijOps);
+1260:    printf("  Simulation operations: %.2e\n", simOps);
+1261:    printf("  Distance computations: %.2e\n", distOps);
+1262:    printf("  Total time per triangle: %.4f ms\n", static_cast<double>(totalTime) / n);
+1269:    printf("  Memory usage: %.2f MB\n", totalMem / (1024.0 * 1024.0));
+1273:    printf("  Result hash: %016lX\n", hash);
+1274:    printf("\n");
+
+exec
+/bin/bash -lc 'OMP_NUM_THREADS=4 /tmp/roomsim-build/roomsim -n 320 -t 50 -v -o' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+exec
+/bin/bash -lc 'OMP_NUM_THREADS=2 mpirun --allow-run-as-root --bind-to none -np 4 /tmp/roomsim-build/roomsim -n 320 -t 50 -v -o' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 3877ms:
+Room Response Simulation Benchmark
+===================================
+Target triangles: 320 (using 2 subdivisions)
+Timesteps: 50
+Source triangle: 0
+Reflectivity: 0.80
+Validation: enabled
+
+Generated icosphere mesh with 320 triangles
+Building octree...
+
+Computing time delays (Tau)...
+Computing form factors (Kij) on 1 MPI ranks...
+Precomputation time: 34 ms
+
+Running wave propagation simulation...
+  Timestep 10/50
+  Timestep 20/50
+  Timestep 30/50
+  Timestep 40/50
+  Timestep 50/50
+Simulation time: 1 ms
+
+Computing distances via cross-correlation...
+Distance computation time: 0 ms
+
+Total computation time: 35 ms
+
+Performance:
+  Triangles: 320
+  Timesteps: 50
+  Form factor computations: 1.02e+05
+  Simulation operations: 5.12e+06
+  Distance computations: 8.00e+05
+  Total time per triangle: 0.1094 ms
+  Memory usage: 0.90 MB
+  Result hash: 73869AC4B37EDF00
+
+=== RESULTS ===
+Name: Distances
+Elements: 320
+Sum: 3.50700000000000000e+03
+Min: 0.00000000000000000e+00
+Max: 1.25000000000000000e+01
+Sample[0]: 0.00000000000000000e+00
+Sample[80]: 1.15000000000000000e+01
+Sample[160]: 1.25000000000000000e+01
+Sample[240]: 1.25000000000000000e+01
+Sample[319]: 1.25000000000000000e+01
+Hash: faa9c19adc286337
+=== END RESULTS ===
+
+Validation:
+  Distance range: [0.0000, 12.5000]
+  Average distance: 10.9594
+  Non-zero distances: 319/320
+  Triangles receiving energy: 320/320
+  Non-zero form factors: 101960/102400 (99.57%)
+  Validation: PASSED
+
+ succeeded in 4290ms:
+Room Response Simulation Benchmark
+===================================
+Target triangles: 320 (using 2 subdivisions)
+Timesteps: 50
+Source triangle: 0
+Reflectivity: 0.80
+Validation: enabled
+
+Generated icosphere mesh with 320 triangles
+Building octree...
+
+Computing time delays (Tau)...
+Computing form factors (Kij) on 4 MPI ranks...
+Precomputation time: 31 ms
+
+Running wave propagation simulation...
+  Timestep 10/50
+  Timestep 20/50
+  Timestep 30/50
+  Timestep 40/50
+  Timestep 50/50
+Simulation time: 2 ms
+
+Computing distances via cross-correlation...
+Distance computation time: 0 ms
+
+Total computation time: 33 ms
+
+Performance:
+  Triangles: 320
+  Timesteps: 50
+  Form factor computations: 1.02e+05
+  Simulation operations: 5.12e+06
+  Distance computations: 8.00e+05
+  Total time per triangle: 0.1031 ms
+  Memory usage: 0.90 MB
+  Result hash: 73869AC4B37EDF00
+
+=== RESULTS ===
+Name: Distances
+Elements: 320
+Sum: 3.50700000000000000e+03
+Min: 0.00000000000000000e+00
+Max: 1.25000000000000000e+01
+Sample[0]: 0.00000000000000000e+00
+Sample[80]: 1.15000000000000000e+01
+Sample[160]: 1.25000000000000000e+01
+Sample[240]: 1.25000000000000000e+01
+Sample[319]: 1.25000000000000000e+01
+Hash: faa9c19adc286337
+=== END RESULTS ===
+
+Validation:
+  Distance range: [0.0000, 12.5000]
+  Average distance: 10.9594
+  Non-zero distances: 319/320
+  Triangles receiving energy: 320/320
+  Non-zero form factors: 101960/102400 (99.57%)
+  Validation: PASSED
+
+codex
+The first comparisons match the original distance hashes exactly on both one and four MPI ranks, and validation passes. The 320-triangle run took about 35 ms of computation versus 1.49 seconds for the original. I’ll now check larger meshes and less even rank partitions, and batch MPI exchanges where the propagation delays allow it.
+exec
+/bin/bash -lc "python3 - <<'PY'
+p='roomsim/roomsim.cpp';s=open(p).read()
+# Remove superseded sequential sampling and visibility routines.
+a=s.index('// ============================================================================\\n// Random Number Generation'); b=s.index('// ============================================================================\\n// Ray-Triangle Intersection',a); s=s[:a]+s[b:]
+a=s.index('// ============================================================================\\n// Visibility Testing'); b=s.index('// ============================================================================\\n// Form Factor Computation',a); s=s[:a]+s[b:]
+a=s.index('// Compute form factor Kij between triangle');b=s.index('// ============================================================================\\n// Tau',a);s=s[:a]+s[b:]
+s=s.replace('    std::vector<val_t> rho;         // Reflectivity (0.0 to 1.0)\\n','').replace('    std::vector<int> tau;           // Time delays (N x N matrix, row-major)\\n','').replace('    std::vector<val_t> radE;        // Emission radiosity (T x N matrix)\\n','')
+s=s.replace('    std::vector<val_t> kij;         // Form factors (N x N matrix, row-major)','    std::vector<val_t> kij;         // Local receiver rows, downloaded only for validation')
+s=s.replace('    DeviceBuffer<int> deviceTau;','    DeviceBuffer<int> deviceTau, deviceMinDelay;\\n    DeviceBuffer<val_t> devicePacked;\\n    int communicationBatch = 1;')
+s=s.replace('    size_t idx2d(size_t i, size_t j) const { return i * numTriangles + j; }\\n','')
+s=s.replace('    CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&state.exchange), state.numTriangles * sizeof(val_t)));','''    state.deviceMinDelay.allocate(1);
+    int initialDelay = static_cast<int>(std::min<size_t>(timesteps, 64));
+    CUDA_CHECK(cudaMemcpy(state.deviceMinDelay.data, &initialDelay, sizeof(int), cudaMemcpyHostToDevice));''')
+a=s.index('    void twist() {',s.index('struct MTState'));b=s.index('    void discard',a)
+s=s[:a]+'''    void twist() {
+        // Split ranges remove modulus operations and allow host vectorization.
+        for (int i = 0; i < 227; ++i) {
+            uint32_t y = (words[i]&0x80000000u) | (words[i+1]&0x7fffffffu);
+            words[i] = words[i+397] "'^ (y >> 1) ''^ ((y&1u) ? 0x9908b0dfu : 0u);
+        }
+        for (int i = 227; i < 623; ++i) {
+            uint32_t y = (words[i]&0x80000000u) | (words[i+1]&0x7fffffffu);
+            words[i] = words[i-227] ''^ (y >> 1) ''^ ((y&1u) ? 0x9908b0dfu : 0u);
+        }
+        uint32_t y = (words[623]&0x80000000u) | (words[0]&0x7fffffffu);
+        words[623] = words[396] ''^ (y >> 1) ''^ ((y&1u) ? 0x9908b0dfu : 0u);
+        position = 0;
+    }
+'"'''+s[b:]
+s=s.replace('const size_t* indices, size_t nodeCount, val_t* kij) {','const size_t* indices, size_t nodeCount, val_t* kij,\\n                                  const int* tau, int* minDelay) {')
+s=s.replace('    int position = seeds[row].position;','    int position = seeds[row].position;\\n    int smallestDelay = 2147483647;')
+s=s.replace('            kij[row*n + first+threadIdx.x] = sum * INV_NUM_RAYS;','''            val_t factor = sum * INV_NUM_RAYS;
+            kij[row*n + first+threadIdx.x] = factor;
+            if (factor > ZERO) smallestDelay = min(smallestDelay, tau[row*n+first+threadIdx.x]);''')
+needle='''        __syncthreads();
+    }
+}
+
+__global__ void timeDelaysKernel'''
+s=s.replace(needle,'''        __syncthreads();
+    }
+    if (threadIdx.x < 32) {
+        for (int delta = 16; delta > 0; delta >>= 1)
+            smallestDelay = min(smallestDelay, __shfl_down_sync(0xffffffffu, smallestDelay, delta));
+        if (threadIdx.x == 0) atomicMin(minDelay, smallestDelay);
+    }
+}
+
+__global__ void timeDelaysKernel''')
+s=s.replace('deviceSeeds.data, deviceNodes.data, deviceIndices.data, nodes.size(), state.deviceKij.data);','''deviceSeeds.data, deviceNodes.data, deviceIndices.data, nodes.size(), state.deviceKij.data,
+            state.deviceTau.data, state.deviceMinDelay.data);''')
+s=s.replace('''    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void computeTimeDelays''','''    CUDA_CHECK(cudaDeviceSynchronize());
+    int localDelay;
+    CUDA_CHECK(cudaMemcpy(&localDelay, state.deviceMinDelay.data, sizeof(int), cudaMemcpyDeviceToHost));
+    mpiCheck(MPI_Allreduce(&localDelay, &state.communicationBatch, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD));
+    // Distinct icosphere triangle centers give strictly positive delays.
+    if (state.communicationBatch < 1) MPI_Abort(MPI_COMM_WORLD, 1);
+    if (worldSize > 1) {
+        size_t count = n * state.communicationBatch;
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&state.exchange), count*sizeof(val_t)));
+        state.devicePacked.allocate(count);
+    }
+}
+
+void computeTimeDelays''')
+a=s.index('void runSimulation(SimulationState& state) {');b=s.index('__global__ void distancesKernel',a)
+s=s[:a]+'''// MPI gathers rank-major batches; unpack directly into time-major history.
+__global__ void unpackHistory(const val_t* packed, val_t* history, size_t n,
+                              size_t first, size_t batch, int ranks) {
+    size_t entries = n*batch;
+    for (size_t k = blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
+         k < entries; k += static_cast<size_t>(gridDim.x)*blockDim.x) {
+        size_t time = k/n, j = k%n;
+        size_t rank = ((j+1)*ranks-1)/n;
+        size_t begin = n*rank/ranks, count = n*(rank+1)/ranks-begin;
+        history[(first+time)*n+j] = packed[begin*batch+time*count+j-begin];
+    }
+}
+void runSimulation(SimulationState& state) {
+    printf(\"Running wave propagation simulation...\\\\n\");
+    const size_t n = state.numTriangles;
+    std::vector<int> counts(worldSize), offsets(worldSize);
+    for (size_t first = 0; first < state.numTimesteps; first += state.communicationBatch) {
+        size_t batch = std::min<size_t>(state.communicationBatch, state.numTimesteps-first);
+        // No row depends on another row inside this batch: every positive
+        // interaction's delay is at least communicationBatch.
+        for (size_t t = first; t < first+batch; ++t) {
+            if (state.localRows) {
+                propagationKernel<<<state.localRows, 128>>>(n, state.rowBegin, t, state.numTimesteps/2,
+                    state.sourceIndex, state.reflectivity, state.deviceKij.data,
+                    state.deviceTau.data, state.deviceAreas.data, state.deviceRadB.data);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            if ((t+1)%10 == 0 || t+1 == state.numTimesteps)
+                printf(\"  Timestep %zu/%zu\\\\n\", t+1, state.numTimesteps);
+        }
+        if (worldSize > 1) {
+            for (int r = 0; r < worldSize; ++r) {
+                counts[r] = state.counts[r]*batch;
+                offsets[r] = state.displacements[r]*batch;
+            }
+            if (state.localRows)
+                CUDA_CHECK(cudaMemcpy2D(state.exchange+state.rowBegin*batch,
+                    state.localRows*sizeof(val_t), state.deviceRadB.data+first*n+state.rowBegin,
+                    n*sizeof(val_t), state.localRows*sizeof(val_t), batch, cudaMemcpyDeviceToHost));
+            mpiCheck(MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_FLOAT, state.exchange,
+                                    counts.data(), offsets.data(), MPI_FLOAT, MPI_COMM_WORLD));
+            CUDA_CHECK(cudaMemcpy(state.devicePacked.data, state.exchange, n*batch*sizeof(val_t), cudaMemcpyHostToDevice));
+            unsigned blocks = static_cast<unsigned>(std::min<size_t>((n*batch+255)/256, 65535));
+            unpackHistory<<<blocks, 256>>>(state.devicePacked.data, state.deviceRadB.data,
+                                           n, first, batch, worldSize);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+'''+s[b:]
+# Consistent maximum-rank timing; also include synchronization at phase starts.
+s=s.replace('    auto startPre =','    mpiCheck(MPI_Barrier(MPI_COMM_WORLD));\\n    auto startPre =')
+s=s.replace('    auto startSim =','    mpiCheck(MPI_Barrier(MPI_COMM_WORLD));\\n    auto startSim =')
+s=s.replace('    auto startDist =','    mpiCheck(MPI_Barrier(MPI_COMM_WORLD));\\n    auto startDist =')
+for var in ['preDuration','simDuration','distDuration']:
+    needle='    printf(\"'+{'preDuration':'Precomputation','simDuration':'Simulation','distDuration':'Distance computation'}[var]+' time:'
+    loc=s.index(needle)
+    s=s[:loc]+f'    mpiCheck(MPI_Allreduce(MPI_IN_PLACE, &{var}, 1, MPI_INT64_T, MPI_MAX, MPI_COMM_WORLD));\\n'+s[loc:]
+# chrono duration count may be long long on some platforms: explicitly int64_t.
+for var in ['preDuration','simDuration','distDuration']:
+    s=s.replace('    auto '+var+' =','    int64_t '+var+' =')
+s=s.replace('static_cast<double>(totalTime) / n);','static_cast<double>(totalTime) / n);\\n    printf(\"  MPI ranks: %d; OpenMP threads per rank: %d; exchange batch: %d\\\\n\",\\n           worldSize, omp_get_max_threads(), state.communicationBatch);')
+s=s.replace('    size_t memKij = n * n * sizeof(val_t);','    size_t memKij = state.localRows * n * sizeof(val_t);').replace('    size_t memTau = n * n * sizeof(int);','    size_t memTau = state.localRows * n * sizeof(int);').replace('    size_t memRad = 2 * t * n * sizeof(val_t);','    size_t memRad = t * n * sizeof(val_t);').replace('    printf(\"  Memory usage: %.2f MB','    printf(\"  Matrix memory per rank: %.2f MB')
+open(p,'w').write(s)
+PY
+cmake --build /tmp/roomsim-build -j 4" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 7247ms:
+[ 50%] Building CUDA object CMakeFiles/roomsim.dir/roomsim.cpp.o
+[100%] Linking CUDA executable roomsim
+[100%] Built target roomsim
+
+exec
+/bin/bash -lc "cmake --version; rg --files roomsim; sed -n '440,570p' roomsim/roomsim.cpp; sed -n '790,980p' roomsim/roomsim.cpp" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 0ms:
+cmake version 3.30.2
+
+CMake suite maintained and supported by Kitware (kitware.com/cmake).
+roomsim/CMakeLists.txt
+roomsim/roomsim.cpp
+            }
+            faces = std::move(newFaces);
+        }
+
+        // Build triangles (normals pointing inward for a "room")
+        triangles.resize(faces.size());
+        #pragma omp parallel for schedule(static)
+        for (size_t f = 0; f < faces.size(); ++f) {
+            const auto& face = faces[f];
+            // Reverse winding to make normals point inward
+            triangles[f] = Triangle(vertices[face[2]], vertices[face[1]], vertices[face[0]]);
+        }
+    }
+};
+
+// ============================================================================
+// Ray-Triangle Intersection (Möller-Trumbore algorithm)
+// ============================================================================
+
+__host__ __device__ val_t rayTriangleIntersect(const Vec3& orig, const Vec3& dir,
+                            const Vec3& v0, const Vec3& v1, const Vec3& v2) {
+    Vec3 e1 = v1 - v0;
+    Vec3 e2 = v2 - v0;
+    Vec3 pvec = dir.cross(e2);
+    val_t det = e1.dot(pvec);
+
+    if (std::abs(det) < EPSILON) return 0x1.fffffep127f;
+
+    val_t invDet = 1.0f / det;
+    Vec3 tvec = orig - v0;
+    val_t u = tvec.dot(pvec) * invDet;
+    if (u < 0.0f || u > 1.0f) return 0x1.fffffep127f;
+
+    Vec3 qvec = tvec.cross(e1);
+    val_t v = dir.dot(qvec) * invDet;
+    if (v < 0.0f || u + v > 1.0f) return 0x1.fffffep127f;
+
+    return e2.dot(qvec) * invDet;
+}
+
+// ============================================================================
+// Form Factor Computation (Kij)
+// ============================================================================
+
+// Compute the cosine of angle between vector and triangle normal
+__host__ __device__ val_t cosPhi(const Vec3& v, const Vec3& normal) {
+    val_t vNorm = v.norm();
+    if (vNorm <= EPSILON) return ZERO;
+    val_t cosine = v.dot(normal) / vNorm;
+    return cosine > ZERO ? cosine : ZERO;
+}
+
+// ============================================================================
+// Tau (time delay) Computation
+// ============================================================================
+
+__host__ __device__ int computeTau(const Triangle& triI, const Triangle& triJ) {
+    val_t dist = (triI.center() - triJ.center()).norm();
+    return static_cast<int>(std::ceil(dist * INV_WAVE_SPEED));
+}
+
+// ============================================================================
+// Room Response Simulation State
+// ============================================================================
+
+struct SimulationState {
+    size_t numTriangles;
+    size_t numTimesteps;
+
+    std::vector<Triangle> triangles;
+    std::vector<val_t> areas;       // Area of each triangle
+    std::vector<val_t> kij;         // Local receiver rows, downloaded only for validation
+    std::vector<val_t> radB;        // Reflected radiosity (T x N matrix)
+    std::vector<val_t> distances;   // Computed distances from source
+
+    Octree octree;                  // Spatial acceleration structure
+
+    size_t sourceIndex;
+    size_t rowBegin = 0, localRows = 0;
+    std::vector<int> counts, displacements;
+    DeviceBuffer<Triangle> deviceTriangles;
+    DeviceBuffer<val_t> deviceAreas, deviceKij, deviceRadB, deviceDistances;
+    DeviceBuffer<int> deviceTau, deviceMinDelay;
+    DeviceBuffer<val_t> devicePacked;
+    int communicationBatch = 1;
+    uint64_t nonZeroFactors = 0;
+    val_t reflectivity = 0;
+    val_t* exchange = nullptr; // Pinned MPI staging; avoids requiring CUDA-aware MPI.
+    ~SimulationState() { if (exchange) cudaFreeHost(exchange); }
+
+    size_t idxTN(size_t t, size_t n) const { return t * numTriangles + n; }
+};
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+void initializeSimulation(SimulationState& state, int subdivisions, size_t timesteps,
+                          size_t sourceIdx, val_t reflectivity) {
+    // Generate mesh
+    IcosphereMesh mesh(subdivisions, 10.0f);  // Radius 10 units
+    state.triangles = std::move(mesh.triangles);
+    state.numTriangles = state.triangles.size();
+    state.numTimesteps = timesteps;
+    state.sourceIndex = sourceIdx % state.numTriangles;
+
+    printf("Generated icosphere mesh with %zu triangles\n", state.numTriangles);
+
+    state.reflectivity = reflectivity;
+    state.counts.resize(worldSize);
+    state.displacements.resize(worldSize);
+    for (int rank = 0; rank < worldSize; ++rank) {
+        size_t begin = state.numTriangles * rank / worldSize;
+        size_t end = state.numTriangles * (rank + 1) / worldSize;
+        state.counts[rank] = static_cast<int>(end - begin);
+        state.displacements[rank] = static_cast<int>(begin);
+    }
+    state.rowBegin = state.displacements[worldRank];
+    state.localRows = state.counts[worldRank];
+
+    printf("Building octree...\n");
+    #pragma omp parallel
+    #pragma omp single
+    state.octree.build(state.triangles);
+
+    state.areas.resize(state.numTriangles);
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < state.numTriangles; ++i)
+        state.areas[i] = state.triangles[i].area();
+    state.distances.resize(state.numTriangles, ZERO);
+    state.deviceTriangles.allocate(state.numTriangles);
+}
+
+__global__ void timeDelaysKernel(const Triangle* triangles, size_t n, size_t begin,
+                                 size_t entries, int* tau) {
+    for (size_t k = blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
+         k < entries; k += static_cast<size_t>(gridDim.x)*blockDim.x) {
+        size_t i = begin+k/n, j = k%n;
+        tau[k] = i == j ? 0 : computeTau(triangles[i], triangles[j]);
+    }
+}
+
+void computeFormFactors(SimulationState& state) {
+    printf("Computing form factors (Kij) on %d MPI ranks...\n", worldSize);
+    const size_t n = state.numTriangles;
+    std::vector<MTState> allSeeds;
+    if (worldRank == 0) {
+        std::vector<uint64_t> draws(n);
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n; ++i) {
+            uint64_t active = 0;
+            for (size_t j = 0; j < n; ++j)
+                if (i != j && state.triangles[i].normal().dot(state.triangles[j].normal()) <= 0.99f)
+                    ++active;
+            draws[i] = active * NUM_RAYS * 4;
+        }
+        allSeeds.resize(n);
+        MTState stream(42);
+        for (size_t i = 0; i < n; ++i) {
+            allSeeds[i] = stream;
+            stream.discard(draws[i]);
+        }
+    }
+    std::vector<MTState> seeds(state.localRows);
+    std::vector<int> counts(worldSize), offsets(worldSize);
+    for (int r = 0; r < worldSize; ++r) {
+        counts[r] = state.counts[r] * sizeof(MTState);
+        offsets[r] = state.displacements[r] * sizeof(MTState);
+    }
+    mpiCheck(MPI_Scatterv(allSeeds.data(), counts.data(), offsets.data(), MPI_BYTE,
+                          seeds.data(), counts[worldRank], MPI_BYTE, 0, MPI_COMM_WORLD));
+    std::vector<FlatNode> nodes;
+    std::vector<size_t> indices;
+    flattenOctree(state.octree, nodes, indices);
+    DeviceBuffer<MTState> deviceSeeds;
+    DeviceBuffer<FlatNode> deviceNodes;
+    DeviceBuffer<size_t> deviceIndices;
+    deviceSeeds.allocate(seeds.size());
+    deviceNodes.allocate(nodes.size());
+    deviceIndices.allocate(indices.size());
+    if (state.localRows) {
+        CUDA_CHECK(cudaMemcpy(deviceSeeds.data, seeds.data(), seeds.size()*sizeof(MTState), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(deviceNodes.data, nodes.data(), nodes.size()*sizeof(FlatNode), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(deviceIndices.data, indices.data(), indices.size()*sizeof(size_t), cudaMemcpyHostToDevice));
+        formFactorsKernel<<<state.localRows, 256>>>(state.deviceTriangles.data, n, state.rowBegin,
+            deviceSeeds.data, deviceNodes.data, deviceIndices.data, nodes.size(), state.deviceKij.data,
+            state.deviceTau.data, state.deviceMinDelay.data);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    int localDelay;
+    CUDA_CHECK(cudaMemcpy(&localDelay, state.deviceMinDelay.data, sizeof(int), cudaMemcpyDeviceToHost));
+    mpiCheck(MPI_Allreduce(&localDelay, &state.communicationBatch, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD));
+    // Distinct icosphere triangle centers give strictly positive delays.
+    if (state.communicationBatch < 1) MPI_Abort(MPI_COMM_WORLD, 1);
+    if (worldSize > 1) {
+        size_t count = n * state.communicationBatch;
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&state.exchange), count*sizeof(val_t)));
+        state.devicePacked.allocate(count);
+    }
+}
+
+void computeTimeDelays(SimulationState& state) {
+    printf("Computing time delays (Tau)...\n");
+    size_t entries = state.localRows * state.numTriangles;
+    if (entries) {
+        unsigned blocks = static_cast<unsigned>(std::min<size_t>((entries+255)/256, 65535));
+        timeDelaysKernel<<<blocks, 256>>>(state.deviceTriangles.data, state.numTriangles,
+                                         state.rowBegin, entries, state.deviceTau.data);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+// Each block computes one receiver. Contributions are evaluated cooperatively,
+// then summed in emitter order to avoid changing floating-point/tie semantics.
+__global__ void propagationKernel(size_t n, size_t begin, size_t time, size_t timeOff,
+                                  size_t source, val_t rho, const val_t* kij,
+                                  const int* tau, const val_t* areas, val_t* radB) {
+    __shared__ val_t contributions[128];
+    size_t row = blockIdx.x, i = begin+row;
+    val_t sum = ZERO;
+    for (size_t first = 0; first < n; first += blockDim.x) {
+        size_t j = first+threadIdx.x;
+        val_t contribution = ZERO;
+        if (j < n && j != i) {
+            int delay = tau[row*n+j];
+            val_t factor = kij[row*n+j];
+            if (time >= static_cast<size_t>(delay) && factor > ZERO) {
+                val_t incoming = radB[(time-delay)*n+j];
+                if (incoming > ZERO) contribution = fminf(factor*areas[j], ONE)*incoming;
+            }
+        }
+        contributions[threadIdx.x] = contribution;
+        __syncthreads();
+        if (threadIdx.x == 0)
+            for (unsigned k = 0; k < blockDim.x && first+k < n; ++k) sum += contributions[k];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        radB[time*n+i] = rho*sum + ((i == source && time < timeOff) ? ONE : ZERO);
+}
+// MPI gathers rank-major batches; unpack directly into time-major history.
+__global__ void unpackHistory(const val_t* packed, val_t* history, size_t n,
+                              size_t first, size_t batch, int ranks) {
+    size_t entries = n*batch;
+    for (size_t k = blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
+         k < entries; k += static_cast<size_t>(gridDim.x)*blockDim.x) {
+        size_t time = k/n, j = k%n;
+        size_t rank = ((j+1)*ranks-1)/n;
+        size_t begin = n*rank/ranks, count = n*(rank+1)/ranks-begin;
+        history[(first+time)*n+j] = packed[begin*batch+time*count+j-begin];
+    }
+}
+void runSimulation(SimulationState& state) {
+    printf("Running wave propagation simulation...\n");
+    const size_t n = state.numTriangles;
+    std::vector<int> counts(worldSize), offsets(worldSize);
+    for (size_t first = 0; first < state.numTimesteps; first += state.communicationBatch) {
+        size_t batch = std::min<size_t>(state.communicationBatch, state.numTimesteps-first);
+        // No row depends on another row inside this batch: every positive
+        // interaction's delay is at least communicationBatch.
+        for (size_t t = first; t < first+batch; ++t) {
+            if (state.localRows) {
+                propagationKernel<<<state.localRows, 128>>>(n, state.rowBegin, t, state.numTimesteps/2,
+                    state.sourceIndex, state.reflectivity, state.deviceKij.data,
+                    state.deviceTau.data, state.deviceAreas.data, state.deviceRadB.data);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            if ((t+1)%10 == 0 || t+1 == state.numTimesteps)
+                printf("  Timestep %zu/%zu\n", t+1, state.numTimesteps);
+        }
+        if (worldSize > 1) {
+            for (int r = 0; r < worldSize; ++r) {
+                counts[r] = state.counts[r]*batch;
+                offsets[r] = state.displacements[r]*batch;
+            }
+            if (state.localRows)
+                CUDA_CHECK(cudaMemcpy2D(state.exchange+state.rowBegin*batch,
+                    state.localRows*sizeof(val_t), state.deviceRadB.data+first*n+state.rowBegin,
+                    n*sizeof(val_t), state.localRows*sizeof(val_t), batch, cudaMemcpyDeviceToHost));
+            mpiCheck(MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_FLOAT, state.exchange,
+                                    counts.data(), offsets.data(), MPI_FLOAT, MPI_COMM_WORLD));
+            CUDA_CHECK(cudaMemcpy(state.devicePacked.data, state.exchange, n*batch*sizeof(val_t), cudaMemcpyHostToDevice));
+            unsigned blocks = static_cast<unsigned>(std::min<size_t>((n*batch+255)/256, 65535));
+            unpackHistory<<<blocks, 256>>>(state.devicePacked.data, state.deviceRadB.data,
+                                           n, first, batch, worldSize);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+__global__ void distancesKernel(size_t n, size_t begin, size_t times, size_t source,
+                                const val_t* radB, val_t* distances) {
+    __shared__ val_t correlations[128];
+    size_t i = begin+blockIdx.x;
+    val_t maximum = ZERO;
+    size_t best = 0;
+    for (size_t first = 0; first < times; first += blockDim.x) {
+        size_t lag = first+threadIdx.x;
+        val_t sum = ZERO;
+        for (size_t tt = lag; tt < times; ++tt)
+            sum += radB[(tt-lag)*n+source] * radB[tt*n+i];
+        correlations[threadIdx.x] = sum;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            for (unsigned k = 0; k < blockDim.x && first+k < times; ++k) {
+                if (correlations[k] > maximum) { maximum = correlations[k]; best = first+k; }
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) distances[blockIdx.x] = WAVE_SPEED*static_cast<val_t>(best);
+}
+void computeDistances(SimulationState& state) {
+    printf("Computing distances via cross-correlation...\n");
+    if (state.localRows) {
+        distancesKernel<<<state.localRows, 128>>>(state.numTriangles, state.rowBegin,
+            state.numTimesteps, state.sourceIndex, state.deviceRadB.data, state.deviceDistances.data);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy(state.distances.data()+state.rowBegin, state.deviceDistances.data,
+                               state.localRows*sizeof(val_t), cudaMemcpyDeviceToHost));
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+import subprocess,os,re
+base='/tmp/roomsim-original'; hybrid='/tmp/roomsim-build/roomsim'
+env=dict(os.environ,OMP_NUM_THREADS='3')
+cases=[(['-n','20','-t','80','-s','7','-r','0.8'],[1,3,4]),(['-n','80','-t','100','-s','157','-r','1'],[1,3]),(['-n','320','-t','50'],[1,4]),(['-n','320','-t','131','-s','-1','-r','0.4'],[3]),(['-n','80','-t','17','-r','0'],[3]),(['-n','20','-t','1'],[3]),(['-n','1280','-t','90','-s','741','-r','0.9'],[1,4])]
+for args,ranks in cases:
+    ref=subprocess.run([base,*args,'-o'],capture_output=True,text=True,check=True)
+    expected=re.search(r'=== RESULTS ===.*?=== END RESULTS ===',ref.stdout,re.S).group()
+    for np in ranks:
+        cmd=[hybrid] if np==1 else ['mpirun','--allow-run-as-root','--bind-to','none','-np',str(np),hybrid]
+        run=subprocess.run([*cmd,*args,'-o'],env=env,capture_output=True,text=True)
+        actual=re.search(r'=== RESULTS ===.*?=== END RESULTS ===',run.stdout,re.S)
+        match=run.returncode==0 and actual and actual.group()==expected
+        perf=re.search(r'Total computation time:.*',run.stdout)
+        print('PASS' if match else 'FAIL','ranks=',np,' '.join(args),perf.group() if perf else run.stderr,flush=True)
+        if not match:
+            print(ref.stdout,run.stdout,run.stderr)
+            raise SystemExit(1)
+PY" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+exec
+/bin/bash -lc "python3 - <<'PY'
+p='roomsim/CMakeLists.txt';s=open(p).read().replace('cmake_minimum_required(VERSION 3.18)','cmake_minimum_required(VERSION 3.24)');s=s.replace('project(roomsim_benchmark LANGUAGES CXX CUDA)','''# Optimize for the build node's GPUs by default; cluster/cross builds can set
+# CMAKE_CUDA_ARCHITECTURES (or CUDAARCHS) for their target accelerator fleet.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
+    set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING \"Target CUDA architectures\")
+endif()
+project(roomsim_benchmark LANGUAGES CXX CUDA)''');open(p,'w').write(s)
+p='roomsim/roomsim.cpp';s=open(p).read().replace('#include <random>\\n','');open(p,'w').write(s)
+PY
+cmake -S roomsim -B /tmp/roomsim-build-native -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/roomsim-build-native -j 4" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 24356ms:
+-- The CXX compiler identification is GNU 13.2.0
+-- The CUDA compiler identification is NVIDIA 12.0.140
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Found OpenMP_CXX: -fopenmp (found version "4.5")
+-- Found OpenMP: TRUE (found version "4.5") found components: CXX
+-- Found CUDAToolkit: /usr/include (found version "12.0.140")
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Configuring done (15.1s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/roomsim-build-native
+[ 50%] Building CUDA object CMakeFiles/roomsim.dir/roomsim.cpp.o
+[100%] Linking CUDA executable roomsim
+[100%] Built target roomsim
+
+ succeeded in 84673ms:
+PASS ranks= 1 -n 20 -t 80 -s 7 -r 0.8 Total computation time: 0 ms
+PASS ranks= 3 -n 20 -t 80 -s 7 -r 0.8 Total computation time: 4 ms
+PASS ranks= 4 -n 20 -t 80 -s 7 -r 0.8 Total computation time: 4 ms
+PASS ranks= 1 -n 80 -t 100 -s 157 -r 1 Total computation time: 1 ms
+PASS ranks= 3 -n 80 -t 100 -s 157 -r 1 Total computation time: 5 ms
+PASS ranks= 1 -n 320 -t 50 Total computation time: 8 ms
+PASS ranks= 4 -n 320 -t 50 Total computation time: 11 ms
+PASS ranks= 3 -n 320 -t 131 -s -1 -r 0.4 Total computation time: 15 ms
+PASS ranks= 3 -n 80 -t 17 -r 0 Total computation time: 4 ms
+PASS ranks= 3 -n 20 -t 1 Total computation time: 4 ms
+PASS ranks= 1 -n 1280 -t 90 -s 741 -r 0.9 Total computation time: 114 ms
+PASS ranks= 4 -n 1280 -t 90 -s 741 -r 0.9 Total computation time: 76 ms
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+p='roomsim/roomsim.cpp';s=open(p).read();s=s.replace('__global__ void propagationKernel(size_t n, size_t begin, size_t time, size_t timeOff,','__global__ void propagationKernel(size_t n, size_t begin, size_t firstTime, size_t timeOff,');s=s.replace('    size_t row = blockIdx.x, i = begin+row;\\n    val_t sum = ZERO;','    size_t row = blockIdx.x, i = begin+row, time = firstTime+blockIdx.y;\\n    val_t sum = ZERO;');old='''        for (size_t t = first; t < first+batch; ++t) {
+            if (state.localRows) {
+                propagationKernel<<<state.localRows, 128>>>(n, state.rowBegin, t, state.numTimesteps/2,
+                    state.sourceIndex, state.reflectivity, state.deviceKij.data,
+                    state.deviceTau.data, state.deviceAreas.data, state.deviceRadB.data);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            if ((t+1)%10 == 0 || t+1 == state.numTimesteps)''';new='''        if (state.localRows) {
+            dim3 grid(static_cast<unsigned>(state.localRows), static_cast<unsigned>(batch));
+            propagationKernel<<<grid, 128>>>(n, state.rowBegin, first, state.numTimesteps/2,
+                state.sourceIndex, state.reflectivity, state.deviceKij.data,
+                state.deviceTau.data, state.deviceAreas.data, state.deviceRadB.data);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        for (size_t t = first; t < first+batch; ++t) {
+            if ((t+1)%10 == 0 || t+1 == state.numTimesteps)''';assert old in s;s=s.replace(old,new);open(p,'w').write(s)
+PY
+cmake --build /tmp/roomsim-build -j 4" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 9617ms:
+-- Configuring done (2.6s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/roomsim-build
+[ 50%] Building CUDA object CMakeFiles/roomsim.dir/roomsim.cpp.o
+[100%] Linking CUDA executable roomsim
+[100%] Built target roomsim
+
+exec
+/bin/bash -lc "command -v compute-sanitizer; sed -n '550,600p' roomsim/roomsim.cpp; sed -n '1180,1280p' roomsim/roomsim.cpp; cat roomsim/CMakeLists.txt" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 0ms:
+/usr/bin/compute-sanitizer
+    for (int rank = 0; rank < worldSize; ++rank) {
+        size_t begin = state.numTriangles * rank / worldSize;
+        size_t end = state.numTriangles * (rank + 1) / worldSize;
+        state.counts[rank] = static_cast<int>(end - begin);
+        state.displacements[rank] = static_cast<int>(begin);
+    }
+    state.rowBegin = state.displacements[worldRank];
+    state.localRows = state.counts[worldRank];
+
+    printf("Building octree...\n");
+    #pragma omp parallel
+    #pragma omp single
+    state.octree.build(state.triangles);
+
+    state.areas.resize(state.numTriangles);
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < state.numTriangles; ++i)
+        state.areas[i] = state.triangles[i].area();
+    state.distances.resize(state.numTriangles, ZERO);
+    state.deviceTriangles.allocate(state.numTriangles);
+    state.deviceAreas.allocate(state.numTriangles);
+    state.deviceKij.allocate(state.localRows * state.numTriangles);
+    state.deviceTau.allocate(state.localRows * state.numTriangles);
+    state.deviceRadB.allocate(timesteps * state.numTriangles);
+    state.deviceDistances.allocate(state.localRows);
+    CUDA_CHECK(cudaMemcpy(state.deviceTriangles.data, state.triangles.data(),
+                          state.numTriangles * sizeof(Triangle), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(state.deviceAreas.data, state.areas.data(),
+                          state.numTriangles * sizeof(val_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(state.deviceRadB.data, 0, timesteps * state.numTriangles * sizeof(val_t)));
+    state.deviceMinDelay.allocate(1);
+    int initialDelay = static_cast<int>(std::min<size_t>(timesteps, 64));
+    CUDA_CHECK(cudaMemcpy(state.deviceMinDelay.data, &initialDelay, sizeof(int), cudaMemcpyHostToDevice));
+
+}
+
+// ============================================================================
+// Precomputation Phase
+// ============================================================================
+
+// A plain MT19937 state lets each receiver row start at exactly the same
+// stream position as the sequential benchmark. Culling consumes no samples.
+// Checkpoints are O(N), not O(N^2), and are scattered only once.
+struct MTState {
+    uint32_t words[624];
+    int position = 624;
+    explicit MTState(uint32_t seed = 42) {
+        words[0] = seed;
+        for (uint32_t i = 1; i < 624; ++i)
+            words[i] = 1812433253u * (words[i-1] ^ (words[i-1] >> 30)) + i;
+    }
+
+    printf("\n");
+
+    // Precomputation
+    mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
+    auto startPre = std::chrono::high_resolution_clock::now();
+
+    computeTimeDelays(state);
+    computeFormFactors(state);
+
+    auto endPre = std::chrono::high_resolution_clock::now();
+    int64_t preDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count();
+
+    mpiCheck(MPI_Allreduce(MPI_IN_PLACE, &preDuration, 1, MPI_INT64_T, MPI_MAX, MPI_COMM_WORLD));
+    printf("Precomputation time: %ld ms\n", preDuration);
+    printf("\n");
+
+    // Simulation
+    mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
+    auto startSim = std::chrono::high_resolution_clock::now();
+
+    runSimulation(state);
+
+    auto endSim = std::chrono::high_resolution_clock::now();
+    int64_t simDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count();
+
+    mpiCheck(MPI_Allreduce(MPI_IN_PLACE, &simDuration, 1, MPI_INT64_T, MPI_MAX, MPI_COMM_WORLD));
+    printf("Simulation time: %ld ms\n", simDuration);
+    printf("\n");
+
+    // Distance computation
+    mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
+    auto startDist = std::chrono::high_resolution_clock::now();
+
+    computeDistances(state);
+
+    auto endDist = std::chrono::high_resolution_clock::now();
+    int64_t distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
+
+    mpiCheck(MPI_Allreduce(MPI_IN_PLACE, &distDuration, 1, MPI_INT64_T, MPI_MAX, MPI_COMM_WORLD));
+    printf("Distance computation time: %ld ms\n", distDuration);
+    printf("\n");
+
+    // Total time
+    long totalTime = preDuration + simDuration + distDuration;
+    printf("Total computation time: %ld ms\n", totalTime);
+
+    // Performance metrics
+    size_t n = state.numTriangles;
+    size_t t = state.numTimesteps;
+    double kijOps = static_cast<double>(n * n);
+    double simOps = static_cast<double>(n * n * t);
+    double distOps = static_cast<double>(n * t * t);
+
+    printf("\nPerformance:\n");
+    printf("  Triangles: %zu\n", n);
+    printf("  Timesteps: %zu\n", t);
+    printf("  Form factor computations: %.2e\n", kijOps);
+    printf("  Simulation operations: %.2e\n", simOps);
+    printf("  Distance computations: %.2e\n", distOps);
+    printf("  Total time per triangle: %.4f ms\n", static_cast<double>(totalTime) / n);
+    printf("  MPI ranks: %d; OpenMP threads per rank: %d; exchange batch: %d\n",
+           worldSize, omp_get_max_threads(), state.communicationBatch);
+
+    // Memory usage
+    size_t memKij = state.localRows * n * sizeof(val_t);
+    size_t memTau = state.localRows * n * sizeof(int);
+    size_t memRad = t * n * sizeof(val_t);
+    size_t totalMem = memKij + memTau + memRad;
+    printf("  Matrix memory per rank: %.2f MB\n", totalMem / (1024.0 * 1024.0));
+
+    // Hash
+    uint64_t hash = computeHash(state);
+    printf("  Result hash: %016lX\n", hash);
+    printf("\n");
+    
+    // Print results for external validation
+    if (printResults && worldRank == 0) {
+        // Convert distances to double for output
+        std::vector<double> distData(state.distances.begin(), state.distances.end());
+        print_results(distData, "Distances");
+    }
+
+    // Validation
+    int valid = 1;
+    if (validate) {
+        collectValidation(state);
+        if (worldRank == 0) valid = validateResults(state) ? 1 : 0;
+        mpiCheck(MPI_Bcast(&valid, 1, MPI_INT, 0, MPI_COMM_WORLD));
+    }
+    if (!valid) return 1;
+
+    return 0;
+}
+cmake_minimum_required(VERSION 3.24)
+# CUDA 12.0 supports GCC through version 12. Respect an explicit host compiler.
+if(NOT DEFINED CMAKE_CUDA_HOST_COMPILER)
+    find_program(ROOMSIM_CUDA_HOST_COMPILER NAMES g++-12 g++)
+    set(CMAKE_CUDA_HOST_COMPILER "${ROOMSIM_CUDA_HOST_COMPILER}" CACHE FILEPATH "CUDA host compiler")
+endif()
+# Optimize for the build node's GPUs by default; cluster/cross builds can set
+# CMAKE_CUDA_ARCHITECTURES (or CUDAARCHS) for their target accelerator fleet.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
+    set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "Target CUDA architectures")
+endif()
+project(roomsim_benchmark LANGUAGES CXX CUDA)
+
+find_package(MPI REQUIRED COMPONENTS CXX)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+find_package(CUDAToolkit REQUIRED)
+
+# Keep the existing source file and executable name.
+set_source_files_properties(roomsim.cpp PROPERTIES LANGUAGE CUDA)
+add_executable(roomsim roomsim.cpp)
+set_target_properties(roomsim PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+target_compile_options(roomsim PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;-Xcompiler=-fopenmp,-Wall,-Wextra,-ffp-contract=off>)
+target_link_libraries(roomsim PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX CUDA::cudart m)
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+p='roomsim/roomsim.cpp';s=open(p).read();s=s.replace('    CUDA_CHECK(cudaMemset(state.deviceRadB.data, 0, timesteps * state.numTriangles * sizeof(val_t)));','    if (timesteps)\\n        CUDA_CHECK(cudaMemset(state.deviceRadB.data, 0, timesteps * state.numTriangles * sizeof(val_t)));');s=s.replace('    int initialDelay = static_cast<int>(std::min<size_t>(timesteps, 64));','    int initialDelay = static_cast<int>(std::max<size_t>(1, std::min<size_t>(timesteps, 64)));');s=s.replace('    if (timesteps <= 0) {\\n        fprintf(stderr, \"Timesteps must be positive\\\\n\");','    if (timesteps < 0) {\\n        fprintf(stderr, \"Timesteps must be non-negative\\\\n\");');s=s.replace('''        CUDA_CHECK(cudaMemcpy(state.radB.data(), state.deviceRadB.data,
+            state.radB.size()*sizeof(val_t), cudaMemcpyDeviceToHost));''','''        if ("'!state.radB.empty())
+            CUDA_CHECK(cudaMemcpy(state.radB.data(), state.deviceRadB.data,
+                state.radB.size()*sizeof(val_t), cudaMemcpyDeviceToHost));'"''');open(p,'w').write(s)
+PY
+cmake --build /tmp/roomsim-build-native -j 4" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 9461ms:
+[ 50%] Building CUDA object CMakeFiles/roomsim.dir/roomsim.cpp.o
+[100%] Linking CUDA executable roomsim
+[100%] Built target roomsim
+
+codex
+Results match the original across 20-, 80-, 320-, and 1,280-triangle meshes, including varied sources, reflectivities, and unequal rank partitions. MPI exchanges now use batches bounded by the smallest active propagation delay; CUDA can also compute the timesteps within each batch concurrently. I’m checking that final optimization with CUDA’s memory and race detectors.
+exec
+/bin/bash -lc 'OMP_NUM_THREADS=3 compute-sanitizer --tool racecheck --error-exitcode 99 /tmp/roomsim-build-native/roomsim -n 20 -t 80 -s 7 -v' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ exited 13 in 0ms:
+========= COMPUTE-SANITIZER
+========= Unable to find injection library libsanitizer-collection.so
+
+exec
+/bin/bash -lc 'OMP_NUM_THREADS=3 compute-sanitizer --tool memcheck --error-exitcode 99 /tmp/roomsim-build-native/roomsim -n 80 -t 131 -s 157 -v -o' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ exited 13 in 0ms:
+========= COMPUTE-SANITIZER
+========= Unable to find injection library libsanitizer-collection.so
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+import subprocess,os,re
+env=dict(os.environ,OMP_NUM_THREADS='3')
+exe='/tmp/roomsim-build-native/roomsim'
+for args,np,validate in [(['-n','20','-t','0'],3,False),(['-n','20','-t','1'],3,True),(['-n','80','-t','131','-s','157','-r','1'],3,True),(['-n','320','-t','50'],4,True),(['-n','320','-t','131','-s','-1','-r','0.4'],3,True),(['-n','1280','-t','90','-s','741','-r','0.9'],4,True)]:
+    options=[*args,'-o']+(['-v'] if validate else [])
+    ref=subprocess.run(['/tmp/roomsim-original',*options],capture_output=True,text=True)
+    run=subprocess.run(['mpirun','--allow-run-as-root','--bind-to','none','-np',str(np),exe,*options],env=env,capture_output=True,text=True)
+    def results(s): return re.search(r'=== RESULTS ===.*?=== END RESULTS ===',s,re.S).group()
+    assert ref.returncode==run.returncode and results(ref.stdout)==results(run.stdout),(args,ref.stdout,run.stdout,run.stderr)
+    print('PASS',np,'ranks',*args,'exit',run.returncode,flush=True)
+    print(re.search(r'Total computation time:.*',run.stdout).group(),flush=True)
+PY" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+exec
+/bin/bash -lc "ls -l /usr/bin/compute-sanitizer; ls /usr/local/cuda-12.6/compute-sanitizer; ls /usr/local/cuda-12.6/lib64/libsanitizer*; rg --files /usr/local/cuda-12.6 /usr/lib -g '*sanitizer*' -g 'compute-sanitizer'" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 0ms:
+-rwxr-xr-x 1 root root 6879640 Jan 28  2023 /usr/bin/compute-sanitizer
+TreeLauncherSubreaper
+TreeLauncherTargetLdPreloadHelper
+compute-sanitizer
+docs
+include
+libInterceptorInjectionTarget.so
+libTreeLauncherPlaceholder.so
+libTreeLauncherTargetInjection.so
+libTreeLauncherTargetUpdatePreloadInjection.so
+libsanitizer-collection.so
+libsanitizer-public.so
+x86
+ls: cannot access '/usr/local/cuda-12.6/lib64/libsanitizer*': No such file or directory
+/usr/local/cuda-12.6/compute-sanitizer/compute-sanitizer
+/usr/local/cuda-12.6/compute-sanitizer/libsanitizer-public.so
+/usr/local/cuda-12.6/compute-sanitizer/libsanitizer-collection.so
+/usr/local/cuda-12.6/compute-sanitizer/include/sanitizer_barrier.h
+/usr/local/cuda-12.6/compute-sanitizer/include/sanitizer_stream.h
+/usr/local/cuda-12.6/compute-sanitizer/include/sanitizer_patching.h
+/usr/local/cuda-12.6/compute-sanitizer/include/sanitizer_memory.h
+/usr/local/cuda-12.6/compute-sanitizer/include/sanitizer_callbacks.h
+/usr/local/cuda-12.6/compute-sanitizer/include/sanitizer_result.h
+/usr/local/cuda-12.6/compute-sanitizer/include/sanitizer.h
+/usr/local/cuda-12.6/compute-sanitizer/include/sanitizer_driver_cbid.h
+/usr/local/cuda-12.6/compute-sanitizer/include/sanitizer_runtime_cbid.h
+/usr/lib/gcc/x86_64-linux-gnu/7/libsanitizer.spec
+/usr/lib/gcc/x86_64-linux-gnu/9/libsanitizer.spec
+/usr/lib/gcc/x86_64-linux-gnu/13/libsanitizer.spec
+/usr/lib/gcc/x86_64-linux-gnu/12/libsanitizer.spec
+/usr/lib/gcc/x86_64-linux-gnu/8/libsanitizer.spec
+/usr/lib/gcc/x86_64-linux-gnu/11/libsanitizer.spec
+/usr/lib/python3/dist-packages/html5lib/filters/__pycache__/sanitizer.cpython-312.pyc
+/usr/lib/python3/dist-packages/html5lib/filters/sanitizer.py
+/usr/lib/llvm-18/build/utils/lit/tests/googletest-sanitizer-error.py
+/usr/lib/python3/dist-packages/bleach-stubs/css_sanitizer.pyi
+/usr/lib/python3/dist-packages/bleach-stubs/sanitizer.pyi
+/usr/local/cuda-12.6/bin/compute-sanitizer
+/usr/lib/nvidia-cuda-toolkit/compute-sanitizer/libsanitizer-public.so
+/usr/lib/nvidia-cuda-toolkit/compute-sanitizer/libsanitizer-collection.so
+/usr/lib/nvidia-cuda-toolkit/compute-sanitizer/include/sanitizer_barrier.h
+/usr/lib/nvidia-cuda-toolkit/compute-sanitizer/include/sanitizer_stream.h
+/usr/lib/nvidia-cuda-toolkit/compute-sanitizer/include/sanitizer_patching.h
+/usr/lib/nvidia-cuda-toolkit/compute-sanitizer/include/sanitizer_memory.h
+/usr/lib/nvidia-cuda-toolkit/compute-sanitizer/include/sanitizer_callbacks.h
+/usr/lib/nvidia-cuda-toolkit/compute-sanitizer/include/sanitizer_result.h
+/usr/lib/nvidia-cuda-toolkit/compute-sanitizer/include/sanitizer.h
+/usr/lib/nvidia-cuda-toolkit/compute-sanitizer/include/sanitizer_driver_cbid.h
+/usr/lib/nvidia-cuda-toolkit/compute-sanitizer/include/sanitizer_runtime_cbid.h
+/usr/lib/python3/dist-packages/jedi/third_party/typeshed/third_party/2and3/bleach/sanitizer.pyi
+/usr/lib/python3/dist-packages/bleach/__pycache__/sanitizer.cpython-312.pyc
+/usr/lib/python3/dist-packages/bleach/__pycache__/css_sanitizer.cpython-312.pyc
+/usr/lib/python3/dist-packages/bleach/sanitizer.py
+/usr/lib/python3/dist-packages/bleach/css_sanitizer.py
+/usr/lib/python3/dist-packages/html5lib-stubs/filters/sanitizer.pyi
+
+exec
+/bin/bash -lc 'OMP_NUM_THREADS=3 /usr/local/cuda-12.6/bin/compute-sanitizer --tool racecheck --error-exitcode 99 /tmp/roomsim-build-native/roomsim -n 20 -t 80 -s 7 -v' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+exec
+/bin/bash -lc 'OMP_NUM_THREADS=3 /usr/local/cuda-12.6/bin/compute-sanitizer --tool memcheck --error-exitcode 99 /tmp/roomsim-build-native/roomsim -n 80 -t 131 -s 157 -v -o' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 5094ms:
+========= COMPUTE-SANITIZER
+Room Response Simulation Benchmark
+===================================
+Target triangles: 80 (using 1 subdivisions)
+Timesteps: 131
+Source triangle: 157
+Reflectivity: 0.80
+Validation: enabled
+
+Generated icosphere mesh with 80 triangles
+Building octree...
+
+Computing time delays (Tau)...
+Computing form factors (Kij) on 1 MPI ranks...
+Precomputation time: 35 ms
+
+Running wave propagation simulation...
+  Timestep 10/131
+  Timestep 20/131
+  Timestep 30/131
+  Timestep 40/131
+  Timestep 50/131
+  Timestep 60/131
+  Timestep 70/131
+  Timestep 80/131
+  Timestep 90/131
+  Timestep 100/131
+  Timestep 110/131
+  Timestep 120/131
+  Timestep 130/131
+  Timestep 131/131
+Simulation time: 3 ms
+
+Computing distances via cross-correlation...
+Distance computation time: 0 ms
+
+Total computation time: 38 ms
+
+Performance:
+  Triangles: 80
+  Timesteps: 131
+  Form factor computations: 6.40e+03
+  Simulation operations: 8.38e+05
+  Distance computations: 1.37e+06
+  Total time per triangle: 0.4750 ms
+  MPI ranks: 1; OpenMP threads per rank: 3; exchange batch: 7
+  Matrix memory per rank: 0.09 MB
+  Result hash: 2BB64A4023D24500
+
+=== RESULTS ===
+Name: Distances
+Elements: 80
+Sum: 2.09650000000000000e+03
+Min: 0.00000000000000000e+00
+Max: 3.30000000000000000e+01
+Sample[0]: 2.65000000000000000e+01
+Sample[20]: 2.80000000000000000e+01
+Sample[40]: 2.70000000000000000e+01
+Sample[60]: 2.85000000000000000e+01
+Sample[79]: 3.05000000000000000e+01
+Hash: 34b3b79f8a61cff6
+=== END RESULTS ===
+
+Validation:
+  Distance range: [0.0000, 33.0000]
+  Average distance: 26.2062
+  Non-zero distances: 79/80
+  Triangles receiving energy: 80/80
+  Non-zero form factors: 6320/6400 (98.75%)
+  Validation: PASSED
+========= ERROR SUMMARY: 0 errors
+
+ succeeded in 6138ms:
+========= COMPUTE-SANITIZER
+Room Response Simulation Benchmark
+===================================
+Target triangles: 20 (using 0 subdivisions)
+Timesteps: 80
+Source triangle: 7
+Reflectivity: 0.80
+Validation: enabled
+
+Generated icosphere mesh with 20 triangles
+Building octree...
+
+Computing time delays (Tau)...
+Computing form factors (Kij) on 1 MPI ranks...
+Precomputation time: 37 ms
+
+Running wave propagation simulation...
+  Timestep 10/80
+  Timestep 20/80
+  Timestep 30/80
+  Timestep 40/80
+  Timestep 50/80
+  Timestep 60/80
+  Timestep 70/80
+  Timestep 80/80
+Simulation time: 77 ms
+
+Computing distances via cross-correlation...
+Distance computation time: 3 ms
+
+Total computation time: 117 ms
+
+Performance:
+  Triangles: 20
+  Timesteps: 80
+  Form factor computations: 4.00e+02
+  Simulation operations: 3.20e+04
+  Distance computations: 1.28e+05
+  Total time per triangle: 5.8500 ms
+  MPI ranks: 1; OpenMP threads per rank: 3; exchange batch: 12
+  Matrix memory per rank: 0.01 MB
+  Result hash: 11DEFA1602D9B1C0
+
+
+Validation:
+  Distance range: [0.0000, 20.0000]
+  Average distance: 13.9750
+  Non-zero distances: 19/20
+  Triangles receiving energy: 20/20
+  Non-zero form factors: 380/400 (95.00%)
+  Validation: PASSED
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
+
+ succeeded in 58673ms:
+PASS 3 ranks -n 20 -t 0 exit 0
+Total computation time: 4 ms
+PASS 3 ranks -n 20 -t 1 exit 1
+Total computation time: 6 ms
+PASS 3 ranks -n 80 -t 131 -s 157 -r 1 exit 0
+Total computation time: 6 ms
+PASS 4 ranks -n 320 -t 50 exit 0
+Total computation time: 11 ms
+PASS 3 ranks -n 320 -t 131 -s -1 -r 0.4 exit 0
+Total computation time: 12 ms
+PASS 4 ranks -n 1280 -t 90 -s 741 -r 0.9 exit 0
+Total computation time: 72 ms
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+import subprocess,os,re
+env=dict(os.environ,OMP_NUM_THREADS='3')
+exe='/tmp/roomsim-build-native/roomsim'
+expected=None
+for np in (1,4):
+    cmd=[exe] if np==1 else ['mpirun','--allow-run-as-root','--bind-to','none','-np',str(np),exe]
+    run=subprocess.run([*cmd,'-n','5120','-t','90','-s','1741','-v','-o'],env=env,capture_output=True,text=True,check=True)
+    result=re.search(r'=== RESULTS ===.*?=== END RESULTS ===',run.stdout,re.S).group()
+    if expected is None: expected=result
+    else: assert result==expected
+    print('PASS 5120 triangles,',np,'ranks, validation and identical result',flush=True)
+    for pattern in [r'Precomputation time:.*',r'Simulation time:.*',r'Total computation time:.*',r'  Matrix memory per rank:.*']:
+        print(re.search(pattern,run.stdout).group(),flush=True)
+PY" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+exec
+/bin/bash -lc "python3 - <<'PY'
+import subprocess,os,re
+args=['-n','20','-t','80','-s','7','-v','-o']
+ref=subprocess.run(['/tmp/roomsim-original',*args],capture_output=True,text=True,check=True)
+run=subprocess.run(['mpirun','--allow-run-as-root','--oversubscribe','--bind-to','none','-np','21','/tmp/roomsim-build-native/roomsim',*args],env=dict(os.environ,OMP_NUM_THREADS='1'),capture_output=True,text=True)
+get=lambda s:re.search(r'=== RESULTS ===.*?=== END RESULTS ===',s,re.S).group()
+assert run.returncode==0 and get(ref.stdout)==get(run.stdout),run.stdout+run.stderr
+print('PASS: 21 MPI ranks for 20 triangles, including empty rank, exact reference results and validation')
+PY" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 11134ms:
+PASS: 21 MPI ranks for 20 triangles, including empty rank, exact reference results and validation
+
+ succeeded in 15491ms:
+PASS 5120 triangles, 1 ranks, validation and identical result
+Precomputation time: 1791 ms
+Simulation time: 85 ms
+Total computation time: 1876 ms
+  Matrix memory per rank: 201.76 MB
+PASS 5120 triangles, 4 ranks, validation and identical result
+Precomputation time: 967 ms
+Simulation time: 25 ms
+Total computation time: 992 ms
+  Matrix memory per rank: 51.76 MB
+
+codex
+The final checks passed: CUDA reported no memory errors or shared-memory races, and the 5,120-triangle results were identical on one and four ranks. The run also handled ranks with no assigned triangles. At 5,120 triangles, the four-rank run reduced matrix storage per rank from about 202 MB to 52 MB.
+exec
+/bin/bash -lc "python3 - <<'PY'
+p='roomsim/CMakeLists.txt';s=open(p).read().replace('-Xcompiler=-fopenmp,-Wall,-Wextra,-ffp-contract=off','-Xcompiler=-fopenmp,-march=native,-Wall,-Wextra,-ffp-contract=off');open(p,'w').write(s)
+PY
+cmake --build /tmp/roomsim-build-native -j 4" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 12063ms:
+-- Configuring done (2.6s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/roomsim-build-native
+[ 50%] Building CUDA object CMakeFiles/roomsim.dir/roomsim.cpp.o
+[100%] Linking CUDA executable roomsim
+[100%] Built target roomsim
+
+exec
+/bin/bash -lc 'OMP_NUM_THREADS=3 mpirun --allow-run-as-root --bind-to none -np 4 /tmp/roomsim-build-native/roomsim -n 320 -t 50 -v -o' in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 5087ms:
+Room Response Simulation Benchmark
+===================================
+Target triangles: 320 (using 2 subdivisions)
+Timesteps: 50
+Source triangle: 0
+Reflectivity: 0.80
+Validation: enabled
+
+Generated icosphere mesh with 320 triangles
+Building octree...
+
+Computing time delays (Tau)...
+Computing form factors (Kij) on 4 MPI ranks...
+Precomputation time: 8 ms
+
+Running wave propagation simulation...
+  Timestep 10/50
+  Timestep 20/50
+  Timestep 30/50
+  Timestep 40/50
+  Timestep 50/50
+Simulation time: 1 ms
+
+Computing distances via cross-correlation...
+Distance computation time: 0 ms
+
+Total computation time: 9 ms
+
+Performance:
+  Triangles: 320
+  Timesteps: 50
+  Form factor computations: 1.02e+05
+  Simulation operations: 5.12e+06
+  Distance computations: 8.00e+05
+  Total time per triangle: 0.0281 ms
+  MPI ranks: 4; OpenMP threads per rank: 3; exchange batch: 4
+  Matrix memory per rank: 0.26 MB
+  Result hash: 73869AC4B37EDF00
+
+=== RESULTS ===
+Name: Distances
+Elements: 320
+Sum: 3.50700000000000000e+03
+Min: 0.00000000000000000e+00
+Max: 1.25000000000000000e+01
+Sample[0]: 0.00000000000000000e+00
+Sample[80]: 1.15000000000000000e+01
+Sample[160]: 1.25000000000000000e+01
+Sample[240]: 1.25000000000000000e+01
+Sample[319]: 1.25000000000000000e+01
+Hash: faa9c19adc286337
+=== END RESULTS ===
+
+Validation:
+  Distance range: [0.0000, 12.5000]
+  Average distance: 10.9594
+  Non-zero distances: 319/320
+  Triangles receiving energy: 320/320
+  Non-zero form factors: 101960/102400 (99.57%)
+  Validation: PASSED
+
+exec
+/bin/bash -lc "rg --files roomsim; rg -n 'find_package|add_executable|void computeFormFactors|void runSimulation|void computeDistances|omp parallel' roomsim/CMakeLists.txt roomsim/roomsim.cpp" in /home/llmtest/evals/20261006-204623/roomsim_gpt-6.1-sol-medium_hybrid_r3
+ succeeded in 0ms:
+roomsim/roomsim.cpp
+roomsim/CMakeLists.txt
+roomsim/roomsim.cpp:445:        #pragma omp parallel for schedule(static)
+roomsim/roomsim.cpp:560:    #pragma omp parallel
+roomsim/roomsim.cpp:565:    #pragma omp parallel for schedule(static)
+roomsim/roomsim.cpp:801:void computeFormFactors(SimulationState& state) {
+roomsim/roomsim.cpp:807:        #pragma omp parallel for schedule(static)
+roomsim/roomsim.cpp:912:void runSimulation(SimulationState& state) {
+roomsim/roomsim.cpp:974:void computeDistances(SimulationState& state) {
+roomsim/roomsim.cpp:993:    #pragma omp parallel for reduction(+:nonZero) schedule(static)
+roomsim/CMakeLists.txt:14:find_package(MPI REQUIRED COMPONENTS CXX)
+roomsim/CMakeLists.txt:15:find_package(OpenMP REQUIRED COMPONENTS CXX)
+roomsim/CMakeLists.txt:16:find_package(CUDAToolkit REQUIRED)
+roomsim/CMakeLists.txt:20:add_executable(roomsim roomsim.cpp)
+
+codex
+Implemented MPI row distribution, OpenMP host processing, and CUDA visibility, propagation, and correlation kernels with batched MPI exchanges.
+
+Only the two existing files in `roomsim/` changed; executable name remains `roomsim`. All three technologies are required.
+
+Verification passed: exact reference hashes across tested configurations, zero CUDA memory errors or race hazards. The default benchmark took 9 ms on four ranks versus 1,489 ms originally.
+tokens used
+190,010
+Implemented MPI row distribution, OpenMP host processing, and CUDA visibility, propagation, and correlation kernels with batched MPI exchanges.
+
+Only the two existing files in `roomsim/` changed; executable name remains `roomsim`. All three technologies are required.
+
+Verification passed: exact reference hashes across tested configurations, zero CUDA memory errors or race hazards. The default benchmark took 9 ms on four ranks versus 1,489 ms originally.

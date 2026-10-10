@@ -1,0 +1,2942 @@
+Reading additional input from stdin...
+OpenAI Codex v0.160.1
+--------
+workdir: /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+model: gpt-6.1-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 01a113fe-2e4d-7463-8eb0-e652f228bfe9
+--------
+user
+Parallelize the unstructured benchmark code found in ./unstructured/ with CUDA for GPU parallelism. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the benchmark and build setup, then implement and validate a CUDA version while preserving the executable name and output semantics.
+exec
+/bin/bash -lc "pwd && rg --files -g 'AGENTS.md' -g 'CMakeLists.txt' -g '*'" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 0ms:
+/home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+output.txt
+common/hash.hpp
+common/results_output.hpp
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+
+exec
+/bin/bash -lc 'cat unstructured/unstructured.cpp && cat unstructured/CMakeLists.txt && cat common/hash.hpp && cat common/results_output.hpp' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 0ms:
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+// Types to represent unstructured mesh elements
+using idx_t = uint64_t;
+using val_t = double;
+
+// Maximum number of connections per element (for a 2D grid: 4 neighbors)
+constexpr int MAX_CONNECTIONS = 8;
+
+// Material properties for energy transfer
+struct Material {
+    val_t transfer_coeff;  // Energy transfer coefficient
+    val_t external_flow;   // External energy source/sink
+};
+
+// Static connectivity information for each element
+struct ElementStatic {
+    idx_t material_idx;
+    idx_t num_connections;
+    idx_t connected_idx[MAX_CONNECTIONS];     // Indices of connected elements
+    val_t connected_flux[MAX_CONNECTIONS];    // Flux coefficients for each connection
+};
+
+// Dynamic state for each element
+struct ElementDynamic {
+    val_t current_energy;
+    val_t total_flux;
+};
+
+// World state
+struct World {
+    std::vector<Material> materials;
+    std::vector<ElementStatic> elements_static;
+    std::vector<ElementDynamic> elements_dynamic;
+    std::vector<ElementDynamic> elements_dynamic_swap;
+};
+
+// Material type IDs
+constexpr idx_t DEFAULT_MAT_ID = 0;
+constexpr idx_t INFLOW_MAT_ID = 1;
+constexpr idx_t OUTFLOW_MAT_ID = 2;
+
+// Build a 2D square grid as an unstructured mesh
+// This represents computation on arbitrarily-shaped geometries
+void buildSquare2D(World& world, const int n_elems_root) {
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    // Initialize materials
+    world.materials.emplace_back(Material{0.8, 0.0});    // Default material
+    world.materials.emplace_back(Material{0.8, 0.5});    // Inflow material
+    world.materials.emplace_back(Material{0.8, -0.5});   // Outflow material
+    
+    // Allocate elements
+    world.elements_static.resize(n_elems);
+    world.elements_dynamic.resize(n_elems);
+    world.elements_dynamic_swap.resize(n_elems);
+    
+    // Initialize all elements with default material and zero energy
+    for (int i = 0; i < n_elems; ++i) {
+        world.elements_static[i].material_idx = DEFAULT_MAT_ID;
+        world.elements_static[i].num_connections = 0;
+        world.elements_dynamic[i].current_energy = 0.0;
+        world.elements_dynamic[i].total_flux = 0.0;
+    }
+    
+    // Build connectivity: each element connects to its neighbors in 2D grid
+    for (int x = 0; x < n_elems_root; ++x) {
+        for (int y = 0; y < n_elems_root; ++y) {
+            const int idx = x * n_elems_root + y;
+            ElementStatic& elem = world.elements_static[idx];
+            
+            // Connect to neighbors (up, down, left, right)
+            const int offsets[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            
+            for (int n = 0; n < 4; ++n) {
+                const int nx = x + offsets[n][0];
+                const int ny = y + offsets[n][1];
+                
+                // Check if neighbor is within bounds
+                if (nx >= 0 && nx < n_elems_root && ny >= 0 && ny < n_elems_root) {
+                    const int neighbor_idx = nx * n_elems_root + ny;
+                    elem.connected_idx[elem.num_connections] = neighbor_idx;
+                    elem.connected_flux[elem.num_connections] = 1.0;
+                    elem.num_connections++;
+                }
+            }
+        }
+    }
+    
+    // Set corner elements as inflow/outflow to create interesting dynamics
+    const int last = n_elems_root - 1;
+    world.elements_static[0 * n_elems_root + 0].material_idx = INFLOW_MAT_ID;
+    world.elements_static[0 * n_elems_root + last].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + 0].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + last].material_idx = INFLOW_MAT_ID;
+}
+
+// Compute energy flux between two elements
+inline val_t computeFlux(const Material& mat, const ElementDynamic& this_elem,
+                        val_t connection_flux, const ElementDynamic& other_elem) {
+    return (other_elem.current_energy - this_elem.current_energy) * 
+           mat.transfer_coeff * connection_flux * 0.25;
+}
+
+// Run simulation for n_iters iterations
+void runSimulation(World& world, const int n_iters) {
+    const size_t n_elems = world.elements_static.size();
+    
+    for (int iter = 0; iter < n_iters; ++iter) {
+        // Update all elements
+        for (size_t i = 0; i < n_elems; ++i) {
+            const ElementStatic& elem_static = world.elements_static[i];
+            const ElementDynamic& elem_dyn = world.elements_dynamic[i];
+            const Material& mat = world.materials[elem_static.material_idx];
+            
+            // Start with external flow
+            val_t total_flux = mat.external_flow;
+            
+            // Add flux from all connected elements
+            for (idx_t j = 0; j < elem_static.num_connections; ++j) {
+                const idx_t neighbor_idx = elem_static.connected_idx[j];
+                const ElementDynamic& neighbor_dyn = world.elements_dynamic[neighbor_idx];
+                total_flux += computeFlux(mat, elem_dyn, elem_static.connected_flux[j], neighbor_dyn);
+            }
+            
+            // Update element state
+            ElementDynamic& elem_write = world.elements_dynamic_swap[i];
+            elem_write.current_energy = elem_dyn.current_energy + total_flux;
+            elem_write.total_flux = elem_dyn.total_flux + std::abs(total_flux);
+        }
+        
+        // Swap buffers
+        std::swap(world.elements_dynamic, world.elements_dynamic_swap);
+    }
+}
+
+// Validate simulation results
+bool validateResults(const World& world) {
+    val_t energy_sum = 0.0;
+    val_t flux_sum = 0.0;
+    val_t energy_max = std::numeric_limits<val_t>::lowest();
+    val_t energy_min = std::numeric_limits<val_t>::max();
+    
+    for (const auto& elem : world.elements_dynamic) {
+        energy_sum += elem.current_energy;
+        flux_sum += elem.total_flux;
+        energy_max = std::max(elem.current_energy, energy_max);
+        energy_min = std::min(elem.current_energy, energy_min);
+    }
+    
+    printf("Validation results:\n");
+    printf("  Energy sum: %.12f\n", energy_sum);
+    printf("  Flux sum: %.2f\n", flux_sum);
+    printf("  Energy range: [%.6f, %.6f]\n", energy_min, energy_max);
+    
+    // Check for numerical issues
+    constexpr val_t energy_epsilon = 1e-8;
+    
+    if (!std::isfinite(energy_sum)) {
+        printf("  ERROR: Energy sum is not finite\n");
+        return false;
+    }
+    
+    if (std::abs(energy_sum) > energy_epsilon) {
+        printf("  WARNING: Energy sum diverged from 0 (expected conservation)\n");
+        // Don't fail validation as this can happen with external flows
+    }
+    
+    if (!std::isfinite(flux_sum)) {
+        printf("  ERROR: Flux sum is not finite\n");
+        return false;
+    }
+    
+    if (!std::isfinite(energy_max) || !std::isfinite(energy_min)) {
+        printf("  ERROR: Energy extrema are not finite\n");
+        return false;
+    }
+    
+    printf("  Validation: PASSED\n");
+    return true;
+}
+
+// Compute a simple hash of the results for verification
+uint64_t computeHash(const std::vector<ElementDynamic>& elements) {
+    uint64_t hash = 0;
+    for (size_t i = 0; i < elements.size(); ++i) {
+        // Simple hash combining energy and flux values
+        const uint64_t* e_ptr = reinterpret_cast<const uint64_t*>(&elements[i].current_energy);
+        const uint64_t* f_ptr = reinterpret_cast<const uint64_t*>(&elements[i].total_flux);
+        hash ^= (*e_ptr + i) * 0x9e3779b97f4a7c15ULL;
+        hash ^= (*f_ptr + i) * 0xbf58476d1ce4e5b9ULL;
+    }
+    return hash;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Grid size (NxN elements) (default: 512)\n");
+    printf("  -i <num>     Number of simulation iterations (default: 10)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    int n_elems_root = 512;
+    int n_iters = 10;
+    bool validate = false;
+    bool printResults = false;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            n_elems_root = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            n_iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+    
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    printf("Unstructured Mesh Energy Transfer Benchmark\n");
+    printf("============================================\n");
+    printf("Grid size: %d x %d = %d elements\n", n_elems_root, n_elems_root, n_elems);
+    printf("Iterations: %d\n", n_iters);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    printf("\n");
+    
+    // Build the unstructured mesh
+    printf("Building unstructured mesh...\n");
+    World world;
+    buildSquare2D(world, n_elems_root);
+    
+    // Calculate memory usage
+    const size_t static_mem = world.elements_static.size() * sizeof(ElementStatic);
+    const size_t dynamic_mem = world.elements_dynamic.size() * sizeof(ElementDynamic) * 2;
+    const size_t total_mem = static_mem + dynamic_mem;
+    printf("Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\n",
+           total_mem / (1024.0 * 1024.0),
+           static_mem / (1024.0 * 1024.0),
+           dynamic_mem / (1024.0 * 1024.0));
+    printf("\n");
+    
+    // Run simulation
+    printf("Running simulation...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    runSimulation(world, n_iters);
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    
+    printf("Computation time: %ld ms\n", duration_ms);
+    
+    // Calculate performance metrics
+    const int n_measured_iters = std::max(n_iters - 1, 1);
+    const double time_per_iter = static_cast<double>(duration_ms) / n_measured_iters;
+    const double giga_elems_per_sec = (n_measured_iters * n_elems) / (duration_ms / 1000.0) / 1e9;
+    
+    // Approximate FLOPS: ~22 FLOPS per element per iteration (from reference)
+    const double gflops = giga_elems_per_sec * 22.0;
+    
+    printf("Performance:\n");
+    printf("  Time per iteration: %.4f ms\n", time_per_iter);
+    printf("  Elements/sec: %.4f GigaElements/s\n", giga_elems_per_sec);
+    printf("  Performance: %.4f GFLOPS\n", gflops);
+    
+    // Compute hash for verification
+    const uint64_t hash = computeHash(world.elements_dynamic);
+    printf("  Result hash: %016lX\n", hash);
+    printf("\n");
+    
+    // Print results for external validation
+    if (printResults) {
+        std::vector<double> energyData;
+        energyData.reserve(world.elements_dynamic.size());
+        for (const auto& elem : world.elements_dynamic) {
+            energyData.push_back(elem.current_energy);
+        }
+        print_results(energyData, "ElementEnergy");
+    }
+    
+    // Validation
+    if (validate) {
+        bool valid = validateResults(world);
+        if (!valid) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+cmake_minimum_required(VERSION 3.10)
+project(unstructured_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(unstructured unstructured.cpp)
+
+# Enable optimizations
+target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link math library
+target_link_libraries(unstructured m)
+#pragma once
+
+#include <cstdint>
+
+// FNV-1a hash, 64 bit length
+class hash {
+  public:
+	using digest = uint64_t;
+
+	template <typename T>
+	void add(const T& value) {
+		const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&value);
+		for(size_t i = 0; i < sizeof(T); ++i) {
+			d = (d ^ bytes[i]) * 0x100000001b3ull;
+		}
+	}
+
+	digest get() const { return d; }
+
+  private:
+	digest d = 0xcbf29ce484222325ull;
+};
+#pragma once
+
+#include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+#include "hash.hpp"
+
+// Kahan summation for numerically stable sum
+template <typename T>
+T kahan_sum(const std::vector<T>& data) {
+    T sum = 0.0;
+    T c = 0.0;
+    for (const auto& val : data) {
+        T y = val - c;
+        T t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    return sum;
+}
+
+// Print results for floating-point arrays
+template <typename T>
+void print_results(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute statistics
+    T sum = kahan_sum(data);
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Sum: %.17e\n", static_cast<double>(sum));
+    printf("Min: %.17e\n", static_cast<double>(min_val));
+    printf("Max: %.17e\n", static_cast<double>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %.17e\n", indices[i], static_cast<double>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+// Print results for integer arrays (uses exact hash comparison)
+template <typename T>
+void print_results_int(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Compute min/max
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Min: %lld\n", static_cast<long long>(min_val));
+    printf("Max: %lld\n", static_cast<long long>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %lld\n", indices[i], static_cast<long long>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+exec
+/bin/bash -lc 'for d in /home /home/llmtest /home/llmtest/evals /home/llmtest/evals/20261006-204623 /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1; do if [ -f "$d/AGENTS.md" ]; then cat "$d/AGENTS.md"; fi; done; command -v nvcc; nvidia-smi; cmake --version; cat output.txt' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 68ms:
+/usr/bin/nvcc
+Wed Oct  7 03:33:15 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 560.35.03              Driver Version: 560.35.03      CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3090        Off |   00000000:25:00.0 Off |                  N/A |
+| 30%   30C    P8             28W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 3090        Off |   00000000:41:00.0 Off |                  N/A |
+| 30%   26C    P8             24W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA GeForce RTX 3090        Off |   00000000:81:00.0 Off |                  N/A |
+| 30%   26C    P8             26W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA GeForce RTX 3090        Off |   00000000:E1:00.0 Off |                  N/A |
+| 30%   25C    P8             27W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+cmake version 3.30.2
+
+CMake suite maintained and supported by Kitware (kitware.com/cmake).
+Reading additional input from stdin...
+OpenAI Codex v0.160.1
+--------
+workdir: /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+model: gpt-6.1-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 01a113fe-2e4d-7463-8eb0-e652f228bfe9
+--------
+user
+Parallelize the unstructured benchmark code found in ./unstructured/ with CUDA for GPU parallelism. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the benchmark and build setup, then implement and validate a CUDA version while preserving the executable name and output semantics.
+exec
+/bin/bash -lc "pwd && rg --files -g 'AGENTS.md' -g 'CMakeLists.txt' -g '*'" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 0ms:
+/home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+output.txt
+common/hash.hpp
+common/results_output.hpp
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+
+exec
+/bin/bash -lc 'cat unstructured/unstructured.cpp && cat unstructured/CMakeLists.txt && cat common/hash.hpp && cat common/results_output.hpp' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 0ms:
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+// Types to represent unstructured mesh elements
+using idx_t = uint64_t;
+using val_t = double;
+
+// Maximum number of connections per element (for a 2D grid: 4 neighbors)
+constexpr int MAX_CONNECTIONS = 8;
+
+// Material properties for energy transfer
+struct Material {
+    val_t transfer_coeff;  // Energy transfer coefficient
+    val_t external_flow;   // External energy source/sink
+};
+
+// Static connectivity information for each element
+struct ElementStatic {
+    idx_t material_idx;
+    idx_t num_connections;
+    idx_t connected_idx[MAX_CONNECTIONS];     // Indices of connected elements
+    val_t connected_flux[MAX_CONNECTIONS];    // Flux coefficients for each connection
+};
+
+// Dynamic state for each element
+struct ElementDynamic {
+    val_t current_energy;
+    val_t total_flux;
+};
+
+// World state
+struct World {
+    std::vector<Material> materials;
+    std::vector<ElementStatic> elements_static;
+    std::vector<ElementDynamic> elements_dynamic;
+    std::vector<ElementDynamic> elements_dynamic_swap;
+};
+
+// Material type IDs
+constexpr idx_t DEFAULT_MAT_ID = 0;
+constexpr idx_t INFLOW_MAT_ID = 1;
+constexpr idx_t OUTFLOW_MAT_ID = 2;
+
+// Build a 2D square grid as an unstructured mesh
+// This represents computation on arbitrarily-shaped geometries
+void buildSquare2D(World& world, const int n_elems_root) {
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    // Initialize materials
+    world.materials.emplace_back(Material{0.8, 0.0});    // Default material
+    world.materials.emplace_back(Material{0.8, 0.5});    // Inflow material
+    world.materials.emplace_back(Material{0.8, -0.5});   // Outflow material
+    
+    // Allocate elements
+    world.elements_static.resize(n_elems);
+    world.elements_dynamic.resize(n_elems);
+    world.elements_dynamic_swap.resize(n_elems);
+    
+    // Initialize all elements with default material and zero energy
+    for (int i = 0; i < n_elems; ++i) {
+        world.elements_static[i].material_idx = DEFAULT_MAT_ID;
+        world.elements_static[i].num_connections = 0;
+        world.elements_dynamic[i].current_energy = 0.0;
+        world.elements_dynamic[i].total_flux = 0.0;
+    }
+    
+    // Build connectivity: each element connects to its neighbors in 2D grid
+    for (int x = 0; x < n_elems_root; ++x) {
+        for (int y = 0; y < n_elems_root; ++y) {
+            const int idx = x * n_elems_root + y;
+            ElementStatic& elem = world.elements_static[idx];
+            
+            // Connect to neighbors (up, down, left, right)
+            const int offsets[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            
+            for (int n = 0; n < 4; ++n) {
+                const int nx = x + offsets[n][0];
+                const int ny = y + offsets[n][1];
+                
+                // Check if neighbor is within bounds
+                if (nx >= 0 && nx < n_elems_root && ny >= 0 && ny < n_elems_root) {
+                    const int neighbor_idx = nx * n_elems_root + ny;
+                    elem.connected_idx[elem.num_connections] = neighbor_idx;
+                    elem.connected_flux[elem.num_connections] = 1.0;
+                    elem.num_connections++;
+                }
+            }
+        }
+    }
+    
+    // Set corner elements as inflow/outflow to create interesting dynamics
+    const int last = n_elems_root - 1;
+    world.elements_static[0 * n_elems_root + 0].material_idx = INFLOW_MAT_ID;
+    world.elements_static[0 * n_elems_root + last].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + 0].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + last].material_idx = INFLOW_MAT_ID;
+}
+
+// Compute energy flux between two elements
+inline val_t computeFlux(const Material& mat, const ElementDynamic& this_elem,
+                        val_t connection_flux, const ElementDynamic& other_elem) {
+    return (other_elem.current_energy - this_elem.current_energy) * 
+           mat.transfer_coeff * connection_flux * 0.25;
+}
+
+// Run simulation for n_iters iterations
+void runSimulation(World& world, const int n_iters) {
+    const size_t n_elems = world.elements_static.size();
+    
+    for (int iter = 0; iter < n_iters; ++iter) {
+        // Update all elements
+        for (size_t i = 0; i < n_elems; ++i) {
+            const ElementStatic& elem_static = world.elements_static[i];
+            const ElementDynamic& elem_dyn = world.elements_dynamic[i];
+            const Material& mat = world.materials[elem_static.material_idx];
+            
+            // Start with external flow
+            val_t total_flux = mat.external_flow;
+            
+            // Add flux from all connected elements
+            for (idx_t j = 0; j < elem_static.num_connections; ++j) {
+                const idx_t neighbor_idx = elem_static.connected_idx[j];
+                const ElementDynamic& neighbor_dyn = world.elements_dynamic[neighbor_idx];
+                total_flux += computeFlux(mat, elem_dyn, elem_static.connected_flux[j], neighbor_dyn);
+            }
+            
+            // Update element state
+            ElementDynamic& elem_write = world.elements_dynamic_swap[i];
+            elem_write.current_energy = elem_dyn.current_energy + total_flux;
+            elem_write.total_flux = elem_dyn.total_flux + std::abs(total_flux);
+        }
+        
+        // Swap buffers
+        std::swap(world.elements_dynamic, world.elements_dynamic_swap);
+    }
+}
+
+// Validate simulation results
+bool validateResults(const World& world) {
+    val_t energy_sum = 0.0;
+    val_t flux_sum = 0.0;
+    val_t energy_max = std::numeric_limits<val_t>::lowest();
+    val_t energy_min = std::numeric_limits<val_t>::max();
+    
+    for (const auto& elem : world.elements_dynamic) {
+        energy_sum += elem.current_energy;
+        flux_sum += elem.total_flux;
+        energy_max = std::max(elem.current_energy, energy_max);
+        energy_min = std::min(elem.current_energy, energy_min);
+    }
+    
+    printf("Validation results:\n");
+    printf("  Energy sum: %.12f\n", energy_sum);
+    printf("  Flux sum: %.2f\n", flux_sum);
+    printf("  Energy range: [%.6f, %.6f]\n", energy_min, energy_max);
+    
+    // Check for numerical issues
+    constexpr val_t energy_epsilon = 1e-8;
+    
+    if (!std::isfinite(energy_sum)) {
+        printf("  ERROR: Energy sum is not finite\n");
+        return false;
+    }
+    
+    if (std::abs(energy_sum) > energy_epsilon) {
+        printf("  WARNING: Energy sum diverged from 0 (expected conservation)\n");
+        // Don't fail validation as this can happen with external flows
+    }
+    
+    if (!std::isfinite(flux_sum)) {
+        printf("  ERROR: Flux sum is not finite\n");
+        return false;
+    }
+    
+    if (!std::isfinite(energy_max) || !std::isfinite(energy_min)) {
+        printf("  ERROR: Energy extrema are not finite\n");
+        return false;
+    }
+    
+    printf("  Validation: PASSED\n");
+    return true;
+}
+
+// Compute a simple hash of the results for verification
+uint64_t computeHash(const std::vector<ElementDynamic>& elements) {
+    uint64_t hash = 0;
+    for (size_t i = 0; i < elements.size(); ++i) {
+        // Simple hash combining energy and flux values
+        const uint64_t* e_ptr = reinterpret_cast<const uint64_t*>(&elements[i].current_energy);
+        const uint64_t* f_ptr = reinterpret_cast<const uint64_t*>(&elements[i].total_flux);
+        hash ^= (*e_ptr + i) * 0x9e3779b97f4a7c15ULL;
+        hash ^= (*f_ptr + i) * 0xbf58476d1ce4e5b9ULL;
+    }
+    return hash;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Grid size (NxN elements) (default: 512)\n");
+    printf("  -i <num>     Number of simulation iterations (default: 10)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    int n_elems_root = 512;
+    int n_iters = 10;
+    bool validate = false;
+    bool printResults = false;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            n_elems_root = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            n_iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+    
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    printf("Unstructured Mesh Energy Transfer Benchmark\n");
+    printf("============================================\n");
+    printf("Grid size: %d x %d = %d elements\n", n_elems_root, n_elems_root, n_elems);
+    printf("Iterations: %d\n", n_iters);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    printf("\n");
+    
+    // Build the unstructured mesh
+    printf("Building unstructured mesh...\n");
+    World world;
+    buildSquare2D(world, n_elems_root);
+    
+    // Calculate memory usage
+    const size_t static_mem = world.elements_static.size() * sizeof(ElementStatic);
+    const size_t dynamic_mem = world.elements_dynamic.size() * sizeof(ElementDynamic) * 2;
+    const size_t total_mem = static_mem + dynamic_mem;
+    printf("Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\n",
+           total_mem / (1024.0 * 1024.0),
+           static_mem / (1024.0 * 1024.0),
+           dynamic_mem / (1024.0 * 1024.0));
+    printf("\n");
+    
+    // Run simulation
+    printf("Running simulation...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    runSimulation(world, n_iters);
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    
+    printf("Computation time: %ld ms\n", duration_ms);
+    
+    // Calculate performance metrics
+    const int n_measured_iters = std::max(n_iters - 1, 1);
+    const double time_per_iter = static_cast<double>(duration_ms) / n_measured_iters;
+    const double giga_elems_per_sec = (n_measured_iters * n_elems) / (duration_ms / 1000.0) / 1e9;
+    
+    // Approximate FLOPS: ~22 FLOPS per element per iteration (from reference)
+    const double gflops = giga_elems_per_sec * 22.0;
+    
+    printf("Performance:\n");
+    printf("  Time per iteration: %.4f ms\n", time_per_iter);
+    printf("  Elements/sec: %.4f GigaElements/s\n", giga_elems_per_sec);
+    printf("  Performance: %.4f GFLOPS\n", gflops);
+    
+    // Compute hash for verification
+    const uint64_t hash = computeHash(world.elements_dynamic);
+    printf("  Result hash: %016lX\n", hash);
+    printf("\n");
+    
+    // Print results for external validation
+    if (printResults) {
+        std::vector<double> energyData;
+        energyData.reserve(world.elements_dynamic.size());
+        for (const auto& elem : world.elements_dynamic) {
+            energyData.push_back(elem.current_energy);
+        }
+        print_results(energyData, "ElementEnergy");
+    }
+    
+    // Validation
+    if (validate) {
+        bool valid = validateResults(world);
+        if (!valid) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+cmake_minimum_required(VERSION 3.10)
+project(unstructured_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(unstructured unstructured.cpp)
+
+# Enable optimizations
+target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link math library
+target_link_libraries(unstructured m)
+#pragma once
+
+#include <cstdint>
+
+// FNV-1a hash, 64 bit length
+class hash {
+  public:
+	using digest = uint64_t;
+
+	template <typename T>
+	void add(const T& value) {
+		const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&value);
+		for(size_t i = 0; i < sizeof(T); ++i) {
+			d = (d ^ bytes[i]) * 0x100000001b3ull;
+		}
+	}
+
+	digest get() const { return d; }
+
+  private:
+	digest d = 0xcbf29ce484222325ull;
+};
+#pragma once
+
+#include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+#include "hash.hpp"
+
+// Kahan summation for numerically stable sum
+template <typename T>
+T kahan_sum(const std::vector<T>& data) {
+    T sum = 0.0;
+    T c = 0.0;
+    for (const auto& val : data) {
+        T y = val - c;
+        T t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    return sum;
+}
+
+// Print results for floating-point arrays
+template <typename T>
+void print_results(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute statistics
+    T sum = kahan_sum(data);
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Sum: %.17e\n", static_cast<double>(sum));
+    printf("Min: %.17e\n", static_cast<double>(min_val));
+    printf("Max: %.17e\n", static_cast<double>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %.17e\n", indices[i], static_cast<double>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+// Print results for integer arrays (uses exact hash comparison)
+template <typename T>
+void print_results_int(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Compute min/max
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Min: %lld\n", static_cast<long long>(min_val));
+    printf("Max: %lld\n", static_cast<long long>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %lld\n", indices[i], static_cast<long long>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+exec
+/bin/bash -lc 'for d in /home /home/llmtest /home/llmtest/evals /home/llmtest/evals/20261006-204623 /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1; do if [ -f "$d/AGENTS.md" ]; then cat "$d/AGENTS.md"; fi; done; command -v nvcc; nvidia-smi; cmake --version; cat output.txt' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+
+exec
+/bin/bash -lc 'nvcc --version; command -v compute-sanitizer; command -v nsys; git status --short; rg --files /usr/local/cuda* /opt -g nvcc -g compute-sanitizer -g nsys 2>/dev/null' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 0ms:
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2023 NVIDIA Corporation
+Built on Fri_Jan__6_16:45:21_PST_2023
+Cuda compilation tools, release 12.0, V12.0.140
+Build cuda_12.0.r12.0/compiler.32267302_0
+/usr/bin/compute-sanitizer
+/usr/local/bin/nsys
+fatal: not a git repository (or any parent up to mount point /)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+/usr/local/cuda-12.6/compute-sanitizer/compute-sanitizer
+/usr/local/cuda-12/compute-sanitizer/compute-sanitizer
+/usr/local/cuda/compute-sanitizer/compute-sanitizer
+/usr/local/cuda-12.6/bin/compute-sanitizer
+/usr/local/cuda-12.6/bin/nvcc
+/usr/local/cuda-12.6/bin/nsys
+/usr/local/cuda-12/bin/compute-sanitizer
+/usr/local/cuda-12/bin/nvcc
+/usr/local/cuda-12/bin/nsys
+/opt/nvidia/nsight-compute/2024.3.2/host/target-linux-x64/nsys
+/usr/local/cuda/bin/compute-sanitizer
+/usr/local/cuda/bin/nvcc
+/usr/local/cuda/bin/nsys
+/opt/nvidia/nsight-systems/2024.5.1/target-linux-x64/nsys
+
+codex
+Each iteration reads the previous energy state, so elements can update independently on the GPU. I’ll use contiguous device arrays for connectivity and state, keep the mesh on the GPU across iterations, and preserve the original neighbor order and double-precision arithmetic. CUDA graphs will reduce launch overhead for repeated iterations.
+exec
+/bin/bash -lc 'cat unstructured/unstructured.cpp' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 0ms:
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+// Types to represent unstructured mesh elements
+using idx_t = uint64_t;
+using val_t = double;
+
+// Maximum number of connections per element (for a 2D grid: 4 neighbors)
+constexpr int MAX_CONNECTIONS = 8;
+
+// Material properties for energy transfer
+struct Material {
+    val_t transfer_coeff;  // Energy transfer coefficient
+    val_t external_flow;   // External energy source/sink
+};
+
+// Static connectivity information for each element
+struct ElementStatic {
+    idx_t material_idx;
+    idx_t num_connections;
+    idx_t connected_idx[MAX_CONNECTIONS];     // Indices of connected elements
+    val_t connected_flux[MAX_CONNECTIONS];    // Flux coefficients for each connection
+};
+
+// Dynamic state for each element
+struct ElementDynamic {
+    val_t current_energy;
+    val_t total_flux;
+};
+
+// World state
+struct World {
+    std::vector<Material> materials;
+    std::vector<ElementStatic> elements_static;
+    std::vector<ElementDynamic> elements_dynamic;
+    std::vector<ElementDynamic> elements_dynamic_swap;
+};
+
+// Material type IDs
+constexpr idx_t DEFAULT_MAT_ID = 0;
+constexpr idx_t INFLOW_MAT_ID = 1;
+constexpr idx_t OUTFLOW_MAT_ID = 2;
+
+// Build a 2D square grid as an unstructured mesh
+// This represents computation on arbitrarily-shaped geometries
+void buildSquare2D(World& world, const int n_elems_root) {
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    // Initialize materials
+    world.materials.emplace_back(Material{0.8, 0.0});    // Default material
+    world.materials.emplace_back(Material{0.8, 0.5});    // Inflow material
+    world.materials.emplace_back(Material{0.8, -0.5});   // Outflow material
+    
+    // Allocate elements
+    world.elements_static.resize(n_elems);
+    world.elements_dynamic.resize(n_elems);
+    world.elements_dynamic_swap.resize(n_elems);
+    
+    // Initialize all elements with default material and zero energy
+    for (int i = 0; i < n_elems; ++i) {
+        world.elements_static[i].material_idx = DEFAULT_MAT_ID;
+        world.elements_static[i].num_connections = 0;
+        world.elements_dynamic[i].current_energy = 0.0;
+        world.elements_dynamic[i].total_flux = 0.0;
+    }
+    
+    // Build connectivity: each element connects to its neighbors in 2D grid
+    for (int x = 0; x < n_elems_root; ++x) {
+        for (int y = 0; y < n_elems_root; ++y) {
+            const int idx = x * n_elems_root + y;
+            ElementStatic& elem = world.elements_static[idx];
+            
+            // Connect to neighbors (up, down, left, right)
+            const int offsets[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            
+            for (int n = 0; n < 4; ++n) {
+                const int nx = x + offsets[n][0];
+                const int ny = y + offsets[n][1];
+                
+                // Check if neighbor is within bounds
+                if (nx >= 0 && nx < n_elems_root && ny >= 0 && ny < n_elems_root) {
+                    const int neighbor_idx = nx * n_elems_root + ny;
+                    elem.connected_idx[elem.num_connections] = neighbor_idx;
+                    elem.connected_flux[elem.num_connections] = 1.0;
+                    elem.num_connections++;
+                }
+            }
+        }
+    }
+    
+    // Set corner elements as inflow/outflow to create interesting dynamics
+    const int last = n_elems_root - 1;
+    world.elements_static[0 * n_elems_root + 0].material_idx = INFLOW_MAT_ID;
+    world.elements_static[0 * n_elems_root + last].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + 0].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + last].material_idx = INFLOW_MAT_ID;
+}
+
+// Compute energy flux between two elements
+inline val_t computeFlux(const Material& mat, const ElementDynamic& this_elem,
+                        val_t connection_flux, const ElementDynamic& other_elem) {
+    return (other_elem.current_energy - this_elem.current_energy) * 
+           mat.transfer_coeff * connection_flux * 0.25;
+}
+
+// Run simulation for n_iters iterations
+void runSimulation(World& world, const int n_iters) {
+    const size_t n_elems = world.elements_static.size();
+    
+    for (int iter = 0; iter < n_iters; ++iter) {
+        // Update all elements
+        for (size_t i = 0; i < n_elems; ++i) {
+            const ElementStatic& elem_static = world.elements_static[i];
+            const ElementDynamic& elem_dyn = world.elements_dynamic[i];
+            const Material& mat = world.materials[elem_static.material_idx];
+            
+            // Start with external flow
+            val_t total_flux = mat.external_flow;
+            
+            // Add flux from all connected elements
+            for (idx_t j = 0; j < elem_static.num_connections; ++j) {
+                const idx_t neighbor_idx = elem_static.connected_idx[j];
+                const ElementDynamic& neighbor_dyn = world.elements_dynamic[neighbor_idx];
+                total_flux += computeFlux(mat, elem_dyn, elem_static.connected_flux[j], neighbor_dyn);
+            }
+            
+            // Update element state
+            ElementDynamic& elem_write = world.elements_dynamic_swap[i];
+            elem_write.current_energy = elem_dyn.current_energy + total_flux;
+            elem_write.total_flux = elem_dyn.total_flux + std::abs(total_flux);
+        }
+        
+        // Swap buffers
+        std::swap(world.elements_dynamic, world.elements_dynamic_swap);
+    }
+}
+
+// Validate simulation results
+bool validateResults(const World& world) {
+    val_t energy_sum = 0.0;
+    val_t flux_sum = 0.0;
+    val_t energy_max = std::numeric_limits<val_t>::lowest();
+    val_t energy_min = std::numeric_limits<val_t>::max();
+    
+    for (const auto& elem : world.elements_dynamic) {
+        energy_sum += elem.current_energy;
+        flux_sum += elem.total_flux;
+        energy_max = std::max(elem.current_energy, energy_max);
+        energy_min = std::min(elem.current_energy, energy_min);
+    }
+    
+    printf("Validation results:\n");
+    printf("  Energy sum: %.12f\n", energy_sum);
+    printf("  Flux sum: %.2f\n", flux_sum);
+    printf("  Energy range: [%.6f, %.6f]\n", energy_min, energy_max);
+    
+    // Check for numerical issues
+    constexpr val_t energy_epsilon = 1e-8;
+    
+    if (!std::isfinite(energy_sum)) {
+        printf("  ERROR: Energy sum is not finite\n");
+        return false;
+    }
+    
+    if (std::abs(energy_sum) > energy_epsilon) {
+        printf("  WARNING: Energy sum diverged from 0 (expected conservation)\n");
+        // Don't fail validation as this can happen with external flows
+    }
+    
+    if (!std::isfinite(flux_sum)) {
+        printf("  ERROR: Flux sum is not finite\n");
+        return false;
+    }
+    
+    if (!std::isfinite(energy_max) || !std::isfinite(energy_min)) {
+        printf("  ERROR: Energy extrema are not finite\n");
+        return false;
+    }
+    
+    printf("  Validation: PASSED\n");
+    return true;
+}
+
+// Compute a simple hash of the results for verification
+uint64_t computeHash(const std::vector<ElementDynamic>& elements) {
+    uint64_t hash = 0;
+    for (size_t i = 0; i < elements.size(); ++i) {
+        // Simple hash combining energy and flux values
+        const uint64_t* e_ptr = reinterpret_cast<const uint64_t*>(&elements[i].current_energy);
+        const uint64_t* f_ptr = reinterpret_cast<const uint64_t*>(&elements[i].total_flux);
+        hash ^= (*e_ptr + i) * 0x9e3779b97f4a7c15ULL;
+        hash ^= (*f_ptr + i) * 0xbf58476d1ce4e5b9ULL;
+    }
+    return hash;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Grid size (NxN elements) (default: 512)\n");
+    printf("  -i <num>     Number of simulation iterations (default: 10)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    int n_elems_root = 512;
+    int n_iters = 10;
+    bool validate = false;
+    bool printResults = false;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            n_elems_root = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            n_iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+    
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    printf("Unstructured Mesh Energy Transfer Benchmark\n");
+    printf("============================================\n");
+    printf("Grid size: %d x %d = %d elements\n", n_elems_root, n_elems_root, n_elems);
+    printf("Iterations: %d\n", n_iters);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    printf("\n");
+    
+    // Build the unstructured mesh
+    printf("Building unstructured mesh...\n");
+    World world;
+    buildSquare2D(world, n_elems_root);
+    
+    // Calculate memory usage
+    const size_t static_mem = world.elements_static.size() * sizeof(ElementStatic);
+    const size_t dynamic_mem = world.elements_dynamic.size() * sizeof(ElementDynamic) * 2;
+    const size_t total_mem = static_mem + dynamic_mem;
+    printf("Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\n",
+           total_mem / (1024.0 * 1024.0),
+           static_mem / (1024.0 * 1024.0),
+           dynamic_mem / (1024.0 * 1024.0));
+    printf("\n");
+    
+    // Run simulation
+    printf("Running simulation...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    runSimulation(world, n_iters);
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    
+    printf("Computation time: %ld ms\n", duration_ms);
+    
+    // Calculate performance metrics
+    const int n_measured_iters = std::max(n_iters - 1, 1);
+    const double time_per_iter = static_cast<double>(duration_ms) / n_measured_iters;
+    const double giga_elems_per_sec = (n_measured_iters * n_elems) / (duration_ms / 1000.0) / 1e9;
+    
+    // Approximate FLOPS: ~22 FLOPS per element per iteration (from reference)
+    const double gflops = giga_elems_per_sec * 22.0;
+    
+    printf("Performance:\n");
+    printf("  Time per iteration: %.4f ms\n", time_per_iter);
+    printf("  Elements/sec: %.4f GigaElements/s\n", giga_elems_per_sec);
+    printf("  Performance: %.4f GFLOPS\n", gflops);
+    
+    // Compute hash for verification
+    const uint64_t hash = computeHash(world.elements_dynamic);
+    printf("  Result hash: %016lX\n", hash);
+    printf("\n");
+    
+    // Print results for external validation
+    if (printResults) {
+        std::vector<double> energyData;
+        energyData.reserve(world.elements_dynamic.size());
+        for (const auto& elem : world.elements_dynamic) {
+            energyData.push_back(elem.current_energy);
+        }
+        print_results(energyData, "ElementEnergy");
+    }
+    
+    // Validation
+    if (validate) {
+        bool valid = validateResults(world);
+        if (!valid) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+exec
+/bin/bash -lc 'cat unstructured/CMakeLists.txt' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 0ms:
+cmake_minimum_required(VERSION 3.10)
+project(unstructured_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(unstructured unstructured.cpp)
+
+# Enable optimizations
+target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link math library
+target_link_libraries(unstructured m)
+
+exec
+/bin/bash -lc 'g++ -O3 -march=native -Wall -Wextra -std=c++20 unstructured/unstructured.cpp -o /tmp/unstructured-cpu-baseline && /tmp/unstructured-cpu-baseline -n 5 -i 11 -v -r' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 2410ms:
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 5 x 5 = 25 elements
+Iterations: 11
+Validation: enabled
+
+Building unstructured mesh...
+Memory usage: 0.00 MB (static: 0.00 MB, dynamic: 0.00 MB)
+
+Running simulation...
+Computation time: 0 ms
+Performance:
+  Time per iteration: 0.0000 ms
+  Elements/sec: inf GigaElements/s
+  Performance: inf GFLOPS
+  Result hash: A0654DFD28BDDFF8
+
+=== RESULTS ===
+Name: ElementEnergy
+Elements: 25
+Sum: 0.00000000000000000e+00
+Min: -1.80674452479999981e+00
+Max: 1.80674452479999981e+00
+Sample[0]: 1.80674452479999981e+00
+Sample[6]: 3.11038464000000014e-01
+Sample[12]: 0.00000000000000000e+00
+Sample[18]: 3.11038464000000014e-01
+Sample[24]: 1.80674452479999981e+00
+Hash: e5c61720bdf889e5
+=== END RESULTS ===
+Validation results:
+  Energy sum: 0.000000000000
+  Flux sum: 13.77
+  Energy range: [-1.806745, 1.806745]
+  Validation: PASSED
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+from pathlib import Path
+p = Path('unstructured/unstructured.cpp')
+s = p.read_text()
+start = s.index('// Types to represent')
+end = s.index('// Validate simulation results')
+s = s[:start] + r'''// Connectivity is stored slot-major (ELL layout), so neighboring CUDA threads
+// read consecutive indices and coefficients even for an unstructured mesh.
+using idx_t = uint32_t;
+using val_t = double;
+constexpr int GRID_CONNECTIONS = 4;
+constexpr int BLOCK_SIZE = 256;
+constexpr int GRAPH_ITERATIONS = 64;
+
+struct Material {
+    val_t transfer_coeff;
+    val_t external_flow;
+};
+
+constexpr uint8_t DEFAULT_MAT_ID = 0;
+constexpr uint8_t INFLOW_MAT_ID = 1;
+constexpr uint8_t OUTFLOW_MAT_ID = 2;
+
+void checkCuda(cudaError_t status, const char* operation) {
+    if (status "'!= cudaSuccess) {
+        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+    }
+}
+#define CUDA_CHECK(operation) checkCuda((operation), #operation)
+
+struct World {
+    size_t n_elems = 0;
+    size_t pitch = 0;
+    size_t static_mem = 0;
+    size_t dynamic_mem = 0;
+    int blocks = 0;
+    int graph_iters = 0;
+    cudaStream_t stream = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable_graph = nullptr;
+    void* device_memory = nullptr;
+    Material* materials = nullptr;
+    uint8_t* material_idx = nullptr;
+    uint8_t* num_connections = nullptr;
+    idx_t* connected_idx = nullptr;
+    val_t* connected_flux = nullptr;
+    val_t* energy[2] = {nullptr, nullptr};
+    val_t* total_flux = nullptr;
+    const val_t* final_energy = nullptr;
+    std::vector<val_t> host_energy;
+    std::vector<val_t> host_flux;
+
+    World() = default;
+    World(const World&) = delete;
+    World& operator=(const World&) = delete;
+
+    ~World() {
+        // Also release partially constructed worlds after a CUDA error.
+        if (stream) cudaStreamSynchronize(stream);
+        if (executable_graph) cudaGraphExecDestroy(executable_graph);
+        if (graph) cudaGraphDestroy(graph);
+        if (device_memory) cudaFree(device_memory);
+        if (stream) cudaStreamDestroy(stream);
+    }
+};
+
+__global__ void initializeMesh(idx_t n_elems, int root, size_t pitch,
+                               Material* materials, uint8_t* material_idx,
+                               uint8_t* num_connections, idx_t* connected_idx,
+                               val_t* connected_flux, val_t* energy,
+                               val_t* total_flux) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        materials[DEFAULT_MAT_ID] = Material{0.8, 0.0};
+        materials[INFLOW_MAT_ID] = Material{0.8, 0.5};
+        materials[OUTFLOW_MAT_ID] = Material{0.8, -0.5};
+    }
+    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+         i < n_elems; i += static_cast<size_t>(blockDim.x) * gridDim.x) {
+        const int x = static_cast<int>(i / root);
+        const int y = static_cast<int>(i % root);
+        uint8_t count = 0;
+        // Preserve the original +x, -x, +y, -y connection order.
+        if (x + 1 < root) {
+            connected_idx[count * pitch + i] = static_cast<idx_t>(i + root);
+            connected_flux[count++ * pitch + i] = 1.0;
+        }
+        if (x > 0) {
+            connected_idx[count * pitch + i] = static_cast<idx_t>(i - root);
+            connected_flux[count++ * pitch + i] = 1.0;
+        }
+        if (y + 1 < root) {
+            connected_idx[count * pitch + i] = static_cast<idx_t>(i + 1);
+            connected_flux[count++ * pitch + i] = 1.0;
+        }
+        if (y > 0) {
+            connected_idx[count * pitch + i] = static_cast<idx_t>(i - 1);
+            connected_flux[count++ * pitch + i] = 1.0;
+        }
+        num_connections[i] = count;
+        uint8_t material = DEFAULT_MAT_ID;
+        // Ordered assignments also preserve the overlapping corners for root=1.
+        if (i == 0) material = INFLOW_MAT_ID;
+        if (i == static_cast<size_t>(root - 1)) material = OUTFLOW_MAT_ID;
+        if (i == static_cast<size_t>(root - 1) * root) material = OUTFLOW_MAT_ID;
+        if (i == static_cast<size_t>(n_elems - 1)) material = INFLOW_MAT_ID;
+        material_idx[i] = material;
+        energy[i] = 0.0;
+        total_flux[i] = 0.0;
+    }
+}
+
+__global__ void updateElements(idx_t n_elems, size_t pitch,
+                               const Material* __restrict__ materials,
+                               const uint8_t* __restrict__ material_idx,
+                               const uint8_t* __restrict__ num_connections,
+                               const idx_t* __restrict__ connected_idx,
+                               const val_t* __restrict__ connected_flux,
+                               const val_t* __restrict__ energy,
+                               val_t* __restrict__ next_energy,
+                               val_t* __restrict__ total_flux) {
+    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+         i < n_elems; i += static_cast<size_t>(blockDim.x) * gridDim.x) {
+        const val_t current = energy[i];
+        const Material mat = materials[material_idx[i]];
+        val_t flux = mat.external_flow;
+        const int count = num_connections[i];
+        #pragma unroll
+        for (int j = 0; j < GRID_CONNECTIONS; ++j) {
+            if (j < count) {
+                const size_t slot = j * pitch + i;
+                flux += (energy[connected_idx[slot]] - current) *
+                        mat.transfer_coeff * connected_flux[slot] * 0.25;
+            }
+        }
+        next_energy[i] = current + flux;
+        // No neighbor reads accumulated flux, so it needs only one buffer.
+        total_flux[i] += fabs(flux);
+    }
+}
+
+void launchUpdate(World& world, const val_t* energy, val_t* next_energy) {
+    updateElements<<<world.blocks, BLOCK_SIZE, 0, world.stream>>>(
+        static_cast<idx_t>(world.n_elems), world.pitch, world.materials,
+        world.material_idx, world.num_connections, world.connected_idx,
+        world.connected_flux, energy, next_energy, world.total_flux);
+}
+
+// Build the original square mesh directly on the GPU, without a host copy of
+// its connectivity or a serial preprocessing pass.
+void buildSquare2D(World& world, const int n_elems_root) {
+    world.n_elems = static_cast<size_t>(n_elems_root) * n_elems_root;
+    world.pitch = (world.n_elems + 31) & ~size_t{31};
+    world.static_mem = 3 * sizeof(Material) + world.pitch *
+        (GRID_CONNECTIONS * (sizeof(idx_t) + sizeof(val_t)) + 2 * sizeof(uint8_t));
+    world.dynamic_mem = 3 * world.pitch * sizeof(val_t);
+    CUDA_CHECK(cudaStreamCreateWithFlags(&world.stream, cudaStreamNonBlocking));
+    int device = 0;
+    cudaDeviceProp properties{};
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+    world.blocks = static_cast<int>(std::min(
+        (world.n_elems + BLOCK_SIZE - 1) / BLOCK_SIZE,
+        static_cast<size_t>(properties.multiProcessorCount) * 32));
+    CUDA_CHECK(cudaMalloc(&world.device_memory, world.static_mem + world.dynamic_mem));
+    auto* cursor = static_cast<unsigned char*>(world.device_memory);
+    world.materials = reinterpret_cast<Material*>(cursor);
+    cursor += 3 * sizeof(Material);
+    for (auto& energy : world.energy) {
+        energy = reinterpret_cast<val_t*>(cursor);
+        cursor += world.pitch * sizeof(val_t);
+    }
+    world.total_flux = reinterpret_cast<val_t*>(cursor);
+    cursor += world.pitch * sizeof(val_t);
+    world.connected_flux = reinterpret_cast<val_t*>(cursor);
+    cursor += GRID_CONNECTIONS * world.pitch * sizeof(val_t);
+    world.connected_idx = reinterpret_cast<idx_t*>(cursor);
+    cursor += GRID_CONNECTIONS * world.pitch * sizeof(idx_t);
+    world.material_idx = cursor;
+    cursor += world.pitch;
+    world.num_connections = cursor;
+    world.final_energy = world.energy[0];
+    initializeMesh<<<world.blocks, BLOCK_SIZE, 0, world.stream>>>(
+        static_cast<idx_t>(world.n_elems), n_elems_root, world.pitch,
+        world.materials, world.material_idx, world.num_connections,
+        world.connected_idx, world.connected_flux, world.energy[0], world.total_flux);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(world.stream));
+}
+
+void prepareSimulation(World& world, int n_iters) {
+    world.graph_iters = std::min(std::max(n_iters, 0), GRAPH_ITERATIONS);
+    if (world.graph_iters == 0) return;
+    // An even batch ends in the same energy buffer it starts in, so the graph
+    // can be replayed without changing kernel arguments. Capture also provides
+    // the global dependency between consecutive Jacobi iterations.
+    CUDA_CHECK(cudaStreamBeginCapture(world.stream, cudaStreamCaptureModeThreadLocal));
+    for (int iter = 0; iter < world.graph_iters; ++iter) {
+        launchUpdate(world, world.energy[iter & 1], world.energy[(iter + 1) & 1]);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamEndCapture(world.stream, &world.graph));
+    CUDA_CHECK(cudaGraphInstantiate(&world.executable_graph, world.graph, nullptr, nullptr, 0));
+    CUDA_CHECK(cudaGraphUpload(world.executable_graph, world.stream));
+    CUDA_CHECK(cudaStreamSynchronize(world.stream));
+}
+
+void runSimulation(World& world, const int n_iters) {
+    if (world.graph_iters == 0) return;
+    val_t* energy = world.energy[0];
+    val_t* next_energy = world.energy[1];
+    const int batches = n_iters / world.graph_iters;
+    for (int batch = 0; batch < batches; ++batch) {
+        CUDA_CHECK(cudaGraphLaunch(world.executable_graph, world.stream));
+    }
+    // Odd-sized graphs are used only when the entire run fits in one batch.
+    if (world.graph_iters & 1) std::swap(energy, next_energy);
+    for (int iter = 0; iter < n_iters % world.graph_iters; ++iter) {
+        launchUpdate(world, energy, next_energy);
+        std::swap(energy, next_energy);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(world.stream));
+    world.final_energy = energy;
+}
+
+void downloadResults(World& world) {
+    world.host_energy.resize(world.n_elems);
+    world.host_flux.resize(world.n_elems);
+    CUDA_CHECK(cudaMemcpyAsync(world.host_energy.data(), world.final_energy,
+                               world.n_elems * sizeof(val_t), cudaMemcpyDeviceToHost,
+                               world.stream));
+    CUDA_CHECK(cudaMemcpyAsync(world.host_flux.data(), world.total_flux,
+                               world.n_elems * sizeof(val_t), cudaMemcpyDeviceToHost,
+                               world.stream));
+    CUDA_CHECK(cudaStreamSynchronize(world.stream));
+}
+
+'"''' + s[end:]
+s = s.replace('#include <vector>', '#include <vector>\\n#include <stdexcept>\\n#include <string>\\n\\n#include <cuda_runtime.h>')
+s = s.replace('    for (const auto& elem : world.elements_dynamic) {\\n        energy_sum += elem.current_energy;\\n        flux_sum += elem.total_flux;\\n        energy_max = std::max(elem.current_energy, energy_max);\\n        energy_min = std::min(elem.current_energy, energy_min);\\n    }', '    for (size_t i = 0; i < world.n_elems; ++i) {\\n        energy_sum += world.host_energy[i];\\n        flux_sum += world.host_flux[i];\\n        energy_max = std::max(world.host_energy[i], energy_max);\\n        energy_min = std::min(world.host_energy[i], energy_min);\\n    }')
+a = s.index('uint64_t computeHash(')
+b = s.index('void printUsage(', a)
+s = s[:a] + '''uint64_t computeHash(const World& world) {
+    uint64_t hash = 0;
+    for (size_t i = 0; i < world.n_elems; ++i) {
+        uint64_t energy_bits, flux_bits;
+        // memcpy preserves the bitwise hash without violating strict aliasing.
+        std::memcpy(&energy_bits, &world.host_energy[i], sizeof(energy_bits));
+        std::memcpy(&flux_bits, &world.host_flux[i], sizeof(flux_bits));
+        hash "'^= (energy_bits + i) * 0x9e3779b97f4a7c15ULL;
+        hash ''^= (flux_bits + i) * 0xbf58476d1ce4e5b9ULL;
+    }
+    return hash;
+}
+
+'"''' + s[b:]
+s = s.replace('    const int n_elems = n_elems_root * n_elems_root;', '''    if (n_elems_root <= 0 ||
+        static_cast<uint64_t>(n_elems_root) * n_elems_root >
+            static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        fprintf(stderr, \"Grid size must be positive and NxN must fit in a signed int.\\\\n\");
+        return 1;
+    }
+    const int n_elems = n_elems_root * n_elems_root;''')
+s = s.replace('    // Build the unstructured mesh', '    try {\\n    // Build the unstructured mesh')
+s = s.replace('    const size_t static_mem = world.elements_static.size() * sizeof(ElementStatic);\\n    const size_t dynamic_mem = world.elements_dynamic.size() * sizeof(ElementDynamic) * 2;', '    const size_t static_mem = world.static_mem;\\n    const size_t dynamic_mem = world.dynamic_mem;')
+s = s.replace('    // Run simulation\\n', '    prepareSimulation(world, n_iters);\\n\\n    // Run simulation\\n')
+s = s.replace('    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();\\n    \\n    printf(\"Computation time: %ld ms\\\\n\", duration_ms);', '    const double duration_ms = std::chrono::duration<double, std::milli>(end - start).count();\\n    \\n    printf(\"Computation time: %.3f ms\\\\n\", duration_ms);')
+s = s.replace('    const int n_measured_iters = std::max(n_iters - 1, 1);\\n    const double time_per_iter = static_cast<double>(duration_ms) / n_measured_iters;\\n    const double giga_elems_per_sec = (n_measured_iters * n_elems) / (duration_ms / 1000.0) / 1e9;', '    const int n_measured_iters = std::max(n_iters, 0);\\n    const double time_per_iter = duration_ms / std::max(n_measured_iters, 1);\\n    const double giga_elems_per_sec = duration_ms > 0.0 ?\\n        (static_cast<double>(n_measured_iters) * n_elems) / (duration_ms * 1e6) : 0.0;')
+s = s.replace('    const uint64_t hash = computeHash(world.elements_dynamic);', '    downloadResults(world);\\n    const uint64_t hash = computeHash(world);')
+a = s.index('        std::vector<double> energyData;')
+b = s.index('    }', a)
+s = s[:a] + '        print_results(world.host_energy, \"ElementEnergy\");\\n' + s[b:]
+# Remove the now-unneeded loop tail from the old results-conversion block.
+s = s.replace('    }\\n        print_results(energyData, \"ElementEnergy\");\\n    }', '    }')
+s = s.replace('    return 0;\\n}', '    return 0;\\n    } catch (const std::exception& error) {\\n        fprintf(stderr, \"ERROR: %s\\\\n\", error.what());\\n        return 1;\\n    }\\n}')
+p.write_text(s)
+Path('unstructured/CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.24)
+
+# Optimize for installed GPUs unless the caller selects deployment architectures.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
+project(unstructured_benchmark LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# Keep the existing source filename and executable name.
+set_source_files_properties(unstructured.cpp PROPERTIES LANGUAGE CUDA)
+add_executable(unstructured unstructured.cpp)
+
+# Preserve the reference arithmetic order; fast math and FMA contraction can
+# change the bitwise result hashes even when values are numerically close.
+target_compile_options(unstructured PRIVATE
+    "'$<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;-Xcompiler=-O3,-march=native,-Wall,-Wextra>
+    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>)
+target_link_libraries(unstructured PRIVATE m)
+'"''')
+PY
+cmake -S unstructured -B /tmp/unstructured-cuda-build -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/unstructured-cuda-build -j 4" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+exec
+/bin/bash -lc "sed -n '280,480p' unstructured/unstructured.cpp; objdump -d /tmp/unstructured-cpu-baseline | rg -m 12 'vfmadd|vfmsub'; cat /tmp/unstructured-cuda-build/CMakeFiles/unstructured.dir/flags.make" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 0ms:
+    if (!std::isfinite(flux_sum)) {
+        printf("  ERROR: Flux sum is not finite\n");
+        return false;
+    }
+    
+    if (!std::isfinite(energy_max) || !std::isfinite(energy_min)) {
+        printf("  ERROR: Energy extrema are not finite\n");
+        return false;
+    }
+    
+    printf("  Validation: PASSED\n");
+    return true;
+}
+
+// Compute a simple hash of the results for verification
+uint64_t computeHash(const World& world) {
+    uint64_t hash = 0;
+    for (size_t i = 0; i < world.n_elems; ++i) {
+        uint64_t energy_bits, flux_bits;
+        // memcpy preserves the bitwise hash without violating strict aliasing.
+        std::memcpy(&energy_bits, &world.host_energy[i], sizeof(energy_bits));
+        std::memcpy(&flux_bits, &world.host_flux[i], sizeof(flux_bits));
+        hash ^= (energy_bits + i) * 0x9e3779b97f4a7c15ULL;
+        hash ^= (flux_bits + i) * 0xbf58476d1ce4e5b9ULL;
+    }
+    return hash;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Grid size (NxN elements) (default: 512)\n");
+    printf("  -i <num>     Number of simulation iterations (default: 10)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    int n_elems_root = 512;
+    int n_iters = 10;
+    bool validate = false;
+    bool printResults = false;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            n_elems_root = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            n_iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+    
+    if (n_elems_root <= 0 ||
+        static_cast<uint64_t>(n_elems_root) * n_elems_root >
+            static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        fprintf(stderr, "Grid size must be positive and NxN must fit in a signed int.\n");
+        return 1;
+    }
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    printf("Unstructured Mesh Energy Transfer Benchmark\n");
+    printf("============================================\n");
+    printf("Grid size: %d x %d = %d elements\n", n_elems_root, n_elems_root, n_elems);
+    printf("Iterations: %d\n", n_iters);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    printf("\n");
+    
+    try {
+    // Build the unstructured mesh
+    printf("Building unstructured mesh...\n");
+    World world;
+    buildSquare2D(world, n_elems_root);
+    
+    // Calculate memory usage
+    const size_t static_mem = world.static_mem;
+    const size_t dynamic_mem = world.dynamic_mem;
+    const size_t total_mem = static_mem + dynamic_mem;
+    printf("Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\n",
+           total_mem / (1024.0 * 1024.0),
+           static_mem / (1024.0 * 1024.0),
+           dynamic_mem / (1024.0 * 1024.0));
+    printf("\n");
+    
+    prepareSimulation(world, n_iters);
+
+    // Run simulation
+    printf("Running simulation...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    runSimulation(world, n_iters);
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    const double duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    
+    printf("Computation time: %.3f ms\n", duration_ms);
+    
+    // Calculate performance metrics
+    const int n_measured_iters = std::max(n_iters, 0);
+    const double time_per_iter = duration_ms / std::max(n_measured_iters, 1);
+    const double giga_elems_per_sec = duration_ms > 0.0 ?
+        (static_cast<double>(n_measured_iters) * n_elems) / (duration_ms * 1e6) : 0.0;
+    
+    // Approximate FLOPS: ~22 FLOPS per element per iteration (from reference)
+    const double gflops = giga_elems_per_sec * 22.0;
+    
+    printf("Performance:\n");
+    printf("  Time per iteration: %.4f ms\n", time_per_iter);
+    printf("  Elements/sec: %.4f GigaElements/s\n", giga_elems_per_sec);
+    printf("  Performance: %.4f GFLOPS\n", gflops);
+    
+    // Compute hash for verification
+    downloadResults(world);
+    const uint64_t hash = computeHash(world);
+    printf("  Result hash: %016lX\n", hash);
+    printf("\n");
+    
+    // Print results for external validation
+    if (printResults) {
+        print_results(world.host_energy, "ElementEnergy");
+    }
+    
+    // Validation
+    if (validate) {
+        bool valid = validateResults(world);
+        if (!valid) {
+            return 1;
+        }
+    }
+    
+    return 0;
+    } catch (const std::exception& error) {
+        fprintf(stderr, "ERROR: %s\n", error.what());
+        return 1;
+    }
+}
+    2ecb:	c4 62 f1 b9 e2       	vfmadd231sd %xmm2,%xmm1,%xmm12
+# CMAKE generated file: DO NOT EDIT!
+# Generated by "Unix Makefiles" Generator, CMake Version 3.30
+
+# compile CUDA with /usr/bin/nvcc
+CUDA_DEFINES = 
+
+CUDA_INCLUDES = 
+
+CUDA_FLAGS = -O3 -DNDEBUG -std=c++17 -arch=native -O3 --fmad=false -Xcompiler=-O3,-march=native,-Wall,-Wextra
+
+
+ succeeded in 18675ms:
+-- The CXX compiler identification is GNU 13.2.0
+-- The CUDA compiler identification is NVIDIA 12.0.140
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Configuring done (13.1s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/unstructured-cuda-build
+[ 50%] Building CUDA object CMakeFiles/unstructured.dir/unstructured.cpp.o
+[100%] Linking CUDA executable unstructured
+[100%] Built target unstructured
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+import subprocess,re
+cpu='/tmp/unstructured-cpu-baseline'
+gpu='/tmp/unstructured-cuda-build/unstructured'
+cases=[(1,0),(1,11),(2,1),(2,65),(3,11),(5,11),(7,64),(17,65),(33,129),(127,131),(256,100),(512,10),(1024,65)]
+for n,it in cases:
+    args=['-n',str(n),'-i',str(it),'-v','-r']
+    a=subprocess.check_output([cpu,*args],text=True)
+    b=subprocess.check_output([gpu,*args],text=True)
+    ha=re.search(r'Result hash: (\\w+)',a).group(1)
+    hb=re.search(r'Result hash: (\\w+)',b).group(1)
+    ra=a[a.index('=== RESULTS ==='):]
+    rb=b[b.index('=== RESULTS ==='):]
+    print(f'n={n} iterations={it}: '+('EXACT MATCH' if ha==hb and ra==rb else f'MISMATCH CPU={ha} GPU={hb}'))
+    if ra"'!=rb:
+        import difflib
+        print('"''.join(difflib.unified_diff(ra.splitlines(True),rb.splitlines(True))))
+PY" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+exec
+/bin/bash -lc "objdump -d --demangle /tmp/unstructured-cpu-baseline | sed -n '/<runSimulation(World&, int)>:/,/"'^$/p'"' | tail -n 100; /tmp/unstructured-cuda-build/unstructured -n 512 -i 100 -v -r" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 2847ms:
+    2dec:	c5 f9 16 04 0a       	vmovhpd (%rdx,%rcx,1),%xmm0,%xmm0
+    2df1:	c4 21 29 16 14 0a    	vmovhpd (%rdx,%r9,1),%xmm10,%xmm10
+    2df7:	c4 c3 7d 18 c2 01    	vinsertf128 $0x1,%xmm10,%ymm0,%ymm0
+    2dfd:	c4 c1 7d 5c c1       	vsubpd %ymm9,%ymm0,%ymm0
+    2e02:	c4 c1 7d 59 c0       	vmulpd %ymm8,%ymm0,%ymm0
+    2e07:	c5 fd 59 40 70       	vmulpd 0x70(%rax),%ymm0,%ymm0
+    2e0c:	c5 fd 59 c4          	vmulpd %ymm4,%ymm0,%ymm0
+    2e10:	c4 c1 7b 58 cc       	vaddsd %xmm12,%xmm0,%xmm1
+    2e15:	c5 79 15 c8          	vunpckhpd %xmm0,%xmm0,%xmm9
+    2e19:	c4 e3 7d 19 c0 01    	vextractf128 $0x1,%ymm0,%xmm0
+    2e1f:	c4 c1 73 58 c9       	vaddsd %xmm9,%xmm1,%xmm1
+    2e24:	c5 7b 58 e1          	vaddsd %xmm1,%xmm0,%xmm12
+    2e28:	c5 f9 15 c0          	vunpckhpd %xmm0,%xmm0,%xmm0
+    2e2c:	c5 1b 58 e0          	vaddsd %xmm0,%xmm12,%xmm12
+    2e30:	40 f6 c6 03          	test   $0x3,%sil
+    2e34:	0f 84 96 00 00 00    	je     2ed0 <runSimulation(World&, int)+0x2a0>
+    2e3a:	48 89 f1             	mov    %rsi,%rcx
+    2e3d:	48 83 e1 fc          	and    $0xfffffffffffffffc,%rcx
+    2e41:	48 29 ce             	sub    %rcx,%rsi
+    2e44:	48 83 fe 01          	cmp    $0x1,%rsi
+    2e48:	74 62                	je     2eac <runSimulation(World&, int)+0x27c>
+    2e4a:	49 8d 7c 0a 02       	lea    0x2(%r10,%rcx,1),%rdi
+    2e4f:	41 bf 04 00 00 00    	mov    $0x4,%r15d
+    2e55:	c5 7b 12 c6          	vmovddup %xmm6,%xmm8
+    2e59:	48 c1 e7 03          	shl    $0x3,%rdi
+    2e5d:	4c 8d 0c 3b          	lea    (%rbx,%rdi,1),%r9
+    2e61:	c4 42 81 f7 39       	shlx   %r15,(%r9),%r15
+    2e66:	c4 a1 7b 10 04 3a    	vmovsd (%rdx,%r15,1),%xmm0
+    2e6c:	4d 8b 49 08          	mov    0x8(%r9),%r9
+    2e70:	49 c1 e1 04          	shl    $0x4,%r9
+    2e74:	c4 a1 79 16 04 0a    	vmovhpd (%rdx,%r9,1),%xmm0,%xmm0
+    2e7a:	c4 c1 79 5c c0       	vsubpd %xmm8,%xmm0,%xmm0
+    2e7f:	c5 7b 12 c7          	vmovddup %xmm7,%xmm8
+    2e83:	c4 c1 79 59 c0       	vmulpd %xmm8,%xmm0,%xmm0
+    2e88:	c5 f9 59 44 3b 40    	vmulpd 0x40(%rbx,%rdi,1),%xmm0,%xmm0
+    2e8e:	c5 f9 59 c3          	vmulpd %xmm3,%xmm0,%xmm0
+    2e92:	c5 1b 58 e0          	vaddsd %xmm0,%xmm12,%xmm12
+    2e96:	c5 f9 15 c0          	vunpckhpd %xmm0,%xmm0,%xmm0
+    2e9a:	c4 41 7b 58 e4       	vaddsd %xmm12,%xmm0,%xmm12
+    2e9f:	40 f6 c6 01          	test   $0x1,%sil
+    2ea3:	74 2b                	je     2ed0 <runSimulation(World&, int)+0x2a0>
+    2ea5:	48 83 e6 fe          	and    $0xfffffffffffffffe,%rsi
+    2ea9:	48 01 f1             	add    %rsi,%rcx
+    2eac:	bf 04 00 00 00       	mov    $0x4,%edi
+    2eb1:	c4 e2 c1 f7 74 c8 10 	shlx   %rdi,0x10(%rax,%rcx,8),%rsi
+    2eb8:	c5 fb 10 0c 32       	vmovsd (%rdx,%rsi,1),%xmm1
+    2ebd:	c5 f3 5c ce          	vsubsd %xmm6,%xmm1,%xmm1
+    2ec1:	c5 f3 59 cf          	vmulsd %xmm7,%xmm1,%xmm1
+    2ec5:	c5 f3 59 4c c8 50    	vmulsd 0x50(%rax,%rcx,8),%xmm1,%xmm1
+    2ecb:	c4 62 f1 b9 e2       	vfmadd231sd %xmm2,%xmm1,%xmm12
+    2ed0:	c5 9b 58 f6          	vaddsd %xmm6,%xmm12,%xmm6
+    2ed4:	c5 19 54 e5          	vandpd %xmm5,%xmm12,%xmm12
+    2ed8:	c4 21 1b 58 64 02 08 	vaddsd 0x8(%rdx,%r8,1),%xmm12,%xmm12
+    2edf:	49 ff c3             	inc    %r11
+    2ee2:	48 05 90 00 00 00    	add    $0x90,%rax
+    2ee8:	49 83 c2 12          	add    $0x12,%r10
+    2eec:	c4 c1 49 14 f4       	vunpcklpd %xmm12,%xmm6,%xmm6
+    2ef1:	c4 81 79 11 34 04    	vmovupd %xmm6,(%r12,%r8,1)
+    2ef7:	49 83 c0 10          	add    $0x10,%r8
+    2efb:	4d 39 f3             	cmp    %r14,%r11
+    2efe:	0f 82 fc fd ff ff    	jb     2d00 <runSimulation(World&, int)+0xd0>
+    2f04:	8b 4c 24 dc          	mov    -0x24(%rsp),%ecx
+    2f08:	ff c1                	inc    %ecx
+    2f0a:	39 4c 24 d8          	cmp    %ecx,-0x28(%rsp)
+    2f0e:	74 3d                	je     2f4d <runSimulation(World&, int)+0x31d>
+    2f10:	48 8b 44 24 f8       	mov    -0x8(%rsp),%rax
+    2f15:	48 8b 74 24 e8       	mov    -0x18(%rsp),%rsi
+    2f1a:	48 89 44 24 e8       	mov    %rax,-0x18(%rsp)
+    2f1f:	48 8b 44 24 f0       	mov    -0x10(%rsp),%rax
+    2f24:	48 89 74 24 f8       	mov    %rsi,-0x8(%rsp)
+    2f29:	48 8b 74 24 e0       	mov    -0x20(%rsp),%rsi
+    2f2e:	48 89 44 24 e0       	mov    %rax,-0x20(%rsp)
+    2f33:	48 89 d0             	mov    %rdx,%rax
+    2f36:	48 89 74 24 f0       	mov    %rsi,-0x10(%rsp)
+    2f3b:	4c 89 e2             	mov    %r12,%rdx
+    2f3e:	49 89 c4             	mov    %rax,%r12
+    2f41:	e9 8a fd ff ff       	jmp    2cd0 <runSimulation(World&, int)+0xa0>
+    2f46:	31 c9                	xor    %ecx,%ecx
+    2f48:	e9 f4 fe ff ff       	jmp    2e41 <runSimulation(World&, int)+0x211>
+    2f4d:	4c 8b 4c 24 c8       	mov    -0x38(%rsp),%r9
+    2f52:	48 8b 44 24 f0       	mov    -0x10(%rsp),%rax
+    2f57:	48 8b 74 24 e8       	mov    -0x18(%rsp),%rsi
+    2f5c:	48 8b 7c 24 e0       	mov    -0x20(%rsp),%rdi
+    2f61:	49 89 41 50          	mov    %rax,0x50(%r9)
+    2f65:	48 8b 44 24 f8       	mov    -0x8(%rsp),%rax
+    2f6a:	4d 89 61 30          	mov    %r12,0x30(%r9)
+    2f6e:	49 89 51 48          	mov    %rdx,0x48(%r9)
+    2f72:	49 89 79 38          	mov    %rdi,0x38(%r9)
+    2f76:	49 89 71 40          	mov    %rsi,0x40(%r9)
+    2f7a:	49 89 41 58          	mov    %rax,0x58(%r9)
+    2f7e:	c5 f8 77             	vzeroupper
+    2f81:	48 8d 65 d8          	lea    -0x28(%rbp),%rsp
+    2f85:	5b                   	pop    %rbx
+    2f86:	41 5c                	pop    %r12
+    2f88:	41 5d                	pop    %r13
+    2f8a:	41 5e                	pop    %r14
+    2f8c:	41 5f                	pop    %r15
+    2f8e:	5d                   	pop    %rbp
+    2f8f:	c3                   	ret
+
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 512 x 512 = 262144 elements
+Iterations: 100
+Validation: enabled
+
+Building unstructured mesh...
+Memory usage: 18.50 MB (static: 12.50 MB, dynamic: 6.00 MB)
+
+Running simulation...
+Computation time: 3.782 ms
+Performance:
+  Time per iteration: 0.0378 ms
+  Elements/sec: 6.9309 GigaElements/s
+  Performance: 152.4800 GFLOPS
+  Result hash: 868AEDC55BF6F400
+
+=== RESULTS ===
+Name: ElementEnergy
+Elements: 262144
+Sum: 0.00000000000000000e+00
+Min: -3.56433614319549630e+00
+Max: 3.56433614319549630e+00
+Sample[0]: 3.56433614319549630e+00
+Sample[65536]: 0.00000000000000000e+00
+Sample[131072]: 0.00000000000000000e+00
+Sample[196608]: 0.00000000000000000e+00
+Sample[262143]: 3.56433614319549630e+00
+Hash: 47145a7fabbbdb51
+=== END RESULTS ===
+Validation results:
+  Energy sum: 0.000000000000
+  Flux sum: 200.00
+  Energy range: [-3.564336, 3.564336]
+  Validation: PASSED
+
+codex
+The CUDA build succeeds, and the first run passes validation. Mesh construction now runs on the GPU, and the simulation keeps connectivity and state in device memory. I’m comparing both energy and accumulated-flux hashes with the original, including runs that cross CUDA graph batch boundaries.
+ succeeded in 31329ms:
+n=1 iterations=0: EXACT MATCH
+n=1 iterations=11: EXACT MATCH
+n=2 iterations=1: EXACT MATCH
+n=2 iterations=65: EXACT MATCH
+n=3 iterations=11: EXACT MATCH
+n=5 iterations=11: EXACT MATCH
+n=7 iterations=64: EXACT MATCH
+n=17 iterations=65: EXACT MATCH
+n=33 iterations=129: EXACT MATCH
+n=127 iterations=131: EXACT MATCH
+n=256 iterations=100: EXACT MATCH
+n=512 iterations=10: EXACT MATCH
+n=1024 iterations=65: EXACT MATCH
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1/unstructured/unstructured.cpp
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 76b93bafae707ec4aa4712e1fbdf22530e365fa7..4ce42067ebea6351121734edb7f50dc2a683696f
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -21,6 +21,7 @@
+ constexpr int GRID_CONNECTIONS = 4;
+ constexpr int BLOCK_SIZE = 256;
+ constexpr int GRAPH_ITERATIONS = 64;
++constexpr size_t MATERIAL_STORAGE_BYTES = 256;
+ 
+ struct Material {
+     val_t transfer_coeff;
+@@ -160,7 +161,7 @@
+ void buildSquare2D(World& world, const int n_elems_root) {
+     world.n_elems = static_cast<size_t>(n_elems_root) * n_elems_root;
+     world.pitch = (world.n_elems + 31) & ~size_t{31};
+-    world.static_mem = 3 * sizeof(Material) + world.pitch *
++    world.static_mem = MATERIAL_STORAGE_BYTES + world.pitch *
+         (GRID_CONNECTIONS * (sizeof(idx_t) + sizeof(val_t)) + 2 * sizeof(uint8_t));
+     world.dynamic_mem = 3 * world.pitch * sizeof(val_t);
+     CUDA_CHECK(cudaStreamCreateWithFlags(&world.stream, cudaStreamNonBlocking));
+@@ -174,7 +175,8 @@
+     CUDA_CHECK(cudaMalloc(&world.device_memory, world.static_mem + world.dynamic_mem));
+     auto* cursor = static_cast<unsigned char*>(world.device_memory);
+     world.materials = reinterpret_cast<Material*>(cursor);
+-    cursor += 3 * sizeof(Material);
++    // Align all slot and state arrays to full memory-transaction boundaries.
++    cursor += MATERIAL_STORAGE_BYTES;
+     for (auto& energy : world.energy) {
+         energy = reinterpret_cast<val_t*>(cursor);
+         cursor += world.pitch * sizeof(val_t);
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+from pathlib import Path
+p=Path('unstructured/unstructured.cpp')
+s=p.read_text()
+a=s.index('    // Build the unstructured mesh', s.index('    try {'))
+b=s.index('    } catch (const std::exception& error)',a)
+s=s[:a]+''.join('    '+line if line.strip() else '\\n' for line in s[a:b].splitlines(True))+s[b:]
+s='\\n'.join(line.rstrip() for line in s.splitlines())+'\\n'
+p.write_text(s)
+PY
+cmake --build /tmp/unstructured-cuda-build -j 4" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 5618ms:
+[ 50%] Building CUDA object CMakeFiles/unstructured.dir/unstructured.cpp.o
+[100%] Linking CUDA executable unstructured
+[100%] Built target unstructured
+
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 76b93bafae707ec4aa4712e1fbdf22530e365fa7..4ce42067ebea6351121734edb7f50dc2a683696f
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -21,6 +21,7 @@
+ constexpr int GRID_CONNECTIONS = 4;
+ constexpr int BLOCK_SIZE = 256;
+ constexpr int GRAPH_ITERATIONS = 64;
++constexpr size_t MATERIAL_STORAGE_BYTES = 256;
+ 
+ struct Material {
+     val_t transfer_coeff;
+@@ -160,7 +161,7 @@
+ void buildSquare2D(World& world, const int n_elems_root) {
+     world.n_elems = static_cast<size_t>(n_elems_root) * n_elems_root;
+     world.pitch = (world.n_elems + 31) & ~size_t{31};
+-    world.static_mem = 3 * sizeof(Material) + world.pitch *
++    world.static_mem = MATERIAL_STORAGE_BYTES + world.pitch *
+         (GRID_CONNECTIONS * (sizeof(idx_t) + sizeof(val_t)) + 2 * sizeof(uint8_t));
+     world.dynamic_mem = 3 * world.pitch * sizeof(val_t);
+     CUDA_CHECK(cudaStreamCreateWithFlags(&world.stream, cudaStreamNonBlocking));
+@@ -174,7 +175,8 @@
+     CUDA_CHECK(cudaMalloc(&world.device_memory, world.static_mem + world.dynamic_mem));
+     auto* cursor = static_cast<unsigned char*>(world.device_memory);
+     world.materials = reinterpret_cast<Material*>(cursor);
+-    cursor += 3 * sizeof(Material);
++    // Align all slot and state arrays to full memory-transaction boundaries.
++    cursor += MATERIAL_STORAGE_BYTES;
+     for (auto& energy : world.energy) {
+         energy = reinterpret_cast<val_t*>(cursor);
+         cursor += world.pitch * sizeof(val_t);
+
+exec
+/bin/bash -lc 'compute-sanitizer --tool memcheck --error-exitcode 1 /tmp/unstructured-cuda-build/unstructured -n 33 -i 129 -v -r && compute-sanitizer --tool initcheck --error-exitcode 1 /tmp/unstructured-cuda-build/unstructured -n 17 -i 65 -v' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ exited 13 in 0ms:
+========= COMPUTE-SANITIZER
+========= Unable to find injection library libsanitizer-collection.so
+
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 76b93bafae707ec4aa4712e1fbdf22530e365fa7..4ce42067ebea6351121734edb7f50dc2a683696f
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -21,6 +21,7 @@
+ constexpr int GRID_CONNECTIONS = 4;
+ constexpr int BLOCK_SIZE = 256;
+ constexpr int GRAPH_ITERATIONS = 64;
++constexpr size_t MATERIAL_STORAGE_BYTES = 256;
+ 
+ struct Material {
+     val_t transfer_coeff;
+@@ -160,7 +161,7 @@
+ void buildSquare2D(World& world, const int n_elems_root) {
+     world.n_elems = static_cast<size_t>(n_elems_root) * n_elems_root;
+     world.pitch = (world.n_elems + 31) & ~size_t{31};
+-    world.static_mem = 3 * sizeof(Material) + world.pitch *
++    world.static_mem = MATERIAL_STORAGE_BYTES + world.pitch *
+         (GRID_CONNECTIONS * (sizeof(idx_t) + sizeof(val_t)) + 2 * sizeof(uint8_t));
+     world.dynamic_mem = 3 * world.pitch * sizeof(val_t);
+     CUDA_CHECK(cudaStreamCreateWithFlags(&world.stream, cudaStreamNonBlocking));
+@@ -174,7 +175,8 @@
+     CUDA_CHECK(cudaMalloc(&world.device_memory, world.static_mem + world.dynamic_mem));
+     auto* cursor = static_cast<unsigned char*>(world.device_memory);
+     world.materials = reinterpret_cast<Material*>(cursor);
+-    cursor += 3 * sizeof(Material);
++    // Align all slot and state arrays to full memory-transaction boundaries.
++    cursor += MATERIAL_STORAGE_BYTES;
+     for (auto& energy : world.energy) {
+         energy = reinterpret_cast<val_t*>(cursor);
+         cursor += world.pitch * sizeof(val_t);
+
+exec
+/bin/bash -lc '/usr/local/cuda-12.6/compute-sanitizer/compute-sanitizer --tool memcheck --error-exitcode 1 /tmp/unstructured-cuda-build/unstructured -n 33 -i 129 -v -r && /usr/local/cuda-12.6/compute-sanitizer/compute-sanitizer --tool initcheck --error-exitcode 1 /tmp/unstructured-cuda-build/unstructured -n 17 -i 65 -v' in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 76b93bafae707ec4aa4712e1fbdf22530e365fa7..4ce42067ebea6351121734edb7f50dc2a683696f
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -21,6 +21,7 @@
+ constexpr int GRID_CONNECTIONS = 4;
+ constexpr int BLOCK_SIZE = 256;
+ constexpr int GRAPH_ITERATIONS = 64;
++constexpr size_t MATERIAL_STORAGE_BYTES = 256;
+ 
+ struct Material {
+     val_t transfer_coeff;
+@@ -160,7 +161,7 @@
+ void buildSquare2D(World& world, const int n_elems_root) {
+     world.n_elems = static_cast<size_t>(n_elems_root) * n_elems_root;
+     world.pitch = (world.n_elems + 31) & ~size_t{31};
+-    world.static_mem = 3 * sizeof(Material) + world.pitch *
++    world.static_mem = MATERIAL_STORAGE_BYTES + world.pitch *
+         (GRID_CONNECTIONS * (sizeof(idx_t) + sizeof(val_t)) + 2 * sizeof(uint8_t));
+     world.dynamic_mem = 3 * world.pitch * sizeof(val_t);
+     CUDA_CHECK(cudaStreamCreateWithFlags(&world.stream, cudaStreamNonBlocking));
+@@ -174,7 +175,8 @@
+     CUDA_CHECK(cudaMalloc(&world.device_memory, world.static_mem + world.dynamic_mem));
+     auto* cursor = static_cast<unsigned char*>(world.device_memory);
+     world.materials = reinterpret_cast<Material*>(cursor);
+-    cursor += 3 * sizeof(Material);
++    // Align all slot and state arrays to full memory-transaction boundaries.
++    cursor += MATERIAL_STORAGE_BYTES;
+     for (auto& energy : world.energy) {
+         energy = reinterpret_cast<val_t*>(cursor);
+         cursor += world.pitch * sizeof(val_t);
+
+ succeeded in 6026ms:
+========= COMPUTE-SANITIZER
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 33 x 33 = 1089 elements
+Iterations: 129
+Validation: enabled
+
+Building unstructured mesh...
+Memory usage: 0.08 MB (static: 0.05 MB, dynamic: 0.03 MB)
+
+Running simulation...
+Computation time: 8.818 ms
+Performance:
+  Time per iteration: 0.0684 ms
+  Elements/sec: 0.0159 GigaElements/s
+  Performance: 0.3505 GFLOPS
+  Result hash: 174DFD4E497F8D50
+
+=== RESULTS ===
+Name: ElementEnergy
+Elements: 1089
+Sum: 0.00000000000000000e+00
+Min: -3.76497307760100375e+00
+Max: 3.76497307760100375e+00
+Sample[0]: 3.76497307760100375e+00
+Sample[272]: 9.17610466534327096e-02
+Sample[544]: 0.00000000000000000e+00
+Sample[816]: 9.17610466534327235e-02
+Sample[1088]: 3.76497307760100375e+00
+Hash: 9a0cc64c01c49251
+=== END RESULTS ===
+Validation results:
+  Energy sum: 0.000000000000
+  Flux sum: 253.20
+  Energy range: [-3.764973, 3.764973]
+  Validation: PASSED
+========= ERROR SUMMARY: 0 errors
+========= COMPUTE-SANITIZER
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 17 x 17 = 289 elements
+Iterations: 65
+Validation: enabled
+
+Building unstructured mesh...
+Memory usage: 0.02 MB (static: 0.02 MB, dynamic: 0.01 MB)
+
+Running simulation...
+Computation time: 3.491 ms
+Performance:
+  Time per iteration: 0.0537 ms
+  Elements/sec: 0.0054 GigaElements/s
+  Performance: 0.1184 GFLOPS
+  Result hash: E36F2A8C5B2AB8A8
+
+Validation results:
+  Energy sum: -0.000000000000
+  Flux sum: 115.20
+  Energy range: [-3.224207, 3.224207]
+  Validation: PASSED
+========= ERROR SUMMARY: 0 errors
+
+exec
+/bin/bash -lc "sed -n '1,270p' unstructured/unstructured.cpp; sed -n '355,470p' unstructured/unstructured.cpp; cat unstructured/CMakeLists.txt; rg --files -g '"'!output.txt'"'" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 0ms:
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
+#include <stdexcept>
+#include <string>
+
+#include <cuda_runtime.h>
+
+#include "../common/results_output.hpp"
+
+// Connectivity is stored slot-major (ELL layout), so neighboring CUDA threads
+// read consecutive indices and coefficients even for an unstructured mesh.
+using idx_t = uint32_t;
+using val_t = double;
+constexpr int GRID_CONNECTIONS = 4;
+constexpr int BLOCK_SIZE = 256;
+constexpr int GRAPH_ITERATIONS = 64;
+constexpr size_t MATERIAL_STORAGE_BYTES = 256;
+
+struct Material {
+    val_t transfer_coeff;
+    val_t external_flow;
+};
+
+constexpr uint8_t DEFAULT_MAT_ID = 0;
+constexpr uint8_t INFLOW_MAT_ID = 1;
+constexpr uint8_t OUTFLOW_MAT_ID = 2;
+
+void checkCuda(cudaError_t status, const char* operation) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+    }
+}
+#define CUDA_CHECK(operation) checkCuda((operation), #operation)
+
+struct World {
+    size_t n_elems = 0;
+    size_t pitch = 0;
+    size_t static_mem = 0;
+    size_t dynamic_mem = 0;
+    int blocks = 0;
+    int graph_iters = 0;
+    cudaStream_t stream = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable_graph = nullptr;
+    void* device_memory = nullptr;
+    Material* materials = nullptr;
+    uint8_t* material_idx = nullptr;
+    uint8_t* num_connections = nullptr;
+    idx_t* connected_idx = nullptr;
+    val_t* connected_flux = nullptr;
+    val_t* energy[2] = {nullptr, nullptr};
+    val_t* total_flux = nullptr;
+    const val_t* final_energy = nullptr;
+    std::vector<val_t> host_energy;
+    std::vector<val_t> host_flux;
+
+    World() = default;
+    World(const World&) = delete;
+    World& operator=(const World&) = delete;
+
+    ~World() {
+        // Also release partially constructed worlds after a CUDA error.
+        if (stream) cudaStreamSynchronize(stream);
+        if (executable_graph) cudaGraphExecDestroy(executable_graph);
+        if (graph) cudaGraphDestroy(graph);
+        if (device_memory) cudaFree(device_memory);
+        if (stream) cudaStreamDestroy(stream);
+    }
+};
+
+__global__ void initializeMesh(idx_t n_elems, int root, size_t pitch,
+                               Material* materials, uint8_t* material_idx,
+                               uint8_t* num_connections, idx_t* connected_idx,
+                               val_t* connected_flux, val_t* energy,
+                               val_t* total_flux) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        materials[DEFAULT_MAT_ID] = Material{0.8, 0.0};
+        materials[INFLOW_MAT_ID] = Material{0.8, 0.5};
+        materials[OUTFLOW_MAT_ID] = Material{0.8, -0.5};
+    }
+    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+         i < n_elems; i += static_cast<size_t>(blockDim.x) * gridDim.x) {
+        const int x = static_cast<int>(i / root);
+        const int y = static_cast<int>(i % root);
+        uint8_t count = 0;
+        // Preserve the original +x, -x, +y, -y connection order.
+        if (x + 1 < root) {
+            connected_idx[count * pitch + i] = static_cast<idx_t>(i + root);
+            connected_flux[count++ * pitch + i] = 1.0;
+        }
+        if (x > 0) {
+            connected_idx[count * pitch + i] = static_cast<idx_t>(i - root);
+            connected_flux[count++ * pitch + i] = 1.0;
+        }
+        if (y + 1 < root) {
+            connected_idx[count * pitch + i] = static_cast<idx_t>(i + 1);
+            connected_flux[count++ * pitch + i] = 1.0;
+        }
+        if (y > 0) {
+            connected_idx[count * pitch + i] = static_cast<idx_t>(i - 1);
+            connected_flux[count++ * pitch + i] = 1.0;
+        }
+        num_connections[i] = count;
+        uint8_t material = DEFAULT_MAT_ID;
+        // Ordered assignments also preserve the overlapping corners for root=1.
+        if (i == 0) material = INFLOW_MAT_ID;
+        if (i == static_cast<size_t>(root - 1)) material = OUTFLOW_MAT_ID;
+        if (i == static_cast<size_t>(root - 1) * root) material = OUTFLOW_MAT_ID;
+        if (i == static_cast<size_t>(n_elems - 1)) material = INFLOW_MAT_ID;
+        material_idx[i] = material;
+        energy[i] = 0.0;
+        total_flux[i] = 0.0;
+    }
+}
+
+__global__ void updateElements(idx_t n_elems, size_t pitch,
+                               const Material* __restrict__ materials,
+                               const uint8_t* __restrict__ material_idx,
+                               const uint8_t* __restrict__ num_connections,
+                               const idx_t* __restrict__ connected_idx,
+                               const val_t* __restrict__ connected_flux,
+                               const val_t* __restrict__ energy,
+                               val_t* __restrict__ next_energy,
+                               val_t* __restrict__ total_flux) {
+    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+         i < n_elems; i += static_cast<size_t>(blockDim.x) * gridDim.x) {
+        const val_t current = energy[i];
+        const Material mat = materials[material_idx[i]];
+        val_t flux = mat.external_flow;
+        const int count = num_connections[i];
+        #pragma unroll
+        for (int j = 0; j < GRID_CONNECTIONS; ++j) {
+            if (j < count) {
+                const size_t slot = j * pitch + i;
+                flux += (energy[connected_idx[slot]] - current) *
+                        mat.transfer_coeff * connected_flux[slot] * 0.25;
+            }
+        }
+        next_energy[i] = current + flux;
+        // No neighbor reads accumulated flux, so it needs only one buffer.
+        total_flux[i] += fabs(flux);
+    }
+}
+
+void launchUpdate(World& world, const val_t* energy, val_t* next_energy) {
+    updateElements<<<world.blocks, BLOCK_SIZE, 0, world.stream>>>(
+        static_cast<idx_t>(world.n_elems), world.pitch, world.materials,
+        world.material_idx, world.num_connections, world.connected_idx,
+        world.connected_flux, energy, next_energy, world.total_flux);
+}
+
+// Build the original square mesh directly on the GPU, without a host copy of
+// its connectivity or a serial preprocessing pass.
+void buildSquare2D(World& world, const int n_elems_root) {
+    world.n_elems = static_cast<size_t>(n_elems_root) * n_elems_root;
+    world.pitch = (world.n_elems + 31) & ~size_t{31};
+    world.static_mem = MATERIAL_STORAGE_BYTES + world.pitch *
+        (GRID_CONNECTIONS * (sizeof(idx_t) + sizeof(val_t)) + 2 * sizeof(uint8_t));
+    world.dynamic_mem = 3 * world.pitch * sizeof(val_t);
+    CUDA_CHECK(cudaStreamCreateWithFlags(&world.stream, cudaStreamNonBlocking));
+    int device = 0;
+    cudaDeviceProp properties{};
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+    world.blocks = static_cast<int>(std::min(
+        (world.n_elems + BLOCK_SIZE - 1) / BLOCK_SIZE,
+        static_cast<size_t>(properties.multiProcessorCount) * 32));
+    CUDA_CHECK(cudaMalloc(&world.device_memory, world.static_mem + world.dynamic_mem));
+    auto* cursor = static_cast<unsigned char*>(world.device_memory);
+    world.materials = reinterpret_cast<Material*>(cursor);
+    // Align all slot and state arrays to full memory-transaction boundaries.
+    cursor += MATERIAL_STORAGE_BYTES;
+    for (auto& energy : world.energy) {
+        energy = reinterpret_cast<val_t*>(cursor);
+        cursor += world.pitch * sizeof(val_t);
+    }
+    world.total_flux = reinterpret_cast<val_t*>(cursor);
+    cursor += world.pitch * sizeof(val_t);
+    world.connected_flux = reinterpret_cast<val_t*>(cursor);
+    cursor += GRID_CONNECTIONS * world.pitch * sizeof(val_t);
+    world.connected_idx = reinterpret_cast<idx_t*>(cursor);
+    cursor += GRID_CONNECTIONS * world.pitch * sizeof(idx_t);
+    world.material_idx = cursor;
+    cursor += world.pitch;
+    world.num_connections = cursor;
+    world.final_energy = world.energy[0];
+    initializeMesh<<<world.blocks, BLOCK_SIZE, 0, world.stream>>>(
+        static_cast<idx_t>(world.n_elems), n_elems_root, world.pitch,
+        world.materials, world.material_idx, world.num_connections,
+        world.connected_idx, world.connected_flux, world.energy[0], world.total_flux);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(world.stream));
+}
+
+void prepareSimulation(World& world, int n_iters) {
+    world.graph_iters = std::min(std::max(n_iters, 0), GRAPH_ITERATIONS);
+    if (world.graph_iters == 0) return;
+    // An even batch ends in the same energy buffer it starts in, so the graph
+    // can be replayed without changing kernel arguments. Capture also provides
+    // the global dependency between consecutive Jacobi iterations.
+    CUDA_CHECK(cudaStreamBeginCapture(world.stream, cudaStreamCaptureModeThreadLocal));
+    for (int iter = 0; iter < world.graph_iters; ++iter) {
+        launchUpdate(world, world.energy[iter & 1], world.energy[(iter + 1) & 1]);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamEndCapture(world.stream, &world.graph));
+    CUDA_CHECK(cudaGraphInstantiate(&world.executable_graph, world.graph, nullptr, nullptr, 0));
+    CUDA_CHECK(cudaGraphUpload(world.executable_graph, world.stream));
+    CUDA_CHECK(cudaStreamSynchronize(world.stream));
+}
+
+void runSimulation(World& world, const int n_iters) {
+    if (world.graph_iters == 0) return;
+    val_t* energy = world.energy[0];
+    val_t* next_energy = world.energy[1];
+    const int batches = n_iters / world.graph_iters;
+    for (int batch = 0; batch < batches; ++batch) {
+        CUDA_CHECK(cudaGraphLaunch(world.executable_graph, world.stream));
+    }
+    // Odd-sized graphs are used only when the entire run fits in one batch.
+    if (world.graph_iters & 1) std::swap(energy, next_energy);
+    for (int iter = 0; iter < n_iters % world.graph_iters; ++iter) {
+        launchUpdate(world, energy, next_energy);
+        std::swap(energy, next_energy);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(world.stream));
+    world.final_energy = energy;
+}
+
+void downloadResults(World& world) {
+    world.host_energy.resize(world.n_elems);
+    world.host_flux.resize(world.n_elems);
+    CUDA_CHECK(cudaMemcpyAsync(world.host_energy.data(), world.final_energy,
+                               world.n_elems * sizeof(val_t), cudaMemcpyDeviceToHost,
+                               world.stream));
+    CUDA_CHECK(cudaMemcpyAsync(world.host_flux.data(), world.total_flux,
+                               world.n_elems * sizeof(val_t), cudaMemcpyDeviceToHost,
+                               world.stream));
+    CUDA_CHECK(cudaStreamSynchronize(world.stream));
+}
+
+// Validate simulation results
+bool validateResults(const World& world) {
+    val_t energy_sum = 0.0;
+    val_t flux_sum = 0.0;
+    val_t energy_max = std::numeric_limits<val_t>::lowest();
+    val_t energy_min = std::numeric_limits<val_t>::max();
+
+    for (size_t i = 0; i < world.n_elems; ++i) {
+        energy_sum += world.host_energy[i];
+        flux_sum += world.host_flux[i];
+        energy_max = std::max(world.host_energy[i], energy_max);
+        energy_min = std::min(world.host_energy[i], energy_min);
+    }
+
+    printf("Validation results:\n");
+    printf("  Energy sum: %.12f\n", energy_sum);
+    printf("  Flux sum: %.2f\n", flux_sum);
+    printf("  Energy range: [%.6f, %.6f]\n", energy_min, energy_max);
+
+    // Check for numerical issues
+    constexpr val_t energy_epsilon = 1e-8;
+    printf("============================================\n");
+    printf("Grid size: %d x %d = %d elements\n", n_elems_root, n_elems_root, n_elems);
+    printf("Iterations: %d\n", n_iters);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    printf("\n");
+
+    try {
+        // Build the unstructured mesh
+        printf("Building unstructured mesh...\n");
+        World world;
+        buildSquare2D(world, n_elems_root);
+
+        // Calculate memory usage
+        const size_t static_mem = world.static_mem;
+        const size_t dynamic_mem = world.dynamic_mem;
+        const size_t total_mem = static_mem + dynamic_mem;
+        printf("Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\n",
+               total_mem / (1024.0 * 1024.0),
+               static_mem / (1024.0 * 1024.0),
+               dynamic_mem / (1024.0 * 1024.0));
+        printf("\n");
+
+        prepareSimulation(world, n_iters);
+
+        // Run simulation
+        printf("Running simulation...\n");
+        auto start = std::chrono::high_resolution_clock::now();
+
+        runSimulation(world, n_iters);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        const double duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+        printf("Computation time: %.3f ms\n", duration_ms);
+
+        // Calculate performance metrics
+        const int n_measured_iters = std::max(n_iters, 0);
+        const double time_per_iter = duration_ms / std::max(n_measured_iters, 1);
+        const double giga_elems_per_sec = duration_ms > 0.0 ?
+            (static_cast<double>(n_measured_iters) * n_elems) / (duration_ms * 1e6) : 0.0;
+
+        // Approximate FLOPS: ~22 FLOPS per element per iteration (from reference)
+        const double gflops = giga_elems_per_sec * 22.0;
+
+        printf("Performance:\n");
+        printf("  Time per iteration: %.4f ms\n", time_per_iter);
+        printf("  Elements/sec: %.4f GigaElements/s\n", giga_elems_per_sec);
+        printf("  Performance: %.4f GFLOPS\n", gflops);
+
+        // Compute hash for verification
+        downloadResults(world);
+        const uint64_t hash = computeHash(world);
+        printf("  Result hash: %016lX\n", hash);
+        printf("\n");
+
+        // Print results for external validation
+        if (printResults) {
+            print_results(world.host_energy, "ElementEnergy");
+        }
+
+        // Validation
+        if (validate) {
+            bool valid = validateResults(world);
+            if (!valid) {
+                return 1;
+            }
+        }
+
+        return 0;
+    } catch (const std::exception& error) {
+        fprintf(stderr, "ERROR: %s\n", error.what());
+        return 1;
+    }
+}
+cmake_minimum_required(VERSION 3.24)
+
+# Optimize for installed GPUs unless the caller selects deployment architectures.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
+project(unstructured_benchmark LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# Keep the existing source filename and executable name.
+set_source_files_properties(unstructured.cpp PROPERTIES LANGUAGE CUDA)
+add_executable(unstructured unstructured.cpp)
+
+# Preserve the reference arithmetic order; fast math and FMA contraction can
+# change the bitwise result hashes even when values are numerically close.
+target_compile_options(unstructured PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;-Xcompiler=-O3,-march=native,-Wall,-Wextra>
+    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra>)
+target_link_libraries(unstructured PRIVATE m)
+common/hash.hpp
+common/results_output.hpp
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+
+exec
+/bin/bash -lc "python3 -u - <<'PY'
+import subprocess,re,statistics
+for n,its in [(512,100),(1024,100),(2048,100)]:
+    times=[]
+    for _ in range(3):
+        out=subprocess.check_output(['/tmp/unstructured-cpu-baseline','-n',str(n),'-i',str(its)],text=True)
+        times.append(float(re.search(r'Computation time: ([\\d.]+)',out).group(1)))
+    print(f'CPU n={n}, iterations={its}: median {statistics.median(times):.3f} ms, samples={times}',flush=True)
+PY" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 76b93bafae707ec4aa4712e1fbdf22530e365fa7..4ce42067ebea6351121734edb7f50dc2a683696f
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -21,6 +21,7 @@
+ constexpr int GRID_CONNECTIONS = 4;
+ constexpr int BLOCK_SIZE = 256;
+ constexpr int GRAPH_ITERATIONS = 64;
++constexpr size_t MATERIAL_STORAGE_BYTES = 256;
+ 
+ struct Material {
+     val_t transfer_coeff;
+@@ -160,7 +161,7 @@
+ void buildSquare2D(World& world, const int n_elems_root) {
+     world.n_elems = static_cast<size_t>(n_elems_root) * n_elems_root;
+     world.pitch = (world.n_elems + 31) & ~size_t{31};
+-    world.static_mem = 3 * sizeof(Material) + world.pitch *
++    world.static_mem = MATERIAL_STORAGE_BYTES + world.pitch *
+         (GRID_CONNECTIONS * (sizeof(idx_t) + sizeof(val_t)) + 2 * sizeof(uint8_t));
+     world.dynamic_mem = 3 * world.pitch * sizeof(val_t);
+     CUDA_CHECK(cudaStreamCreateWithFlags(&world.stream, cudaStreamNonBlocking));
+@@ -174,7 +175,8 @@
+     CUDA_CHECK(cudaMalloc(&world.device_memory, world.static_mem + world.dynamic_mem));
+     auto* cursor = static_cast<unsigned char*>(world.device_memory);
+     world.materials = reinterpret_cast<Material*>(cursor);
+-    cursor += 3 * sizeof(Material);
++    // Align all slot and state arrays to full memory-transaction boundaries.
++    cursor += MATERIAL_STORAGE_BYTES;
+     for (auto& energy : world.energy) {
+         energy = reinterpret_cast<val_t*>(cursor);
+         cursor += world.pitch * sizeof(val_t);
+
+ succeeded in 18472ms:
+CPU n=512, iterations=100: median 233.000 ms, samples=[228.0, 233.0, 240.0]
+CPU n=1024, iterations=100: median 973.000 ms, samples=[962.0, 989.0, 973.0]
+CPU n=2048, iterations=100: median 3965.000 ms, samples=[3921.0, 4091.0, 3965.0]
+
+exec
+/bin/bash -lc "python3 -u - <<'PY'
+import subprocess,re,statistics,os
+program='/tmp/unstructured-cuda-build/unstructured'
+for n,its in [(512,100),(1024,100),(2048,100)]:
+    times=[]
+    for _ in range(3):
+        out=subprocess.check_output([program,'-n',str(n),'-i',str(its)],text=True)
+        times.append(float(re.search(r'Computation time: ([\\d.]+)',out).group(1)))
+    print(f'CUDA n={n}, iterations={its}: median {statistics.median(times):.3f} ms, samples={times}',flush=True)
+for args in [['-h'],['-n','0'],['-n','46341'],['-n','5','-i','0','-r','-v'],['-n','5','-i','-2','-r','-v'],['--invalid']]:
+    result=subprocess.run([program,*args],text=True,capture_output=True)
+    expect=1 if args[0]=='--invalid' or args[:2] in [['-n','0'],['-n','46341']] else 0
+    assert result.returncode==expect,(args,result.stdout,result.stderr)
+    if '-i' in args:
+        original=subprocess.check_output(['/tmp/unstructured-cpu-baseline',*args],text=True)
+        assert result.stdout[result.stdout.index('=== RESULTS ==='):]==original[original.index('=== RESULTS ==='):]
+        assert re.search(r'Result hash: (\\w+)',result.stdout).group(1)==re.search(r'Result hash: (\\w+)',original).group(1)
+    print(f'CLI {args}: PASS',flush=True)
+env=dict(os.environ,CUDA_VISIBLE_DEVICES='')
+result=subprocess.run([program,'-n','5','-i','1'],env=env,text=True,capture_output=True)
+assert result.returncode==1 and 'ERROR:' in result.stderr
+print('No GPU available: explicit CUDA failure, PASS',flush=True)
+PY" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 76b93bafae707ec4aa4712e1fbdf22530e365fa7..4ce42067ebea6351121734edb7f50dc2a683696f
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -21,6 +21,7 @@
+ constexpr int GRID_CONNECTIONS = 4;
+ constexpr int BLOCK_SIZE = 256;
+ constexpr int GRAPH_ITERATIONS = 64;
++constexpr size_t MATERIAL_STORAGE_BYTES = 256;
+ 
+ struct Material {
+     val_t transfer_coeff;
+@@ -160,7 +161,7 @@
+ void buildSquare2D(World& world, const int n_elems_root) {
+     world.n_elems = static_cast<size_t>(n_elems_root) * n_elems_root;
+     world.pitch = (world.n_elems + 31) & ~size_t{31};
+-    world.static_mem = 3 * sizeof(Material) + world.pitch *
++    world.static_mem = MATERIAL_STORAGE_BYTES + world.pitch *
+         (GRID_CONNECTIONS * (sizeof(idx_t) + sizeof(val_t)) + 2 * sizeof(uint8_t));
+     world.dynamic_mem = 3 * world.pitch * sizeof(val_t);
+     CUDA_CHECK(cudaStreamCreateWithFlags(&world.stream, cudaStreamNonBlocking));
+@@ -174,7 +175,8 @@
+     CUDA_CHECK(cudaMalloc(&world.device_memory, world.static_mem + world.dynamic_mem));
+     auto* cursor = static_cast<unsigned char*>(world.device_memory);
+     world.materials = reinterpret_cast<Material*>(cursor);
+-    cursor += 3 * sizeof(Material);
++    // Align all slot and state arrays to full memory-transaction boundaries.
++    cursor += MATERIAL_STORAGE_BYTES;
+     for (auto& energy : world.energy) {
+         energy = reinterpret_cast<val_t*>(cursor);
+         cursor += world.pitch * sizeof(val_t);
+
+codex
+All 13 comparison cases match the original exactly, including both result hashes and validation output. CUDA memory and initialization checks also report zero errors. I’m finishing performance measurements and checking that a missing GPU produces a clear error.
+ succeeded in 26553ms:
+CUDA n=512, iterations=100: median 3.399 ms, samples=[3.399, 3.4, 3.398]
+CUDA n=1024, iterations=100: median 10.835 ms, samples=[10.826, 10.835, 10.835]
+CUDA n=2048, iterations=100: median 42.597 ms, samples=[42.59, 42.599, 42.597]
+CLI ['-h']: PASS
+CLI ['-n', '0']: PASS
+CLI ['-n', '46341']: PASS
+CLI ['-n', '5', '-i', '0', '-r', '-v']: PASS
+CLI ['-n', '5', '-i', '-2', '-r', '-v']: PASS
+CLI ['--invalid']: PASS
+No GPU available: explicit CUDA failure, PASS
+
+exec
+/bin/bash -lc "python3 -u - <<'PY'
+import subprocess,re
+for n,it in [(1,65),(5,63),(257,128),(1025,130),(2048,100)]:
+    args=['-n',str(n),'-i',str(it),'-v','-r']
+    a=subprocess.check_output(['/tmp/unstructured-cpu-baseline',*args],text=True)
+    b=subprocess.check_output(['/tmp/unstructured-cuda-build/unstructured',*args],text=True)
+    assert re.search(r'Result hash: (\\w+)',a).group(1)==re.search(r'Result hash: (\\w+)',b).group(1),(n,it,'state hash')
+    assert a[a.index('=== RESULTS ==='):]==b[b.index('=== RESULTS ==='):],(n,it,'results')
+    print(f'Final n={n}, iterations={it}: exact energy and accumulated-flux hashes and output',flush=True)
+PY" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 76b93bafae707ec4aa4712e1fbdf22530e365fa7..4ce42067ebea6351121734edb7f50dc2a683696f
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -21,6 +21,7 @@
+ constexpr int GRID_CONNECTIONS = 4;
+ constexpr int BLOCK_SIZE = 256;
+ constexpr int GRAPH_ITERATIONS = 64;
++constexpr size_t MATERIAL_STORAGE_BYTES = 256;
+ 
+ struct Material {
+     val_t transfer_coeff;
+@@ -160,7 +161,7 @@
+ void buildSquare2D(World& world, const int n_elems_root) {
+     world.n_elems = static_cast<size_t>(n_elems_root) * n_elems_root;
+     world.pitch = (world.n_elems + 31) & ~size_t{31};
+-    world.static_mem = 3 * sizeof(Material) + world.pitch *
++    world.static_mem = MATERIAL_STORAGE_BYTES + world.pitch *
+         (GRID_CONNECTIONS * (sizeof(idx_t) + sizeof(val_t)) + 2 * sizeof(uint8_t));
+     world.dynamic_mem = 3 * world.pitch * sizeof(val_t);
+     CUDA_CHECK(cudaStreamCreateWithFlags(&world.stream, cudaStreamNonBlocking));
+@@ -174,7 +175,8 @@
+     CUDA_CHECK(cudaMalloc(&world.device_memory, world.static_mem + world.dynamic_mem));
+     auto* cursor = static_cast<unsigned char*>(world.device_memory);
+     world.materials = reinterpret_cast<Material*>(cursor);
+-    cursor += 3 * sizeof(Material);
++    // Align all slot and state arrays to full memory-transaction boundaries.
++    cursor += MATERIAL_STORAGE_BYTES;
+     for (auto& energy : world.energy) {
+         energy = reinterpret_cast<val_t*>(cursor);
+         cursor += world.pitch * sizeof(val_t);
+
+ succeeded in 19479ms:
+Final n=1, iterations=65: exact energy and accumulated-flux hashes and output
+Final n=5, iterations=63: exact energy and accumulated-flux hashes and output
+Final n=257, iterations=128: exact energy and accumulated-flux hashes and output
+Final n=1025, iterations=130: exact energy and accumulated-flux hashes and output
+Final n=2048, iterations=100: exact energy and accumulated-flux hashes and output
+
+exec
+/bin/bash -lc "rg -n 'initializeMesh|updateElements|prepareSimulation|runSimulation|downloadResults|cmake_minimum_required|project\\(|target_compile_options' unstructured/unstructured.cpp unstructured/CMakeLists.txt; rg --files -g '"'!output.txt'"'" in /home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1
+ succeeded in 0ms:
+unstructured/CMakeLists.txt:1:cmake_minimum_required(VERSION 3.24)
+unstructured/CMakeLists.txt:7:project(unstructured_benchmark LANGUAGES CXX CUDA)
+unstructured/CMakeLists.txt:20:target_compile_options(unstructured PRIVATE
+unstructured/unstructured.cpp:78:__global__ void initializeMesh(idx_t n_elems, int root, size_t pitch,
+unstructured/unstructured.cpp:123:__global__ void updateElements(idx_t n_elems, size_t pitch,
+unstructured/unstructured.cpp:153:    updateElements<<<world.blocks, BLOCK_SIZE, 0, world.stream>>>(
+unstructured/unstructured.cpp:194:    initializeMesh<<<world.blocks, BLOCK_SIZE, 0, world.stream>>>(
+unstructured/unstructured.cpp:202:void prepareSimulation(World& world, int n_iters) {
+unstructured/unstructured.cpp:219:void runSimulation(World& world, const int n_iters) {
+unstructured/unstructured.cpp:238:void downloadResults(World& world) {
+unstructured/unstructured.cpp:377:        prepareSimulation(world, n_iters);
+unstructured/unstructured.cpp:383:        runSimulation(world, n_iters);
+unstructured/unstructured.cpp:405:        downloadResults(world);
+common/results_output.hpp
+common/hash.hpp
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 76b93bafae707ec4aa4712e1fbdf22530e365fa7..4ce42067ebea6351121734edb7f50dc2a683696f
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -21,6 +21,7 @@
+ constexpr int GRID_CONNECTIONS = 4;
+ constexpr int BLOCK_SIZE = 256;
+ constexpr int GRAPH_ITERATIONS = 64;
++constexpr size_t MATERIAL_STORAGE_BYTES = 256;
+ 
+ struct Material {
+     val_t transfer_coeff;
+@@ -160,7 +161,7 @@
+ void buildSquare2D(World& world, const int n_elems_root) {
+     world.n_elems = static_cast<size_t>(n_elems_root) * n_elems_root;
+     world.pitch = (world.n_elems + 31) & ~size_t{31};
+-    world.static_mem = 3 * sizeof(Material) + world.pitch *
++    world.static_mem = MATERIAL_STORAGE_BYTES + world.pitch *
+         (GRID_CONNECTIONS * (sizeof(idx_t) + sizeof(val_t)) + 2 * sizeof(uint8_t));
+     world.dynamic_mem = 3 * world.pitch * sizeof(val_t);
+     CUDA_CHECK(cudaStreamCreateWithFlags(&world.stream, cudaStreamNonBlocking));
+@@ -174,7 +175,8 @@
+     CUDA_CHECK(cudaMalloc(&world.device_memory, world.static_mem + world.dynamic_mem));
+     auto* cursor = static_cast<unsigned char*>(world.device_memory);
+     world.materials = reinterpret_cast<Material*>(cursor);
+-    cursor += 3 * sizeof(Material);
++    // Align all slot and state arrays to full memory-transaction boundaries.
++    cursor += MATERIAL_STORAGE_BYTES;
+     for (auto& energy : world.energy) {
+         energy = reinterpret_cast<val_t*>(cursor);
+         cursor += world.pitch * sizeof(val_t);
+
+codex
+Implemented CUDA in [unstructured.cpp](/home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1/unstructured/unstructured.cpp) and updated [CMakeLists.txt](/home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1/unstructured/CMakeLists.txt).
+
+- GPU mesh construction, coalesced connectivity arrays, persistent device state, and batched CUDA graphs.
+- Executable remains `unstructured`; no new project files or external dependencies.
+- Exact reference hashes matched across 18 cases. CUDA memory and initialization checks passed.
+- RTX 3090 simulation: **42.6 ms versus 3965 ms CPU**, about **93× faster**, for 2048² elements and 100 iterations.
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 76b93bafae707ec4aa4712e1fbdf22530e365fa7..4ce42067ebea6351121734edb7f50dc2a683696f
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -21,6 +21,7 @@
+ constexpr int GRID_CONNECTIONS = 4;
+ constexpr int BLOCK_SIZE = 256;
+ constexpr int GRAPH_ITERATIONS = 64;
++constexpr size_t MATERIAL_STORAGE_BYTES = 256;
+ 
+ struct Material {
+     val_t transfer_coeff;
+@@ -160,7 +161,7 @@
+ void buildSquare2D(World& world, const int n_elems_root) {
+     world.n_elems = static_cast<size_t>(n_elems_root) * n_elems_root;
+     world.pitch = (world.n_elems + 31) & ~size_t{31};
+-    world.static_mem = 3 * sizeof(Material) + world.pitch *
++    world.static_mem = MATERIAL_STORAGE_BYTES + world.pitch *
+         (GRID_CONNECTIONS * (sizeof(idx_t) + sizeof(val_t)) + 2 * sizeof(uint8_t));
+     world.dynamic_mem = 3 * world.pitch * sizeof(val_t);
+     CUDA_CHECK(cudaStreamCreateWithFlags(&world.stream, cudaStreamNonBlocking));
+@@ -174,7 +175,8 @@
+     CUDA_CHECK(cudaMalloc(&world.device_memory, world.static_mem + world.dynamic_mem));
+     auto* cursor = static_cast<unsigned char*>(world.device_memory);
+     world.materials = reinterpret_cast<Material*>(cursor);
+-    cursor += 3 * sizeof(Material);
++    // Align all slot and state arrays to full memory-transaction boundaries.
++    cursor += MATERIAL_STORAGE_BYTES;
+     for (auto& energy : world.energy) {
+         energy = reinterpret_cast<val_t*>(cursor);
+         cursor += world.pitch * sizeof(val_t);
+
+tokens used
+58,593
+Implemented CUDA in [unstructured.cpp](/home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1/unstructured/unstructured.cpp) and updated [CMakeLists.txt](/home/llmtest/evals/20261006-204623/unstructured_gpt-6.1-sol-xhigh_cuda_r1/unstructured/CMakeLists.txt).
+
+- GPU mesh construction, coalesced connectivity arrays, persistent device state, and batched CUDA graphs.
+- Executable remains `unstructured`; no new project files or external dependencies.
+- Exact reference hashes matched across 18 cases. CUDA memory and initialization checks passed.
+- RTX 3090 simulation: **42.6 ms versus 3965 ms CPU**, about **93× faster**, for 2048² elements and 100 iterations.

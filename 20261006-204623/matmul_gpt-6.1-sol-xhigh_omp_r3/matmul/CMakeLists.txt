@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.10)
+project(matmul_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+
+add_executable(matmul matmul.cpp)
+
+# Enable optimizations
+target_compile_options(matmul PRIVATE -O3 -march=native -Wall -Wextra)
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # Keep SIMD accumulators in registers instead of spilling unrolled k iterations.
+    target_compile_options(matmul PRIVATE -fno-loop-unroll-and-jam)
+endif()
+
+# OpenMP is required for both compilation and linking.
+target_link_libraries(matmul PRIVATE OpenMP::OpenMP_CXX m)

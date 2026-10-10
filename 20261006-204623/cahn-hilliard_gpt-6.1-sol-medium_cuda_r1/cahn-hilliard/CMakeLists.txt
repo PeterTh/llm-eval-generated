@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.18)
+project(cahn_hilliard_benchmark LANGUAGES CXX CUDA)
+
+# Retain the existing source filename and compile it with the CUDA toolchain.
+set_source_files_properties(cahn_hilliard.cpp PROPERTIES LANGUAGE CUDA)
+add_executable(cahn_hilliard cahn_hilliard.cpp)
+set_target_properties(cahn_hilliard PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON)
+
+# Preserve double-precision expression ordering; avoid fast math and fused
+# operations that can change the original stencil's numerical behavior.
+target_compile_options(cahn_hilliard PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;-Xcompiler=-Wall,-Wextra>)
+target_link_libraries(cahn_hilliard PRIVATE m)
