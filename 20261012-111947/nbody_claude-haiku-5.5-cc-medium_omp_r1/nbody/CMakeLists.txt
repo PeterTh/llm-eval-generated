@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.10)
+project(nbody_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# OpenMP is required; the build fails if it is not available
+find_package(OpenMP REQUIRED)
+
+add_executable(nbody nbody.cpp)
+
+# Enable optimizations
+# -ffp-contract=off keeps floating-point results identical across threads and builds
+target_compile_options(nbody PRIVATE -O3 -march=native -Wall -Wextra -ffp-contract=off)
+
+# Link OpenMP and math library
+target_link_libraries(nbody OpenMP::OpenMP_CXX m)
