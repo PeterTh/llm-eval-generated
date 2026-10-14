@@ -412,15 +412,16 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
 
-    const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    const double elapsedSec = std::chrono::duration<double>(end - start).count();
+    const double localElapsedSec = std::chrono::duration<double>(end - start).count();
+    double elapsedSec = 0.0;
+    MPI_Reduce(&localElapsedSec, &elapsedSec, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Bring the result of the last iteration back to the host
     std::vector<double> h_out(localRows);
     CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, localRows * sizeof(double), cudaMemcpyDeviceToHost));
 
     if (root) {
-        printf("Computation time: %ld ms\n", static_cast<long>(duration.count()));
+        printf("Computation time: %ld ms\n", static_cast<long>(elapsedSec * 1000.0));
 
         // Calculate performance metrics
         const double gflops = (2.0 * nItems * iterations) / elapsedSec / 1e9;

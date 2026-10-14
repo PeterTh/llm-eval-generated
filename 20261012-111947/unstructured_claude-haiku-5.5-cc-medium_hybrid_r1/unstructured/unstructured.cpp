@@ -626,6 +626,7 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    MPI_Allreduce(MPI_IN_PLACE, &duration_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     // Gather the final state on rank 0 (outside the timed region)
     std::vector<ElementDynamic> elements = solver.gather(rank, nranks, n_total);

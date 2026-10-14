@@ -228,6 +228,8 @@ int runSimulation(int argc, char** argv) {
     }
 
     const double elapsed = MPI_Wtime() - start;
+    double global_elapsed = 0.0;
+    MPI_Reduce(&elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather final velocities so the full state is available for output and validation
     MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL,
@@ -235,7 +237,7 @@ int runSimulation(int argc, char** argv) {
     MPI_Type_free(&posType);
 
     if (isRoot) {
-        printf("Simulation time: %ld ms\n", static_cast<long>(elapsed * 1000.0));
+        printf("Simulation time: %ld ms\n", static_cast<long>(global_elapsed * 1000.0));
     }
 
     // Print results for external validation

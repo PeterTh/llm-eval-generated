@@ -342,9 +342,12 @@ int runNBody(int argc, char** argv, int rank, int size) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_ms = duration.count();
+    long global_ms = 0;
+    MPI_Reduce(&local_ms, &global_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %ld ms\n", global_ms);
     }
 
     // Print results for external validation

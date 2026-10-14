@@ -1437,8 +1437,10 @@ int main(int argc, char** argv) {
     ROOT_PRINTF("\n");
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
-    ROOT_PRINTF("Total computation time: %ld ms\n", totalTime);
+    double localTotalTime = (endDist - startPre) * 1000.0;
+    double totalTime = 0.0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    ROOT_PRINTF("Total computation time: %.3f ms\n", totalTime);
 
     // Non-zero form factor count over the whole matrix
     uint64_t localNonZeroKij = 0;

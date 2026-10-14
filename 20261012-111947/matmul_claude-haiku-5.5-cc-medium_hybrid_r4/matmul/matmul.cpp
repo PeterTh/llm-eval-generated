@@ -317,12 +317,14 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double seconds = MPI_Wtime() - start;
+    double max_seconds;
+    MPI_Reduce(&seconds, &max_seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (root) {
-        printf("Computation time: %ld ms\n", static_cast<long>(seconds * 1000.0));
+        printf("Computation time: %ld ms\n", static_cast<long>(max_seconds * 1000.0));
 
         // Calculate GFLOPS
-        double gflops = (2.0 * N * N * N) / seconds / 1e9;
+        double gflops = (2.0 * N * N * N) / max_seconds / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
     }
 

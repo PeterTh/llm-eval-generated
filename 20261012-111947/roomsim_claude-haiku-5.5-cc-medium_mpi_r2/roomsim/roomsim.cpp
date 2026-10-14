@@ -960,6 +960,7 @@ int runBenchmark(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double endPre = MPI_Wtime();
     auto preDuration = static_cast<long>((endPre - startPre) * 1000.0);
+    MPI_Allreduce(MPI_IN_PLACE, &preDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     rootPrintf("Precomputation time: %ld ms\n", preDuration);
     rootPrintf("\n");
@@ -973,6 +974,7 @@ int runBenchmark(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double endSim = MPI_Wtime();
     auto simDuration = static_cast<long>((endSim - startSim) * 1000.0);
+    MPI_Allreduce(MPI_IN_PLACE, &simDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     rootPrintf("Simulation time: %ld ms\n", simDuration);
     rootPrintf("\n");
@@ -986,6 +988,7 @@ int runBenchmark(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double endDist = MPI_Wtime();
     auto distDuration = static_cast<long>((endDist - startDist) * 1000.0);
+    MPI_Allreduce(MPI_IN_PLACE, &distDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     rootPrintf("Distance computation time: %ld ms\n", distDuration);
     rootPrintf("\n");

@@ -456,7 +456,11 @@ int runBenchmark(int argc, char** argv, const int rank, const int size) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double cluster_end = MPI_Wtime();
-    const long cluster_ms = static_cast<long>((cluster_end - cluster_start) * 1000.0);
+    const double cluster_elapsed = cluster_end - cluster_start;
+    double max_cluster_elapsed = 0.0;
+    MPI_Reduce(&cluster_elapsed, &max_cluster_elapsed, 1, MPI_DOUBLE, MPI_MAX,
+               0, MPI_COMM_WORLD);
+    const long cluster_ms = static_cast<long>(max_cluster_elapsed * 1000.0);
 
     // Calculate statistics and performance metrics
     int total_clustered = 0;

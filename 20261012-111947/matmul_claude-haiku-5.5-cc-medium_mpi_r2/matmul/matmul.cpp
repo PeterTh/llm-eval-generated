@@ -188,13 +188,15 @@ int main(int argc, char** argv) {
                 C.data(), counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     const double elapsed = MPI_Wtime() - start;
+    double max_elapsed = 0.0;
+    MPI_Reduce(&elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     int status = 0;
     if (root) {
-        printf("Computation time: %ld ms\n", static_cast<long>(elapsed * 1000.0));
+        printf("Computation time: %ld ms\n", static_cast<long>(max_elapsed * 1000.0));
 
         // Calculate GFLOPS
-        double gflops = (2.0 * N * N * N) / elapsed / 1e9;
+        double gflops = (2.0 * N * N * N) / max_elapsed / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
 
         // Print results for external validation

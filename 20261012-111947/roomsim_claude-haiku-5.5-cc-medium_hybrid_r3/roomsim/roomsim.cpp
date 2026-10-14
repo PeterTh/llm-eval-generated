@@ -1322,6 +1322,7 @@ int runBenchmark(const Options& opt, int rank, int numRanks, int deviceId) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto endPre = std::chrono::high_resolution_clock::now();
     auto preDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count();
+    MPI_Allreduce(MPI_IN_PLACE, &preDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     rootPrintf("Precomputation time: %ld ms\n", preDuration);
     rootPrintf("\n");
@@ -1332,9 +1333,11 @@ int runBenchmark(const Options& opt, int rank, int numRanks, int deviceId) {
 
     runSimulation(state, gpu);
 
+    CUDA_CHECK(cudaDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
     auto endSim = std::chrono::high_resolution_clock::now();
     auto simDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count();
+    MPI_Allreduce(MPI_IN_PLACE, &simDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     rootPrintf("Simulation time: %ld ms\n", simDuration);
     rootPrintf("\n");
@@ -1348,6 +1351,7 @@ int runBenchmark(const Options& opt, int rank, int numRanks, int deviceId) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto endDist = std::chrono::high_resolution_clock::now();
     auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
+    MPI_Allreduce(MPI_IN_PLACE, &distDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     rootPrintf("Distance computation time: %ld ms\n", distDuration);
     rootPrintf("\n");

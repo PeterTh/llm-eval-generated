@@ -234,9 +234,12 @@ int run(int argc, char** argv, int rank, int size) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double end = MPI_Wtime();
+    const double local_elapsed = end - start;
+    double max_elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Simulation time: %ld ms\n", static_cast<long>((end - start) * 1000.0));
+        printf("Simulation time: %ld ms\n", static_cast<long>(max_elapsed * 1000.0));
     }
 
     // Velocities are only held by their owner; gather them on rank 0 for output and validation

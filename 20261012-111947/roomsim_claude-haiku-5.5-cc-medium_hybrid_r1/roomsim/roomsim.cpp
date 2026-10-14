@@ -1275,7 +1275,10 @@ int main(int argc, char** argv) {
         rootPrintf("\n");
 
         // Total time
-        long totalTime = preDuration + simDuration + distDuration;
+        long localPhaseDurations[3] = {preDuration, simDuration, distDuration};
+        long globalPhaseDurations[3] = {};
+        MPI_Reduce(localPhaseDurations, globalPhaseDurations, 3, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+        long totalTime = globalPhaseDurations[0] + globalPhaseDurations[1] + globalPhaseDurations[2];
         rootPrintf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

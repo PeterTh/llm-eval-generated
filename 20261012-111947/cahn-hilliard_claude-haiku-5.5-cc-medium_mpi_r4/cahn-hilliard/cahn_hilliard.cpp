@@ -316,7 +316,9 @@ int runBenchmark(int argc, char** argv) {
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
-    const double elapsed = MPI_Wtime() - start;
+    const double localElapsed = MPI_Wtime() - start;
+    double elapsed = 0.0;
+    MPI_Reduce(&localElapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (root) {
         printf("Computation time: %ld ms\n", static_cast<long>(elapsed * 1000.0));
