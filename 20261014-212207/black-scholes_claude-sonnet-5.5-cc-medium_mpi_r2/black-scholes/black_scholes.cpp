@@ -207,9 +207,11 @@ int main(int argc, char** argv) {
     
     MPI_Barrier(MPI_COMM_WORLD);
     const double elapsed = MPI_Wtime() - start;
+    double max_elapsed = 0.0;
+    MPI_Reduce(&elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
-        const double us = std::floor(elapsed * 1e6);
+        const double us = std::floor(max_elapsed * 1e6);
         printf("Computation time: %.3f ms\n", us / 1000.0);
         printf("Options per second: %.0f\n", numOptions / (us / 1e6));
     }

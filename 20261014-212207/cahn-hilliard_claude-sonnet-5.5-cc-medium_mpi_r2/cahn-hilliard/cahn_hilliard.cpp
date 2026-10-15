@@ -265,7 +265,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double elapsed = MPI_Wtime() - start;
-    const long long ms = (long long)(elapsed * 1000.0);
+    double global_elapsed = 0.0;
+    MPI_Reduce(&elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    const long long ms = (long long)(global_elapsed * 1000.0);
 
     if (rank == 0) {
         printf("Computation time: %lld ms\n", ms);

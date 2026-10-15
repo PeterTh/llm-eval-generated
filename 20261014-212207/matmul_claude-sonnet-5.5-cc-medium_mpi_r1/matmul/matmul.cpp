@@ -175,7 +175,10 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double t1 = MPI_Wtime();
     
-    long long ms = static_cast<long long>((t1 - t0) * 1000.0);
+    double elapsed = t1 - t0;
+    double max_elapsed = 0.0;
+    MPI_Reduce(&elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    long long ms = static_cast<long long>(max_elapsed * 1000.0);
     if (rank == 0) {
         printf("Computation time: %lld ms\n", ms);
         double gflops = (2.0 * N * N * N) / (ms / 1000.0) / 1e9;

@@ -275,7 +275,10 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-    if (rank == 0) printf("Simulation time: %ld ms\n", (long)duration.count());
+    long localDuration = duration.count();
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) printf("Simulation time: %ld ms\n", maxDuration);
 
     // Gather velocities (positions are already replicated everywhere)
     CUDA_CHECK(cudaMemcpy(myVel.data(), dVel, sizeof(double) * myVel.size(), cudaMemcpyDeviceToHost));

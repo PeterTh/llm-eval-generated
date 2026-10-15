@@ -169,9 +169,11 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double elapsed = MPI_Wtime() - t0;
+    double max_elapsed = 0.0;
+    MPI_Reduce(&elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        const long ms = static_cast<long>(elapsed * 1000.0);
+        const long ms = static_cast<long>(max_elapsed * 1000.0);
         printf("Computation time: %ld ms\n", ms);
         double gflops = (2.0 * N * N * N) / (ms / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);

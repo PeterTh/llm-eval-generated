@@ -265,7 +265,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     const double t1 = MPI_Wtime();
 
-    const double ms = (t1 - t0) * 1e3;
+    const double local_ms = (t1 - t0) * 1e3;
+    double ms = 0.0;
+    MPI_Reduce(&local_ms, &ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {
         printf("Computation time: %.3f ms\n", ms);
         printf("Options per second: %.0f\n", numOptions / (ms / 1e3));

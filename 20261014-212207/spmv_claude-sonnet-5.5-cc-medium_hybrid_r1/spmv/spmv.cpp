@@ -371,7 +371,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+    const double local_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    double ms = 0.0;
+    MPI_Reduce(&local_ms, &ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (myRows > 0) {
         CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, sizeof(double) * myRows, cudaMemcpyDeviceToHost));

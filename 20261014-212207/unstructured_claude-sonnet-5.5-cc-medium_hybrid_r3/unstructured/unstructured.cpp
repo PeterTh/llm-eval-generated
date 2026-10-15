@@ -386,6 +386,9 @@ int main(int argc, char** argv) {
         MPI_Barrier(comm);
         auto end = std::chrono::high_resolution_clock::now();
         elapsed_ms = (double)std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        double max_elapsed_ms = 0.0;
+        MPI_Reduce(&elapsed_ms, &max_elapsed_ms, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+        if (dc.rank == 0) elapsed_ms = max_elapsed_ms;
 
         val_t *h_e, *h_f;
         CUDA_CHECK(cudaMallocHost(&h_e, local * sizeof(val_t)));

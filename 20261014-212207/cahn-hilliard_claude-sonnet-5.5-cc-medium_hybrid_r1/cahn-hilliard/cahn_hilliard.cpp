@@ -338,13 +338,16 @@ int main(int argc, char** argv) {
     MPI_Barrier(comm);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localMs = duration.count();
+    long maxMs = 0;
+    MPI_Reduce(&localMs, &maxMs, 1, MPI_LONG, MPI_MAX, 0, comm);
 
     if (root) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", maxMs);
 
         // Calculate performance
         double cellUpdates = (double)gridSize * iterations;
-        double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
+        double mcups = cellUpdates / (maxMs / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

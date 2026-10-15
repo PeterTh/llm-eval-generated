@@ -1061,7 +1061,9 @@ int run(int argc, char** argv, int rank, int nprocs) {
     }
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long localTotalTime = preDuration + simDuration + distDuration;
+    long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     uint64_t nonZeroKijTotal = 0;
     MPI_Allreduce(&state.localNonZeroKij, &nonZeroKijTotal, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);

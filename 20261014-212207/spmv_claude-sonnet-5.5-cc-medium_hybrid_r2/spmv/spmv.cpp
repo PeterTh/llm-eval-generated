@@ -565,9 +565,9 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     double seconds = std::chrono::duration<double>(end - start).count();
-    MPI_Bcast(&seconds, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &seconds, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     long long ms = duration.count();
-    MPI_Bcast(&ms, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &ms, 1, MPI_LONG_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, static_cast<size_t>(myRows) * sizeof(double), cudaMemcpyDeviceToHost));
 

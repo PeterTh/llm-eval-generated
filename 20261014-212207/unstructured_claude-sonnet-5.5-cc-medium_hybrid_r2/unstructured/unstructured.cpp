@@ -444,6 +444,7 @@ int main(int argc, char** argv) {
     std::vector<val_t> energy, flux;
     double elapsed_s = 0.0;
     runSimulation(mesh, n_iters, energy, flux, elapsed_s);
+    MPI_Allreduce(MPI_IN_PLACE, &elapsed_s, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
     const long duration_ms = static_cast<long>(elapsed_s * 1000.0);
 

@@ -346,6 +346,7 @@ int main(int argc, char** argv) {
         MPI_Barrier(comm);
         auto end = std::chrono::high_resolution_clock::now();
         elapsed = std::chrono::duration<double>(end - start).count();
+        MPI_Allreduce(MPI_IN_PLACE, &elapsed, 1, MPI_DOUBLE, MPI_MAX, comm);
 
         // Gather the result on rank 0 (only needed for output / validation)
         if (printResults || validate) {

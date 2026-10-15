@@ -418,7 +418,10 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const long local_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long max_duration = 0;
+    MPI_Reduce(&local_duration, &max_duration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    auto duration = std::chrono::milliseconds(max_duration);
 
     // Gather output on rank 0
     std::vector<double> l_out(myRows);
