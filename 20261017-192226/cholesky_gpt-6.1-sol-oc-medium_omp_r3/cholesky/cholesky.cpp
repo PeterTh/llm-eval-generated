@@ -1,0 +1,299 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+// Keep a 4-by-8 output microtile in registers across the panel dimension.
+// This reuses each packed vector four times and avoids repeatedly storing C.
+static inline void updateMicrotile(double* c, const double* left,
+                                   const double* packed, size_t n,
+                                   size_t width, size_t stride) {
+    double c0[8], c1[8], c2[8], c3[8];
+    #pragma omp simd
+    for (size_t j = 0; j < 8; ++j) {
+        c0[j] = c[j];
+        c1[j] = c[n + j];
+        c2[j] = c[2 * n + j];
+        c3[j] = c[3 * n + j];
+    }
+    for (size_t k = 0; k < width; ++k) {
+        const double l0 = left[k];
+        const double l1 = left[n + k];
+        const double l2 = left[2 * n + k];
+        const double l3 = left[3 * n + k];
+        #pragma omp simd
+        for (size_t j = 0; j < 8; ++j) {
+            const double r = packed[k * stride + j];
+            c0[j] -= l0 * r;
+            c1[j] -= l1 * r;
+            c2[j] -= l2 * r;
+            c3[j] -= l3 * r;
+        }
+    }
+    #pragma omp simd
+    for (size_t j = 0; j < 8; ++j) {
+        c[j] = c0[j];
+        c[n + j] = c1[j];
+        c[2 * n + j] = c2[j];
+        c[3 * n + j] = c3[j];
+    }
+}
+
+// Blocked right-looking Cholesky, with one persistent OpenMP team.
+// Only the lower triangle is used until the final upper-triangle cleanup.
+
+bool choleskyDecomposition(std::vector<double>& A, const size_t n) {
+    constexpr size_t block = 64;
+    // Pack transposed panel tiles contiguously, avoiding cache-set conflicts
+    // for power-of-two matrix sizes as well as strided trailing-update reads.
+    std::vector<double> panel(((n + block - 1) / block) * block * block);
+    double* const a = A.data();
+    double* const p = panel.data();
+    bool success = true;
+
+    #pragma omp parallel shared(success)
+    {
+        for (size_t first = 0; first < n; first += block) {
+            const size_t end = std::min(first + block, n);
+            #pragma omp single
+            {
+                for (size_t j = first; j < end; ++j) {
+                    double sum = 0.0;
+                    for (size_t k = first; k < j; ++k)
+                        sum += a[j * n + k] * a[j * n + k];
+                    const double val = a[j * n + j] - sum;
+                    if (val <= 0.0) {
+                        printf("Error: Matrix is not positive definite at diagonal element %zu\n", j);
+                        success = false;
+                        break;
+                    }
+                    a[j * n + j] = sqrt(val);
+                    for (size_t i = j + 1; i < end; ++i) {
+                        double dot = 0.0;
+                        for (size_t k = first; k < j; ++k)
+                            dot += a[i * n + k] * a[j * n + k];
+                        a[i * n + j] = (a[i * n + j] - dot) / a[j * n + j];
+                    }
+                }
+            }
+            // The single-region barrier publishes both the diagonal and status.
+            if (!success) break;
+
+            #pragma omp for schedule(static)
+            for (size_t i = end; i < n; ++i) {
+                for (size_t j = first; j < end; ++j) {
+                    double sum = 0.0;
+                    #pragma omp simd reduction(+:sum)
+                    for (size_t k = first; k < j; ++k)
+                        sum += a[i * n + k] * a[j * n + k];
+                    const double value = (a[i * n + j] - sum) / a[j * n + j];
+                    a[i * n + j] = value;
+                    p[(i / block) * block * block + (j - first) * block + i % block] = value;
+                }
+            }
+
+            const size_t tiles = (n - end + block - 1) / block;
+            // Flatten the tile grid to distribute even the last few block rows
+            // across the team. Each lower-triangular tile has a single writer.
+            #pragma omp for schedule(dynamic, 1)
+            for (size_t tile = 0; tile < tiles * tiles; ++tile) {
+                const size_t ti = tile / tiles;
+                const size_t tj = tile % tiles;
+                if (tj > ti) continue;
+                const size_t ib = end + ti * block;
+                const size_t jb = end + tj * block;
+                const size_t ie = std::min(ib + block, n);
+                const size_t je = std::min(jb + block, n);
+                const double* const packed = p + (jb / block) * block * block;
+                // Full off-diagonal microtiles use a register-blocked kernel.
+                const size_t fullRows = ti == tj ? ib : ib + (ie - ib) / 4 * 4;
+                const size_t fullCols = jb + (je - jb) / 8 * 8;
+                for (size_t i = ib; i < fullRows; i += 4) {
+                    for (size_t j = jb; j < fullCols; j += 8)
+                        updateMicrotile(a + i * n + j, a + i * n + first,
+                                        packed + j - jb, n, end - first, block);
+                }
+                for (size_t i = ib; i < ie; ++i) {
+                    const size_t limit = std::min(je, i + 1);
+                    const size_t begin = i < fullRows ? fullCols : jb;
+                    for (size_t k = first; k < end; ++k) {
+                        const double value = a[i * n + k];
+                        const double* const row = packed + (k - first) * block;
+                        #pragma omp simd
+                        for (size_t j = begin; j < limit; ++j)
+                            a[i * n + j] -= value * row[j - jb];
+                    }
+                }
+            }
+            // The worksharing barrier completes all updates before the next panel.
+        }
+
+        #pragma omp for schedule(static)
+        for (size_t i = 0; i < n; ++i) {
+            if (success)
+                std::fill(a + i * n + i + 1, a + (i + 1) * n, 0.0);
+        }
+    }
+    return success;
+}
+
+// Generate a symmetric positive definite matrix
+void generatePositiveDefiniteMatrix(std::vector<double>& A, const size_t n) {
+    // Method: Create A = B * B^T where B is random
+    // This guarantees A is positive semi-definite
+    // Then add identity to make it strictly positive definite
+    
+    std::vector<double> B(n * n);
+    unsigned int seed = 42;
+    
+    // Generate random matrix B
+    for (size_t i = 0; i < n * n; ++i) {
+        B[i] = (rand_r(&seed) / (double)RAND_MAX) - 0.5;
+    }
+    
+    // Compute A = B * B^T
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j <= i; ++j) {
+            double sum = 0.0;
+            #pragma omp simd reduction(+:sum)
+            for (size_t k = 0; k < n; ++k) {
+                sum += B[i * n + k] * B[j * n + k];
+            }
+            A[i * n + j] = sum;
+            A[j * n + i] = sum;
+        }
+        A[i * n + i] += n;
+    }
+}
+
+bool validateCholesky(const std::vector<double>& L, const std::vector<double>& A_orig, const size_t n) {
+    // Validate by computing L * L^T and comparing with original matrix
+    
+    double maxError = 0.0;
+    double relError = 0.0;
+
+    // Fuse reconstruction and comparison, omitting the known zero products.
+    #pragma omp parallel for schedule(dynamic, 1) reduction(max:maxError,relError)
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            double sum = 0.0;
+            const size_t limit = std::min(i, j) + 1;
+            #pragma omp simd reduction(+:sum)
+            for (size_t k = 0; k < limit; ++k) {
+                sum += L[i * n + k] * L[j * n + k];
+            }
+            const double error = fabs(sum - A_orig[i * n + j]);
+            maxError = std::max(maxError, error);
+            const double rel = error / (fabs(A_orig[i * n + j]) + 1e-10);
+            relError = std::max(relError, rel);
+        }
+    }
+    
+    printf("Max absolute error: %.10e\n", maxError);
+    printf("Max relative error: %.10e\n", relError);
+    
+    // Check if error is within tolerance
+    if (relError > 1e-6) {
+        printf("Validation failed: relative error too large\n");
+        return false;
+    }
+    
+    return true;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Matrix size (default: 512)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    size_t n = 512;
+    bool validate = false;
+    bool printResults = false;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            n = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+    
+    printf("Cholesky Decomposition Benchmark\n");
+    printf("Matrix size: %zu x %zu\n", n, n);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    
+    // Allocate matrix
+    std::vector<double> A(n * n);
+    std::vector<double> A_orig;
+    
+    // Generate positive definite matrix
+    printf("Generating positive definite matrix...\n");
+    generatePositiveDefiniteMatrix(A, n);
+    
+    if (validate) {
+        A_orig = A; // Save original for validation
+    }
+    
+    // Perform Cholesky decomposition
+    printf("Computing Cholesky decomposition...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    bool success = choleskyDecomposition(A, n);
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    
+    if (!success) {
+        printf("Cholesky decomposition failed\n");
+        return 1;
+    }
+    
+    printf("Computation time: %ld ms\n", duration.count());
+    
+    // Calculate GFLOPS (approximately n³/3 operations for Cholesky)
+    double ops = (double)n * n * n / 3.0;
+    double gflops = ops / (duration.count() / 1000.0) / 1e9;
+    printf("Performance: %.3f GFLOPS\n", gflops);
+    
+    // Print results for external validation
+    if (printResults) {
+        print_results(A, "CholeskyL");
+    }
+    
+    // Validation
+    if (validate) {
+        printf("Validating result...\n");
+        bool valid = validateCholesky(A, A_orig, n);
+        
+        if (valid) {
+            printf("Validation: PASSED\n");
+            return 0;
+        } else {
+            printf("Validation: FAILED\n");
+            return 1;
+        }
+    }
+    
+    return 0;
+}
