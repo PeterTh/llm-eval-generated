@@ -1039,7 +1039,10 @@ int main(int argc, char** argv) {
     printf("\n");
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long localDurations[3] = {preDuration, simDuration, distDuration};
+    long phaseMaxima[3] = {};
+    MPI_Reduce(localDurations, phaseMaxima, 3, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    long totalTime = phaseMaxima[0] + phaseMaxima[1] + phaseMaxima[2];
     printf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics
