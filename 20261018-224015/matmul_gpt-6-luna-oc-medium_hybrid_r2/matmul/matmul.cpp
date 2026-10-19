@@ -160,8 +160,10 @@ int main(int argc, char** argv) {
     }
     MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DOUBLE, C.data(), counts.data(), displacements.data(), MPI_DOUBLE, MPI_COMM_WORLD);
     const auto end = std::chrono::steady_clock::now();
+    const double localSeconds = std::chrono::duration<double>(end - start).count();
+    double seconds = 0.0;
+    MPI_Reduce(&localSeconds, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {
-        const double seconds = std::chrono::duration<double>(end - start).count();
         printf("Computation time: %.3f ms\n", seconds * 1000.0);
         printf("Performance: %.3f GFLOPS\n", (2.0 * N * N * N) / seconds / 1e9);
         if (printResults) print_results(C, "MatrixC");

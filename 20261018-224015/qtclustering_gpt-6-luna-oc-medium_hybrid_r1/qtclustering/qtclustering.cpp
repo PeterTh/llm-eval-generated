@@ -392,16 +392,19 @@ int main(int argc, char** argv) {
     std::vector<Point> points(num_points);
     if (rank == 0) generateSyntheticData(points, num_points);
     MPI_Bcast(points.data(), num_points * 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    auto cluster_start = std::chrono::high_resolution_clock::now();
     const std::vector<double> distances = makeDistanceMatrix(points);
     
     // Perform QT clustering
-    auto cluster_start = std::chrono::high_resolution_clock::now();
     
     const std::vector<Cluster> clusters = qtClustering(points, threshold, distances, rank, world_size);
     
     auto cluster_end = std::chrono::high_resolution_clock::now();
-    auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        cluster_end - cluster_start);
+    const long local_cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cluster_end - cluster_start).count();
+    long max_cluster_time = 0;
+    MPI_Reduce(&local_cluster_time, &max_cluster_time, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    const auto cluster_time = std::chrono::milliseconds(max_cluster_time);
     
     if (rank == 0) printf("Clustering time: %ld ms\n", cluster_time.count());
     if (rank == 0) {

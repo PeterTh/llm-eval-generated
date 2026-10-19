@@ -59,9 +59,11 @@ int main(int argc,char** argv){
     advance<<<blocks,threads>>>(c,mu,next,nx,ny,localZ,0.01,1,1,1,1);CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaDeviceSynchronize());std::swap(c,next);
  }
  MPI_Barrier(MPI_COMM_WORLD);auto end=std::chrono::high_resolution_clock::now();
+ double local_seconds=std::chrono::duration<double>(end-start).count(),seconds=0.0;
+ MPI_Reduce(&local_seconds,&seconds,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
  std::vector<int> counts(size),displs(size);for(int r=0;r<size;++r){size_t zc=nz/size+(static_cast<size_t>(r)<nz%size),zs=r*(nz/size)+std::min(static_cast<size_t>(r),nz%size);counts[r]=static_cast<int>(zc*plane);displs[r]=static_cast<int>(zs*plane);}
  std::vector<double> result;if(rank==0)result.resize(nx*ny*nz);MPI_Gatherv(c+plane,static_cast<int>(vol),MPI_DOUBLE,rank==0?result.data():nullptr,counts.data(),displs.data(),MPI_DOUBLE,0,MPI_COMM_WORLD);
- if(rank==0){double seconds=std::chrono::duration<double>(end-start).count();printf("Computation time: %ld ms\n",static_cast<long>(seconds*1000));printf("Performance: %.3f MCellUpdates/s\n",seconds>0?static_cast<double>(nx*ny*nz)*iterations/seconds/1e6:0.0);
+ if(rank==0){printf("Computation time: %ld ms\n",static_cast<long>(seconds*1000));printf("Performance: %.3f MCellUpdates/s\n",seconds>0?static_cast<double>(nx*ny*nz)*iterations/seconds/1e6:0.0);
  if(printResults)print_results(result,"Concentration");if(validate){bool ok=true;double lo=result[0],hi=result[0];for(double v:result){if(!std::isfinite(v))ok=false;lo=std::min(lo,v);hi=std::max(hi,v);}printf("Concentration range: [%.6f, %.6f]\n",lo,hi);if(hi>10||lo< -10)ok=false;printf("Validation: %s\n",ok?"PASSED":"FAILED");if(!ok){CUDA_CHECK(cudaFree(c));CUDA_CHECK(cudaFree(mu));CUDA_CHECK(cudaFree(next));MPI_Finalize();return 1;}}}
  CUDA_CHECK(cudaFree(c));CUDA_CHECK(cudaFree(mu));CUDA_CHECK(cudaFree(next));MPI_Finalize();return 0;
 }

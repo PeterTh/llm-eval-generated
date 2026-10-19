@@ -250,7 +250,10 @@ int main(int argc, char** argv) {
     if (rank == 0) results.swap(gathered);
     
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    const long long localDurationUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    long long maxDurationUs = 0;
+    MPI_Reduce(&localDurationUs, &maxDurationUs, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+    auto duration = std::chrono::microseconds(maxDurationUs);
     
     if (rank == 0) {
       printf("Computation time: %.3f ms\n", duration.count() / 1000.0);

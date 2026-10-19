@@ -203,13 +203,16 @@ int main(int argc, char** argv) {
     }
     
     auto end = std::chrono::high_resolution_clock::now();
+    long localDuration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     std::vector<Real> gathered;
     if (rank == 0) gathered.resize(nx * ny * nz);
     const auto& localFinal = (iterations % 2 == 0) ? grid1 : grid2;
     MPI_Gatherv(localFinal.data() + plane, counts[rank], MPI_DOUBLE, rank == 0 ? gathered.data() : nullptr,
                 counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (rank != 0) { MPI_Finalize(); return 0; }
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    auto duration = std::chrono::milliseconds(maxDuration);
     
     printf("Computation time: %ld ms\n", duration.count());
     

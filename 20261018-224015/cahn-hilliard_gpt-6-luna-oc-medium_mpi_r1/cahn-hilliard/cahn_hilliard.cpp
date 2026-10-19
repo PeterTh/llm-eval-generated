@@ -246,6 +246,10 @@ int main(int argc, char** argv) {
     std::vector<double> result(rank==0?gridSize:0);
     MPI_Gatherv(cold.data()+plane, static_cast<int>(localNz*plane), MPI_DOUBLE, result.data(), counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localMilliseconds = duration.count();
+    long maxMilliseconds = 0;
+    MPI_Reduce(&localMilliseconds, &maxMilliseconds, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) duration = std::chrono::milliseconds(maxMilliseconds);
     
     if (rank == 0) printf("Computation time: %ld ms\n", duration.count());
     

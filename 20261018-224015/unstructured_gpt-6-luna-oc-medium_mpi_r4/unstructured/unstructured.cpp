@@ -297,6 +297,7 @@ int main(int argc, char** argv) {
                    gathered.data(), counts.data(), displacements.data(), MPI_BYTE, MPI_COMM_WORLD);
     world.elements_dynamic.swap(gathered);
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    MPI_Allreduce(MPI_IN_PLACE, &duration_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
     
     if (rank == 0) printf("Computation time: %ld ms\n", duration_ms);
     

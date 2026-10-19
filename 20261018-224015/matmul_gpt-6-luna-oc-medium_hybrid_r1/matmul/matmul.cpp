@@ -182,7 +182,10 @@ int main(int argc, char** argv) {
     MPI_Gatherv(localC.data(), static_cast<int>(rows * N), MPI_DOUBLE, C.data(), counts.data(), displacements.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(C.data(), static_cast<int>(N * N), MPI_DOUBLE, 0, MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration = end - start;
+    double localSeconds = std::chrono::duration<double>(end - start).count();
+    double maxSeconds = 0.0;
+    MPI_Allreduce(&localSeconds, &maxSeconds, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    std::chrono::duration<double> duration(maxSeconds);
     
     if (rank == 0) printf("Computation time: %.3f ms\n", duration.count() * 1000.0);
     

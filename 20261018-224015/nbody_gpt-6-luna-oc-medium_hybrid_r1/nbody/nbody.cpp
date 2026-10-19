@@ -88,7 +88,10 @@ int main(int argc, char** argv) {
     }
     MPI_Barrier(MPI_COMM_WORLD);
     const auto duration=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()-start);
-    if(rank==0) printf("Simulation time: %ld ms\n",duration.count());
+    long localMs = duration.count();
+    long globalMs = 0;
+    MPI_Reduce(&localMs, &globalMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if(rank==0) printf("Simulation time: %ld ms\n",globalMs);
     if(rank==0 && printResults) {
         std::vector<double> data; data.reserve(static_cast<size_t>(n)*6);
         for(const auto& b:bodies) { data.insert(data.end(),{b.pos.x,b.pos.y,b.pos.z,b.vel.x,b.vel.y,b.vel.z}); }

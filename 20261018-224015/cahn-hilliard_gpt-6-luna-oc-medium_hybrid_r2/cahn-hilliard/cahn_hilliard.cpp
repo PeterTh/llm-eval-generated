@@ -224,11 +224,14 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     
-    if(rank==0) printf("Computation time: %ld ms\n", duration.count());
+    long local_ms = duration.count();
+    long max_ms = local_ms;
+    MPI_Reduce(&local_ms, &max_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if(rank==0) printf("Computation time: %ld ms\n", max_ms);
     
     // Calculate performance
     double cellUpdates = (double)gridSize * iterations;
-    double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
+    double mcups = cellUpdates / (max_ms / 1000.0) / 1e6;
     if(rank==0) printf("Performance: %.3f MCellUpdates/s\n", mcups);
     
     // Print results for external validation

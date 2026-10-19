@@ -221,11 +221,13 @@ int main(int argc, char** argv) {
     MPI_Gatherv(localResults.data(), static_cast<int>(localCount), MPI_DOUBLE,
                 results.data(), counts.data(), displacements.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    double localDuration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    double duration = 0.0;
+    MPI_Reduce(&localDuration, &duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     
     if (rank == 0) {
-      printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
-      printf("Options per second: %.0f\n", duration.count() ? numOptions / (duration.count() / 1e6) : 0.0);
+      printf("Computation time: %.3f ms\n", duration / 1000.0);
+      printf("Options per second: %.0f\n", duration ? numOptions / (duration / 1e6) : 0.0);
     }
     
     // Print results for external validation

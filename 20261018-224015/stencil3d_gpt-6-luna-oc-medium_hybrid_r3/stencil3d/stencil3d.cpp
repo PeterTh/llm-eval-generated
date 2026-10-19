@@ -84,8 +84,10 @@ int main(int argc, char** argv) {
     for(int r=0;r<ranks;++r){size_t n=base+(static_cast<size_t>(r)<rem);counts[r]=static_cast<int>(n*plane);displs[r]=static_cast<int>((static_cast<size_t>(r)*base+std::min(static_cast<size_t>(r),rem))*plane);}
     std::vector<Real> result(rank==0?nz*plane:0);
     MPI_Gatherv(a.data()+plane,static_cast<int>(localNz*plane),MPI_DOUBLE,result.data(),counts.data(),displs.data(),MPI_DOUBLE,0,MPI_COMM_WORLD);
+    const double localMs=std::chrono::duration<double,std::milli>(end-start).count();
+    double ms=0.0;
+    MPI_Reduce(&localMs,&ms,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     if (!rank) {
-        const double ms=std::chrono::duration<double,std::milli>(end-start).count();
         printf("Computation time: %.0f ms\n",ms);
         const double updates=static_cast<double>((nx-2)*(ny-2)*(nz-2))*iterations;
         printf("Performance: %.3f MCellUpdates/s\n",updates/(ms/1000.0)/1e6);

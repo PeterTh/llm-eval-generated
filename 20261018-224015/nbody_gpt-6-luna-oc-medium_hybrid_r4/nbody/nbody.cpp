@@ -232,7 +232,9 @@ int main(int argc, char** argv) {
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     
     cudaFree(deviceInput); cudaFree(deviceOutput); delete[] counts; delete[] displs;
-    if (rank == 0) printf("Simulation time: %ld ms\n", duration.count());
+    long localDuration = duration.count(), maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) printf("Simulation time: %ld ms\n", maxDuration);
     
     // Print results for external validation
     if (printResults && rank == 0) {

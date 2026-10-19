@@ -147,7 +147,9 @@ int main(int argc, char** argv) {
         for (size_t r = 0; r < localRows; ++r)
             for (size_t j = firstRow + r + 1; j < n; ++j) local[r * n + j] = 0.0;
     }
-    const double elapsed = MPI_Wtime() - start;
+    const double localElapsed = MPI_Wtime() - start;
+    double elapsed = 0.0;
+    MPI_Reduce(&localElapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     std::vector<double> result;
     if (rank == 0) result.resize(n * n);

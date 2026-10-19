@@ -78,8 +78,10 @@ int main(int argc,char** argv){
         std::copy(next.begin(),next.end(),old.begin()+plane); exchange(old,30);
     }
     CUDA_CHECK(cudaDeviceSynchronize()); auto end=std::chrono::steady_clock::now();
+    double localSeconds=std::chrono::duration<double>(end-start).count(), seconds=0.0;
+    MPI_Reduce(&localSeconds,&seconds,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     std::vector<int> counts(ranks),displs(ranks); for(int r=0;r<ranks;++r){size_t rz=nz/ranks+(r<static_cast<int>(nz%ranks)); counts[r]=static_cast<int>(rz*plane); displs[r]=static_cast<int>((r*(nz/ranks)+std::min<size_t>(r,nz%ranks))*plane);}
     std::vector<double> result(worldRank==0?nx*ny*nz:0); MPI_Gatherv(old.data()+plane,static_cast<int>(n),MPI_DOUBLE,result.data(),counts.data(),displs.data(),MPI_DOUBLE,0,MPI_COMM_WORLD);
-    if(worldRank==0){double seconds=std::chrono::duration<double>(end-start).count(); std::printf("Computation time: %ld ms\n",static_cast<long>(seconds*1000)); std::printf("Performance: %.3f MCellUpdates/s\n",seconds>0?nx*ny*nz*static_cast<double>(iterations)/seconds/1e6:0.0); if(printResults)print_results(result,"Concentration"); if(validate){double mn=*std::min_element(result.begin(),result.end()),mx=*std::max_element(result.begin(),result.end()); bool valid=std::all_of(result.begin(),result.end(),[](double x){return std::isfinite(x);})&&mn>=-10&&mx<=10; std::printf("Concentration range: [%.6f, %.6f]\nValidation: %s\n",mn,mx,valid?"PASSED":"FAILED"); if(!valid){cudaFree(dc);cudaFree(dm);cudaFree(dn);MPI_Finalize();return 1;}}}
+    if(worldRank==0){ std::printf("Computation time: %ld ms\n",static_cast<long>(seconds*1000)); std::printf("Performance: %.3f MCellUpdates/s\n",seconds>0?nx*ny*nz*static_cast<double>(iterations)/seconds/1e6:0.0); if(printResults)print_results(result,"Concentration"); if(validate){double mn=*std::min_element(result.begin(),result.end()),mx=*std::max_element(result.begin(),result.end()); bool valid=std::all_of(result.begin(),result.end(),[](double x){return std::isfinite(x);})&&mn>=-10&&mx<=10; std::printf("Concentration range: [%.6f, %.6f]\nValidation: %s\n",mn,mx,valid?"PASSED":"FAILED"); if(!valid){cudaFree(dc);cudaFree(dm);cudaFree(dn);MPI_Finalize();return 1;}}}
     cudaFree(dc);cudaFree(dm);cudaFree(dn); MPI_Finalize(); return 0;
 }

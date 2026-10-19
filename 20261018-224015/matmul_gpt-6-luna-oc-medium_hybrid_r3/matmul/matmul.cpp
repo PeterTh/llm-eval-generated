@@ -169,12 +169,14 @@ int main(int argc, char** argv) {
                 (endRow-begin)*N, MPI_DOUBLE, C.data(), counts, displs, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    double local_duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    double duration_ms = 0.0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     
-    if(rank==0) printf("Computation time: %ld ms\n", duration.count());
+    if(rank==0) printf("Computation time: %.6f ms\n", duration_ms);
     
     // Calculate GFLOPS
-    double gflops = duration.count() ? (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9 : 0.0;
+    double gflops = duration_ms ? (2.0 * N * N * N) / (duration_ms / 1000.0) / 1e9 : 0.0;
     if(rank==0) printf("Performance: %.3f GFLOPS\n", gflops);
     
     // Print results for external validation

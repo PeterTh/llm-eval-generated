@@ -220,6 +220,10 @@ int main(int argc, char** argv) {
     
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_ms = duration.count();
+    long max_ms = 0;
+    MPI_Reduce(&local_ms, &max_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) duration = std::chrono::milliseconds(max_ms);
     
     if (!success) {
         if (rank == 0) printf("Cholesky decomposition failed\n");

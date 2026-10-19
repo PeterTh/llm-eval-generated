@@ -285,13 +285,12 @@ int main(int argc, char** argv) {
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-    if (rank == 0) printf("Computation time: %ld ms\n", duration.count());
-    
-    // Calculate performance metrics
     double elapsed = std::chrono::duration<double>(end - start).count();
     MPI_Allreduce(MPI_IN_PLACE, &elapsed, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+    if (rank == 0) printf("Computation time: %.3f ms\n", elapsed * 1000.0);
+    
+    // Calculate performance metrics
     const double gflops = elapsed > 0 ? (2.0 * nItems * iterations) / elapsed / 1e9 : 0;
     const double avgTime = iterations ? elapsed * 1000.0 / iterations : 0;
     

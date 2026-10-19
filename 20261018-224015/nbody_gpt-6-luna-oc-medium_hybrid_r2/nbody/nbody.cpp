@@ -171,7 +171,10 @@ int main(int argc, char** argv) {
     }
     MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
-    if (rank == 0) printf("Simulation time: %ld ms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count());
+    const long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count();
+    long max_elapsed_ms = 0;
+    MPI_Reduce(&elapsed_ms, &max_elapsed_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) printf("Simulation time: %ld ms\n", max_elapsed_ms);
     if (rank == 0 && printResults) {
         std::vector<double> data; data.reserve(static_cast<size_t>(numBodies)*6);
         for (const auto& b : bodies) { data.push_back(b.pos.x); data.push_back(b.pos.y); data.push_back(b.pos.z); data.push_back(b.vel.x); data.push_back(b.vel.y); data.push_back(b.vel.z); }

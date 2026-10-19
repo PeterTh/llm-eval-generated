@@ -127,8 +127,10 @@ int main(int argc, char** argv) {
                 counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
+    const double localSeconds = std::chrono::duration<double>(end - start).count();
+    double seconds = 0.0;
+    MPI_Reduce(&localSeconds, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {
-        const double seconds = std::chrono::duration<double>(end - start).count();
         printf("Computation time: %ld ms\n", static_cast<long>(seconds * 1000.0));
         printf("Performance: %.3f GFLOPS\n", (2.0 * N * N * N) / seconds / 1e9);
         if (printResults) print_results(C, "MatrixC");
