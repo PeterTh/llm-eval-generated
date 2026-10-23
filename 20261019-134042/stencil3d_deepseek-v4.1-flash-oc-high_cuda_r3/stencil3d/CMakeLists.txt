@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.24)
+project(stencil3d_benchmark LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# CMake initializes this to nvcc's default (52) when the language is enabled.
+# Prefer the architecture of the GPU present on the build/run machine.
+if(NOT CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "52")
+    set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
+
+set_source_files_properties(stencil3d.cpp PROPERTIES LANGUAGE CUDA)
+
+add_executable(stencil3d stencil3d.cpp)
+
+# Enable optimizations
+target_compile_options(stencil3d PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -Wall -Wextra>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3 -Wall -Wextra>)
+
+# Link math library
+target_link_libraries(stencil3d m)
