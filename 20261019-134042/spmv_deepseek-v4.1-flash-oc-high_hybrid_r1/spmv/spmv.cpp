@@ -405,7 +405,9 @@ int main(int argc, char** argv) {
     checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    const long long localElapsedUs = static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+    long long elapsedUs = 0;
+    MPI_Reduce(&localElapsedUs, &elapsedUs, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (localRows > 0 && iterations > 0) {
         checkCuda(cudaMemcpy(h_out.data(), d_out, localRows * sizeof(double), cudaMemcpyDeviceToHost), "copy out");

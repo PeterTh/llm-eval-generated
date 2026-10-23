@@ -217,7 +217,10 @@ int main(int argc, char** argv) {
                 0, MPI_COMM_WORLD);
 
     const double endTime = MPI_Wtime();
-    const double elapsedSeconds = endTime - startTime;
+    const double localElapsedSeconds = endTime - startTime;
+    double elapsedSeconds = 0.0;
+    MPI_Reduce(&localElapsedSeconds, &elapsedSeconds, 1, MPI_DOUBLE,
+               MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
         const long elapsedMs = static_cast<long>(elapsedSeconds * 1000.0);

@@ -292,6 +292,7 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     double elapsedSec = std::chrono::duration<double>(end - start).count();
+    MPI_Allreduce(MPI_IN_PLACE, &elapsedSec, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     long long elapsedMs = static_cast<long long>(elapsedSec * 1000.0);
 
     if (rank == 0) {

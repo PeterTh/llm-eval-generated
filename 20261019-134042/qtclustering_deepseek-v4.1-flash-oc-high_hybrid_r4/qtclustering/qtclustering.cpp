@@ -655,6 +655,8 @@ int main(int argc, char** argv) {
     std::vector<double> host_dist(
         static_cast<size_t>(num_points) * static_cast<size_t>(num_points));
 
+    const auto cluster_start = std::chrono::high_resolution_clock::now();
+
 #pragma omp parallel for schedule(static)
     for (int j = 0; j < num_points; ++j) {
         double* row =
@@ -673,15 +675,17 @@ int main(int argc, char** argv) {
     std::vector<double>().swap(host_dist);
 
     MPI_Barrier(MPI_COMM_WORLD);
-    const auto cluster_start = std::chrono::high_resolution_clock::now();
-
     const std::vector<Cluster> clusters =
         qtClustering(points, threshold, rank, world_size, gpu);
 
     MPI_Barrier(MPI_COMM_WORLD);
     const auto cluster_end = std::chrono::high_resolution_clock::now();
-    const auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        cluster_end - cluster_start);
+    const long local_cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cluster_end - cluster_start).count();
+    long max_cluster_time = 0;
+    MPI_Reduce(&local_cluster_time, &max_cluster_time, 1, MPI_LONG,
+               MPI_MAX, 0, MPI_COMM_WORLD);
+    const std::chrono::milliseconds cluster_time(max_cluster_time);
 
     destroyGpuWorkspace(gpu);
     MPI_Comm_free(&node_comm);

@@ -482,12 +482,15 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    const double local_us = static_cast<double>(duration.count());
+    double global_us = 0.0;
+    MPI_Reduce(&local_us, &global_us, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     destroyGpuBuffers(gpu);
 
     if (rank == 0) {
-        const double seconds = duration.count() / 1e6;
-        printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
+        const double seconds = global_us / 1e6;
+        printf("Computation time: %.3f ms\n", global_us / 1000.0);
         printf("Options per second: %.0f\n",
                seconds > 0.0 ? numOptions / seconds : 0.0);
     }

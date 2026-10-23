@@ -487,6 +487,8 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_ms = duration.count(), global_ms = 0;
+    MPI_Reduce(&local_ms, &global_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather the final concentration field onto rank 0 for output/validation.
     std::vector<double> globalC;
@@ -524,10 +526,10 @@ int main(int argc, char** argv) {
     }
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", global_ms);
         
         double cellUpdates = static_cast<double>(gridSize) * iterations;
-        double elapsed = duration.count() / 1000.0;
+        double elapsed = global_ms / 1000.0;
         if (elapsed <= 0.0) elapsed = 1e-9;
         double mcups = cellUpdates / elapsed / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);

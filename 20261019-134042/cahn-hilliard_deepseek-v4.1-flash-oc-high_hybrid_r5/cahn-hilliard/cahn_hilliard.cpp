@@ -706,14 +706,17 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_ms = duration.count();
+    long max_ms = 0;
+    MPI_CHECK(MPI_Reduce(&local_ms, &max_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD));
 
     if (world_rank == 0) {
-        printf("Computation time: %ld ms\n", static_cast<long>(duration.count()));
+        printf("Computation time: %ld ms\n", max_ms);
 
         const double gridSize = static_cast<double>(nx) * static_cast<double>(ny) *
                                 static_cast<double>(nz);
         const double cellUpdates = gridSize * iterations;
-        const double seconds = duration.count() / 1000.0;
+        const double seconds = max_ms / 1000.0;
         const double mcups = seconds > 0.0 ? cellUpdates / seconds / 1e6 : 0.0;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }

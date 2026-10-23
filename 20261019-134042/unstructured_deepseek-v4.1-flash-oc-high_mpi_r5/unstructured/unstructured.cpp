@@ -496,6 +496,7 @@ int main(int argc, char** argv) {
     auto duration_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
             .count();
+    MPI_Allreduce(MPI_IN_PLACE, &duration_ms, 1, MPI_LONG, MPI_MAX, world.cart);
 
     uint64_t local_hash = computeLocalHash(world);
     uint64_t global_hash = 0;

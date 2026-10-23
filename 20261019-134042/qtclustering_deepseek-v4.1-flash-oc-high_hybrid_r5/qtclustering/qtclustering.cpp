@@ -572,6 +572,10 @@ int main(int argc, char** argv) {
     const std::vector<Cluster> clusters =
         qtClustering(points, threshold, gpu, mpi_rank, mpi_size, device_id);
     const double cluster_end = MPI_Wtime();
+    const double local_cluster_elapsed = cluster_end - cluster_start;
+    double max_cluster_elapsed = 0.0;
+    MPI_Reduce(&local_cluster_elapsed, &max_cluster_elapsed, 1, MPI_DOUBLE,
+               MPI_MAX, 0, MPI_COMM_WORLD);
 
     cudaDeviceSynchronize();
 
@@ -587,7 +591,7 @@ int main(int argc, char** argv) {
     int exit_code = 0;
     if (mpi_rank == 0) {
         const long long cluster_ms =
-            static_cast<long long>((cluster_end - cluster_start) * 1000.0);
+            static_cast<long long>(max_cluster_elapsed * 1000.0);
         printf("Clustering time: %lld ms\n", cluster_ms);
         printf("Clusters found: %zu\n", clusters.size());
 
@@ -609,7 +613,7 @@ int main(int argc, char** argv) {
         printf("Average cluster size: %.2f\n", avg_cluster_size);
         printf("Maximum cluster size: %d\n", max_cluster_size);
 
-        const double time_sec = (cluster_end - cluster_start);
+        const double time_sec = max_cluster_elapsed;
         const double safe_time = (time_sec > 0.0) ? time_sec : 1e-9;
         const double clusters_per_sec = clusters.size() / safe_time;
         const double points_per_sec = num_points / safe_time;

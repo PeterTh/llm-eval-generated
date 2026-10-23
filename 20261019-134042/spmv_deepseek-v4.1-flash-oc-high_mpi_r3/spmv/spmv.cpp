@@ -326,6 +326,12 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const long localDurationMs = duration.count();
+    long maxDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &maxDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (isRoot) {
+        duration = std::chrono::milliseconds(maxDurationMs);
+    }
 
     // Collect the distributed output vector on the root for reporting and
     // validation.

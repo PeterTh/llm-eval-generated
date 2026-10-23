@@ -259,9 +259,11 @@ int main(int argc, char** argv) {
 
     const double tEnd = MPI_Wtime();
     const long durationMs = static_cast<long>((tEnd - tStart) * 1000.0);
+    long maxDurationMs;
+    MPI_Reduce(&durationMs, &maxDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Simulation time: %ld ms\n", durationMs);
+        printf("Simulation time: %ld ms\n", maxDurationMs);
     }
 
     // Gather the final state on rank 0 for result output / validation.

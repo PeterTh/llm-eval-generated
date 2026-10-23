@@ -1205,7 +1205,11 @@ int main(int argc, char** argv) {
     if (rank == 0) printf("Computing distances via cross-correlation...\n");
     computeDistances(state, counts, displs, rank);
 
+    cudaDeviceSynchronize();
     double endDist = MPI_Wtime();
+    double localElapsed = endDist - startPre;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&localElapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     long distDuration = static_cast<long>((endDist - startDist) * 1000.0);
     if (rank == 0) {
         printf("Distance computation time: %ld ms\n", distDuration);
@@ -1225,7 +1229,7 @@ int main(int argc, char** argv) {
     int rc = 0;
     if (rank == 0) {
         // Total time
-        long totalTime = preDuration + simDuration + distDuration;
+        long totalTime = static_cast<long>(maxElapsed * 1000.0);
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

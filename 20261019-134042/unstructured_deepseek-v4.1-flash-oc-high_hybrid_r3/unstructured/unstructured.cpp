@@ -433,6 +433,8 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+    mpiCheck(MPI_Allreduce(MPI_IN_PLACE, &duration_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD),
+             "MPI_Allreduce timing");
 
     std::vector<val_t> local_energy(static_cast<size_t>(sim.local_n));
     std::vector<val_t> local_flux(static_cast<size_t>(sim.local_n));

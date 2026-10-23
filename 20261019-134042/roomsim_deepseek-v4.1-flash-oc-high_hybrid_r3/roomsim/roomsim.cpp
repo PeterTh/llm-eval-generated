@@ -1284,9 +1284,14 @@ int main(int argc, char** argv) {
     MPI_Reduce(&localNonZeroKij, &globalNonZeroKij, 1, MPI_INT, MPI_SUM, 0,
                MPI_COMM_WORLD);
 
+    long localPhaseDurations[3] = {preDuration, simDuration, distDuration};
+    long maxPhaseDurations[3];
+    MPI_Reduce(localPhaseDurations, maxPhaseDurations, 3, MPI_LONG, MPI_MAX, 0,
+               MPI_COMM_WORLD);
+
     if (rank == 0) {
         // Total time
-        long totalTime = preDuration + simDuration + distDuration;
+        long totalTime = maxPhaseDurations[0] + maxPhaseDurations[1] + maxPhaseDurations[2];
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

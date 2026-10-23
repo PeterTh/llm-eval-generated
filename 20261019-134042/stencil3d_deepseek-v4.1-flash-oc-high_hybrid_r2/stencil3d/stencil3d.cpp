@@ -325,6 +325,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDurationMs = duration.count();
+    long maxDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &maxDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Gather the final state when it is needed for output/validation.
     std::vector<Real> finalGrid;
@@ -355,10 +358,10 @@ int main(int argc, char** argv) {
     }
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", static_cast<long>(duration.count()));
+        printf("Computation time: %ld ms\n", maxDurationMs);
 
         double cellUpdates = (double)((nx - 2) * (ny - 2) * (nz - 2)) * iterations;
-        double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
+        double mcups = cellUpdates / (maxDurationMs / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
 
         if (printResults) {

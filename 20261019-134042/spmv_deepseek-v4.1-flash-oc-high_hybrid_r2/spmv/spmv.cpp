@@ -507,8 +507,10 @@ int main(int argc, char** argv) {
     }
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    const double elapsedMs =
+    const double localElapsedMs =
         std::chrono::duration<double, std::milli>(end - start).count();
+    double elapsedMs = 0.0;
+    MPI_Reduce(&localElapsedMs, &elapsedMs, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (useEll) {
         cudaMemcpy(localOut.data(), d_out, static_cast<size_t>(localRows) * sizeof(double),

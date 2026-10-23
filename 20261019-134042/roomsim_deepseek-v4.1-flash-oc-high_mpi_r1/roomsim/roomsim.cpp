@@ -1006,7 +1006,12 @@ int main(int argc, char** argv) {
     }
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    double localPhaseTimes[3] = {endPre - startPre, endSim - startSim, endDist - startDist};
+    double maxPhaseTimes[3] = {};
+    MPI_Reduce(localPhaseTimes, maxPhaseTimes, 3, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
+    long totalTime = static_cast<long>((maxPhaseTimes[0] + maxPhaseTimes[1] +
+                                        maxPhaseTimes[2]) * 1000.0);
 
     // Performance metrics
     size_t n = state.numTriangles;

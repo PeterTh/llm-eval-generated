@@ -242,7 +242,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    const double elapsed = MPI_Wtime() - startTime;
+    const double localElapsed = MPI_Wtime() - startTime;
+    double elapsed = 0.0;
+    MPI_Reduce(&localElapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // Collect the complete final state on rank 0 for output/validation.
     int localReturnCode = 0;

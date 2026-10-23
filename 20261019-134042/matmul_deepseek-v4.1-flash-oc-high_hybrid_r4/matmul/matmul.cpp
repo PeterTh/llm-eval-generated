@@ -493,7 +493,9 @@ int main(int argc, char** argv) {
     }
 
     auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
-    const long long elapsedNs = std::max<long long>(1, duration.count());
+    const long long localElapsedNs = std::max<long long>(1, duration.count());
+    long long elapsedNs = 0;
+    MPI_Reduce(&localElapsedNs, &elapsedNs, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
 
     int exitCode = 0;
     if (rank == 0) {

@@ -437,7 +437,10 @@ double runSimulation(World& world, const int n_elems_root, const int n_iters) {
     cudaCheck(cudaFree(d_energy[1]), "cudaFree energy 1");
     cudaCheck(cudaFree(d_flux), "cudaFree flux");
 
-    return compute_ms;
+    double max_compute_ms = 0.0;
+    MPI_Allreduce(&compute_ms, &max_compute_ms, 1, MPI_DOUBLE, MPI_MAX,
+                  MPI_COMM_WORLD);
+    return max_compute_ms;
 }
 
 // Validate simulation results

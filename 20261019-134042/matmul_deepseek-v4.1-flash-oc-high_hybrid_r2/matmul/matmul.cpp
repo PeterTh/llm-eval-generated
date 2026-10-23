@@ -414,13 +414,15 @@ int main(int argc, char** argv) {
         }
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
 
-    const auto duration =
-        std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    const double seconds =
+    const double localSeconds =
         std::chrono::duration<double>(end - start).count();
+    double seconds = 0.0;
+    MPI_Reduce(&localSeconds, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    const auto duration =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::duration<double>(seconds));
 
     if (worldRank == 0) {
         printf("Computation time: %ld ms\n", static_cast<long>(duration.count()));

@@ -374,8 +374,11 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     const double endTime = MPI_Wtime();
 
+    const double localElapsed = endTime - startTime;
+    double elapsed = 0.0;
+    MPI_Reduce(&localElapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
     if (rank == 0) {
-        const double elapsed = endTime - startTime;
         const long durationMs = static_cast<long>(elapsed * 1000.0);
         printf("Computation time: %ld ms\n", durationMs);
 

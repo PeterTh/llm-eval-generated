@@ -572,11 +572,14 @@ int main(int argc, char** argv) {
     MPI_Barrier(comm);
     auto end = std::chrono::high_resolution_clock::now();
 
+    auto local_duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG, MPI_MAX, 0, comm);
+
     bool valid = true;
 
     if (rank == 0) {
-        auto duration_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
         printf("Computation time: %ld ms\n", duration_ms);
 

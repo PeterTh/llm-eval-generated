@@ -457,8 +457,13 @@ int main(int argc, char** argv) {
 
     runSimulation(world, n_iters, prev_rank, next_rank);
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
+    const long local_duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
+            .count();
+    long duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     const uint64_t local_hash = computeLocalHash(world);
     uint64_t result_hash = 0;
@@ -474,10 +479,6 @@ int main(int argc, char** argv) {
     int local_rc = 0;
 
     if (rank == 0) {
-        auto duration_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
-                .count();
-
         printf("Computation time: %ld ms\n", duration_ms);
 
         // Calculate performance metrics

@@ -991,6 +991,7 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double endPre = MPI_Wtime();
     long preDuration = static_cast<long>((endPre - startPre) * 1000.0);
+    MPI_Allreduce(MPI_IN_PLACE, &preDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     if (rank == 0) {
         printf("Precomputation time: %ld ms\n", preDuration);
@@ -1006,6 +1007,7 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double endSim = MPI_Wtime();
     long simDuration = static_cast<long>((endSim - startSim) * 1000.0);
+    MPI_Allreduce(MPI_IN_PLACE, &simDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     if (rank == 0) {
         printf("Simulation time: %ld ms\n", simDuration);
@@ -1021,6 +1023,7 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double endDist = MPI_Wtime();
     long distDuration = static_cast<long>((endDist - startDist) * 1000.0);
+    MPI_Allreduce(MPI_IN_PLACE, &distDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     if (rank == 0) {
         printf("Distance computation time: %ld ms\n", distDuration);
