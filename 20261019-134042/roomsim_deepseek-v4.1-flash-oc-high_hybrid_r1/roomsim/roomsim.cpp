@@ -1558,6 +1558,11 @@ int main(int argc, char** argv) {
         printf("\n");
     }
 
+    long localPhaseDurations[3] = {preDuration, simDuration, distDuration};
+    long globalPhaseDurations[3];
+    MPI_Reduce(localPhaseDurations, globalPhaseDurations, 3, MPI_LONG, MPI_MAX, 0,
+               MPI_COMM_WORLD);
+
     long long localNonZeroKij = 0;
     if (validate) {
         localNonZeroKij = countNonzeroFormFactors(state);
@@ -1570,7 +1575,7 @@ int main(int argc, char** argv) {
 
     if (rank == 0) {
         // Total time
-        long totalTime = preDuration + simDuration + distDuration;
+        long totalTime = globalPhaseDurations[0] + globalPhaseDurations[1] + globalPhaseDurations[2];
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

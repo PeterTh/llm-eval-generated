@@ -807,8 +807,12 @@ int main(int argc, char** argv) {
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     const auto end = std::chrono::steady_clock::now();
 
+    const double local_seconds = std::chrono::duration<double>(end - start).count();
+    double seconds = 0.0;
+    MPI_CHECK(MPI_Reduce(&local_seconds, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0,
+                         MPI_COMM_WORLD));
+
     if (rank == 0) {
-        const double seconds = std::chrono::duration<double>(end - start).count();
         printf("Computation time: %ld ms\n",
                static_cast<long>(seconds * 1000.0));
         const double ops = static_cast<double>(n) * static_cast<double>(n) *

@@ -386,14 +386,17 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
     const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    const long localDurationMs = duration.count();
+    long maxDurationMs = 0;
+    MPI_Reduce(&localDurationMs, &maxDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     const size_t gridSize = nx * ny * nz;
 
     if (worldRank == 0) {
-        printf("Computation time: %ld ms\n", static_cast<long>(duration.count()));
+        printf("Computation time: %ld ms\n", maxDurationMs);
 
         const double cellUpdates = static_cast<double>(gridSize) * iterations;
-        const double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
+        const double mcups = cellUpdates / (maxDurationMs / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

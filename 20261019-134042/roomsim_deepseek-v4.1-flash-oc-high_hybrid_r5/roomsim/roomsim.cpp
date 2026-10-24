@@ -1416,6 +1416,10 @@ int main(int argc, char** argv) {
     auto endDist = std::chrono::high_resolution_clock::now();
     auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
 
+    long localDurations[3] = {preDuration, simDuration, distDuration};
+    long maxDurations[3];
+    MPI_Reduce(localDurations, maxDurations, 3, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     int validationStatus = 1;
 
     if (state.rank == 0) {
@@ -1423,7 +1427,7 @@ int main(int argc, char** argv) {
         printf("\n");
 
         // Total time
-        long totalTime = preDuration + simDuration + distDuration;
+        long totalTime = maxDurations[0] + maxDurations[1] + maxDurations[2];
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

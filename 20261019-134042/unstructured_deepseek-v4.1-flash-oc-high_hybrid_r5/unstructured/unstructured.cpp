@@ -612,8 +612,12 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    const double duration_ms =
+    const double local_duration_ms =
         std::chrono::duration<double, std::milli>(end - start).count();
+    double duration_ms = 0.0;
+    checkMpi(MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_DOUBLE, MPI_MAX,
+                        0, MPI_COMM_WORLD),
+             "MPI_Reduce timing");
 
     std::vector<double> host_energy(static_cast<size_t>(mesh.total));
     std::vector<double> host_flux(static_cast<size_t>(mesh.total));
