@@ -1,14 +1,20 @@
 /**
  * Room Response Simulation Benchmark
- * 
- * This is a simplified, purely sequential implementation of room impulse response
- * simulation using radiosity-based wave propagation. It models how sound/light
- * waves propagate between surfaces in a room by computing:
- * 
- * 1. Form factors (Kij) between all pairs of triangles based on visibility and geometry
+ *
+ * Hybrid MPI + OpenMP + CUDA implementation of the room impulse response
+ * simulation.  Work is partitioned across MPI ranks (contiguous groups of
+ * receiver triangles), each rank drives an NVIDIA GPU for the two dominant
+ * phases (form factors and wave propagation) and uses OpenMP for the
+ * remaining bandwidth-bound host phases.  The result is identical to the
+ * sequential reference output while scaling across the whole cluster.
+ *
+ * 1. Form factors (Kij) between all pairs of triangles based on visibility
+ *    and geometry (GPU, octree-accelerated, one thread per pair).
  * 2. Wave propagation using radiosity equations with time delays (Tau)
+ *    (GPU, one thread per receiver triangle per timestep).
  * 3. Distance estimation via cross-correlation of radiosity values
- * 
+ *    (OpenMP, distributed across ranks).
+ *
  * The implementation generates a procedural icosphere mesh to simulate a room.
  */
 
@@ -23,6 +29,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <random>
 #include <vector>
 
 #include <mpi.h>
@@ -31,22 +38,12 @@
 
 #include "../common/results_output.hpp"
 
-#ifdef __CUDACC__
-#define HD __host__ __device__
-#else
-#define HD
-#endif
-
 // ============================================================================
 // Types and Constants
 // ============================================================================
 
 using idx_t = uint32_t;
 using val_t = float;
-
-HD inline val_t hd_sqrt(val_t v) { return sqrtf(v); }
-HD inline val_t hd_abs(val_t v) { return v < 0.0f ? -v : v; }
-HD inline val_t hd_max(val_t a, val_t b) { return a > b ? a : b; }
 
 constexpr val_t PI = 3.14159265358979323846f;
 constexpr val_t ZERO = 0.0f;
@@ -56,6 +53,8 @@ constexpr val_t INV_WAVE_SPEED = 1.0f / WAVE_SPEED;
 constexpr int NUM_RAYS = 16;              // Number of rays for visibility sampling
 constexpr val_t INV_NUM_RAYS = 1.0f / NUM_RAYS;
 constexpr val_t EPSILON = 1e-6f;
+
+#define HD __host__ __device__
 
 // ============================================================================
 // Vector and Triangle Types
@@ -80,14 +79,15 @@ struct Vec3 {
     }
 
     HD val_t squaredNorm() const { return x * x + y * y + z * z; }
-    HD val_t norm() const { return hd_sqrt(squaredNorm()); }
+    HD val_t norm() const { return sqrtf(squaredNorm()); }
     HD Vec3 normalized() const {
         val_t n = norm();
         return n > EPSILON ? *this / n : Vec3();
     }
 
     HD bool operator==(const Vec3& o) const {
-        return hd_abs(x - o.x) < EPSILON && hd_abs(y - o.y) < EPSILON && hd_abs(z - o.z) < EPSILON;
+        return fabsf(x - o.x) < EPSILON && fabsf(y - o.y) < EPSILON &&
+               fabsf(z - o.z) < EPSILON;
     }
 };
 
@@ -178,15 +178,6 @@ bool triangleBoxOverlap(const Vec3& boxCenter, const Vec3& boxHalfSize, const Tr
 // ============================================================================
 // Octree for Spatial Acceleration
 // ============================================================================
-
-// Flattened octree node used by the CUDA traversal kernels.
-struct FlatOctree {
-    Vec3 center;
-    Vec3 halfExtent;
-    int child[8];
-    int triStart;
-    int triCount;
-};
 
 constexpr size_t MAX_OCTREE_TRIS = 8;
 constexpr val_t MAX_OCTREE_LEAF_SIZE = 0.5f;
@@ -311,30 +302,9 @@ public:
         return true;
     }
 
-    // Flatten this octree into contiguous arrays for GPU traversal.
-    int flatten(std::vector<FlatOctree>& nodes, std::vector<int>& triIndices) const {
-        int childIdx[8];
-        for (int i = 0; i < 8; ++i) {
-            childIdx[i] = children[i] ? children[i]->flatten(nodes, triIndices) : -1;
-        }
-
-        int index = static_cast<int>(nodes.size());
-        FlatOctree fn;
-        fn.center = center;
-        fn.halfExtent = halfExtent;
-        fn.triStart = static_cast<int>(triIndices.size());
-        fn.triCount = static_cast<int>(triangleIndices.size());
-        for (int i = 0; i < 8; ++i) fn.child[i] = childIdx[i];
-        for (size_t idx : triangleIndices) triIndices.push_back(static_cast<int>(idx));
-        nodes.push_back(fn);
-        return index;
-    }
-
     // Apply a function to all triangles potentially intersecting the ray
-    // Returns true if the function returns true for any triangle
     template<typename Func>
     bool applyToTris(const Vec3& p1, const Vec3& p2, Func&& func) const {
-        // If leaf node, check triangles directly
         if (!triangleIndices.empty()) {
             for (size_t idx : triangleIndices) {
                 if (func(idx, (*allTriangles)[idx])) return true;
@@ -342,7 +312,6 @@ public:
             return false;
         }
 
-        // Otherwise, descend to children
         for (int i = 0; i < 8; ++i) {
             if (children[i] && children[i]->rayIntersectsBox(p1, p2)) {
                 if (children[i]->applyToTris(p1, p2, func)) return true;
@@ -351,6 +320,55 @@ public:
         return false;
     }
 };
+
+// ----------------------------------------------------------------------------
+// Flat octree representation used by CUDA kernels
+// ----------------------------------------------------------------------------
+
+struct GpuNode {
+    Vec3 center;
+    Vec3 halfExtent;
+    int child[8];
+    int triStart;
+    int triCount;
+};
+
+static int flattenOctreeNode(const Octree& node, std::vector<GpuNode>& nodes,
+                             std::vector<int>& triIndices, int& nextTri) {
+    int myIndex = static_cast<int>(nodes.size());
+    nodes.push_back(GpuNode{});
+
+    Vec3 c = node.center;
+    Vec3 h = node.halfExtent;
+    int triStart = 0;
+    int triCount = 0;
+
+    if (!node.triangleIndices.empty()) {
+        triStart = nextTri;
+        triCount = static_cast<int>(node.triangleIndices.size());
+        for (size_t idx : node.triangleIndices) {
+            triIndices.push_back(static_cast<int>(idx));
+        }
+        nextTri += triCount;
+    } else {
+        for (int i = 0; i < 8; ++i) {
+            int ci = -1;
+            if (node.children[i]) {
+                ci = flattenOctreeNode(*node.children[i], nodes, triIndices, nextTri);
+            }
+            nodes[myIndex].child[i] = ci;
+        }
+    }
+    for (int i = 0; i < 8; ++i) {
+        if (node.children[i] == nullptr) nodes[myIndex].child[i] = -1;
+    }
+
+    nodes[myIndex].center = c;
+    nodes[myIndex].halfExtent = h;
+    nodes[myIndex].triStart = triStart;
+    nodes[myIndex].triCount = triCount;
+    return myIndex;
+}
 
 // ============================================================================
 // Mesh Generation: Icosphere
@@ -429,31 +447,15 @@ public:
 };
 
 // ============================================================================
-// Random Number Generation
+// Random number generation (bit-exact reproduction of the reference stream)
 // ============================================================================
 
-class RandomGenerator {
-    uint64_t state;
+// The exact reference stream is obtained with std::mt19937 directly; each
+// rank jumps to its own offset with mt19937::discard and then advances the
+// stream locally in row-major order.
 
-    static HD uint64_t mix(uint64_t z) {
-        z += 0x9e3779b97f4a7c15ULL;
-        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-        return z ^ (z >> 31);
-    }
-public:
-    HD explicit RandomGenerator(uint32_t seed = 42) : state(mix(static_cast<uint64_t>(seed) + 1ULL)) {}
-    HD val_t rand() {
-        state += 0x9e3779b97f4a7c15ULL;
-        uint64_t z = mix(state);
-        return static_cast<val_t>(z >> 40) * (1.0f / 16777216.0f);
-    }
-};
-
-// Generate a random point inside a triangle using barycentric coordinates
-HD Vec3 randomPointInTriangle(const Triangle& t, RandomGenerator& rng) {
-    val_t u = rng.rand();
-    val_t v = rng.rand();
+// Build a sample point from two uniform barycentric samples.
+HD inline Vec3 pointInTriangleUV(const Triangle& t, val_t u, val_t v) {
     if (u + v > 1.0f) {
         u = 1.0f - u;
         v = 1.0f - v;
@@ -467,122 +469,57 @@ HD Vec3 randomPointInTriangle(const Triangle& t, RandomGenerator& rng) {
 // Ray-Triangle Intersection (Möller-Trumbore algorithm)
 // ============================================================================
 
-HD val_t rayTriangleIntersect(const Vec3& orig, const Vec3& dir,
-                            const Vec3& v0, const Vec3& v1, const Vec3& v2) {
+HD inline val_t rayTriangleIntersect(const Vec3& orig, const Vec3& dir,
+                                     const Vec3& v0, const Vec3& v1, const Vec3& v2) {
+    const val_t BIG = 3.402823466e+38f;
+
     Vec3 e1 = v1 - v0;
     Vec3 e2 = v2 - v0;
     Vec3 pvec = dir.cross(e2);
     val_t det = e1.dot(pvec);
 
-    if (hd_abs(det) < EPSILON) return 3.4028234663852886e38f;
+    if (fabsf(det) < EPSILON) return BIG;
 
     val_t invDet = 1.0f / det;
     Vec3 tvec = orig - v0;
     val_t u = tvec.dot(pvec) * invDet;
-    if (u < 0.0f || u > 1.0f) return 3.4028234663852886e38f;
+    if (u < 0.0f || u > 1.0f) return BIG;
 
     Vec3 qvec = tvec.cross(e1);
     val_t v = dir.dot(qvec) * invDet;
-    if (v < 0.0f || u + v > 1.0f) return 3.4028234663852886e38f;
+    if (v < 0.0f || u + v > 1.0f) return BIG;
 
     return e2.dot(qvec) * invDet;
 }
 
 // ============================================================================
-// Visibility Testing (Octree-accelerated)
+// Visibility Testing (octree-accelerated, device)
 // ============================================================================
 
-// Check if a ray between two triangles is blocked by any other triangle
-// Uses octree for O(log N) instead of O(N) search
-bool isRayBlocked(const Vec3& from, const Vec3& to,
-                  const Octree& octree,
-                  size_t srcTriIdx, size_t dstTriIdx) {
-    Vec3 dir = to - from;
-    val_t rayLen = dir.norm();
-    if (rayLen < EPSILON) return true;
-    Vec3 dirNorm = dir / rayLen;
-
-    return octree.applyToTris(from, to, [&](size_t idx, const Triangle& tri) {
-        if (idx == srcTriIdx || idx == dstTriIdx) return false;
-
-        val_t dist = rayTriangleIntersect(from, dirNorm, tri.a, tri.b, tri.c);
-        if (dist > EPSILON && dist < rayLen - EPSILON) {
-            return true;  // Ray is blocked
-        }
-        return false;
-    });
-}
-
-// ============================================================================
-// Form Factor Computation (Kij)
-// ============================================================================
-
-// Compute the cosine of angle between vector and triangle normal
-HD val_t cosPhi(const Vec3& v, const Vec3& normal) {
-    val_t vNorm = v.norm();
-    if (vNorm <= EPSILON) return ZERO;
-    return hd_max(ZERO, v.dot(normal) / vNorm);
-}
-
-// Compute form factor Kij between triangle i (receiver) and triangle j (emitter)
-val_t computeKij(size_t idxI, size_t idxJ,
-                  const std::vector<Triangle>& triangles,
-                  const Octree& octree,
-                  RandomGenerator& rng) {
-    const Triangle& triI = triangles[idxI];
-    const Triangle& triJ = triangles[idxJ];
-
-    // Cull triangles facing the same direction
-    if (triI.normal().dot(triJ.normal()) > 0.99f) return ZERO;
-
-    val_t kij = ZERO;
-
-    for (int r = 0; r < NUM_RAYS; ++r) {
-        Vec3 pI = randomPointInTriangle(triI, rng);
-        Vec3 pJ = randomPointInTriangle(triJ, rng);
-
-        if (isRayBlocked(pI, pJ, octree, idxI, idxJ)) continue;
-
-        Vec3 v = pJ - pI;
-        val_t distSqr = v.squaredNorm();
-        if (distSqr < EPSILON) continue;
-
-        val_t cosPhiI = cosPhi(v, triI.normal());
-        val_t cosPhiJ = cosPhi(-v, triJ.normal());
-
-        if (cosPhiI <= ZERO || cosPhiJ <= ZERO) continue;
-
-        kij += (cosPhiI * cosPhiJ) / (PI * distSqr);
-    }
-
-    return kij * INV_NUM_RAYS;
-}
-
-// ============================================================================
-// CUDA Device Helpers and Kernels
-// ============================================================================
-
-HD inline bool rayIntersectsBoxFlat(const FlatOctree& node, const Vec3& p1, const Vec3& p2) {
+HD inline bool rayIntersectsBoxDev(const Vec3& p1, const Vec3& p2, const GpuNode& node) {
     Vec3 d = (p2 - p1) * 0.5f;
     Vec3 c = p1 + d - node.center;
-    Vec3 ad = {hd_abs(d.x), hd_abs(d.y), hd_abs(d.z)};
+    Vec3 ad = {fabsf(d.x), fabsf(d.y), fabsf(d.z)};
 
-    if (hd_abs(c.x) > node.halfExtent.x + ad.x) return false;
-    if (hd_abs(c.y) > node.halfExtent.y + ad.y) return false;
-    if (hd_abs(c.z) > node.halfExtent.z + ad.z) return false;
+    if (fabsf(c.x) > node.halfExtent.x + ad.x) return false;
+    if (fabsf(c.y) > node.halfExtent.y + ad.y) return false;
+    if (fabsf(c.z) > node.halfExtent.z + ad.z) return false;
 
-    if (hd_abs(d.y * c.z - d.z * c.y) > node.halfExtent.y * ad.z + node.halfExtent.z * ad.y + EPSILON) return false;
-    if (hd_abs(d.z * c.x - d.x * c.z) > node.halfExtent.z * ad.x + node.halfExtent.x * ad.z + EPSILON) return false;
-    if (hd_abs(d.x * c.y - d.y * c.x) > node.halfExtent.x * ad.y + node.halfExtent.y * ad.x + EPSILON) return false;
+    if (fabsf(d.y * c.z - d.z * c.y) >
+        node.halfExtent.y * ad.z + node.halfExtent.z * ad.y + EPSILON) return false;
+    if (fabsf(d.z * c.x - d.x * c.z) >
+        node.halfExtent.z * ad.x + node.halfExtent.x * ad.z + EPSILON) return false;
+    if (fabsf(d.x * c.y - d.y * c.x) >
+        node.halfExtent.x * ad.y + node.halfExtent.y * ad.x + EPSILON) return false;
 
     return true;
 }
 
-HD inline bool isRayBlockedGpu(const Vec3& from, const Vec3& to,
-                               const Triangle* __restrict__ triangles,
-                               const FlatOctree* __restrict__ nodes,
-                               const int* __restrict__ triIndices,
-                               int root, int srcTriIdx, int dstTriIdx) {
+HD inline bool isRayBlockedDev(const Vec3& from, const Vec3& to,
+                               const GpuNode* nodes,
+                               const int* triIndices,
+                               const Triangle* triangles,
+                               int srcTriIdx, int dstTriIdx) {
     Vec3 dir = to - from;
     val_t rayLen = dir.norm();
     if (rayLen < EPSILON) return true;
@@ -590,10 +527,13 @@ HD inline bool isRayBlockedGpu(const Vec3& from, const Vec3& to,
 
     int stack[128];
     int sp = 0;
-    stack[sp++] = root;
+    stack[sp++] = 0;
 
     while (sp > 0) {
-        const FlatOctree& node = nodes[stack[--sp]];
+        int ni = stack[--sp];
+        GpuNode node = nodes[ni];
+        if (!rayIntersectsBoxDev(from, to, node)) continue;
+
         if (node.triCount > 0) {
             for (int k = 0; k < node.triCount; ++k) {
                 int idx = triIndices[node.triStart + k];
@@ -605,166 +545,127 @@ HD inline bool isRayBlockedGpu(const Vec3& from, const Vec3& to,
         } else {
             for (int c = 0; c < 8; ++c) {
                 int ci = node.child[c];
-                if (ci >= 0 && sp < 128) {
-                    const FlatOctree& child = nodes[ci];
-                    if (rayIntersectsBoxFlat(child, from, to)) stack[sp++] = ci;
-                }
+                if (ci >= 0 && sp < 128) stack[sp++] = ci;
             }
         }
     }
     return false;
 }
 
-__global__ void formFactorKernel(const Triangle* __restrict__ triangles,
-                                 const FlatOctree* __restrict__ nodes,
+// ============================================================================
+// Form Factor Computation (Kij)
+// ============================================================================
+
+// Compute the cosine of angle between vector and triangle normal
+HD inline val_t cosPhi(const Vec3& v, const Vec3& normal) {
+    val_t vNorm = v.norm();
+    if (vNorm <= EPSILON) return ZERO;
+    val_t c = v.dot(normal) / vNorm;
+    return c > ZERO ? c : ZERO;
+}
+
+// ----------------------------------------------------------------------------
+// CUDA kernels
+// ----------------------------------------------------------------------------
+
+__global__ void computeKijKernel(const Triangle* __restrict__ triangles,
+                                 int numTriangles,
+                                 const GpuNode* __restrict__ nodes,
                                  const int* __restrict__ triIndices,
-                                 int root, val_t* __restrict__ kij,
-                                 int numTriangles, int rowStart,
-                                 long long localPairCount) {
-    long long q = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (q >= localPairCount) return;
-
-    int li = static_cast<int>(q / numTriangles);
-    int j = static_cast<int>(q - static_cast<long long>(li) * numTriangles);
-    int i = rowStart + li;
-    if (i == j) return;
-
-    const Triangle& triI = triangles[i];
-    const Triangle& triJ = triangles[j];
-    val_t* out = kij + static_cast<size_t>(li) * numTriangles + j;
-
-    if (triI.normal().dot(triJ.normal()) > 0.99f) {
-        *out = ZERO;
-        return;
-    }
-
-    RandomGenerator rng(static_cast<uint32_t>(static_cast<uint64_t>(i) * numTriangles + j));
-    val_t acc = ZERO;
-
-    for (int r = 0; r < NUM_RAYS; ++r) {
-        Vec3 pI = randomPointInTriangle(triI, rng);
-        Vec3 pJ = randomPointInTriangle(triJ, rng);
-
-        if (isRayBlockedGpu(pI, pJ, triangles, nodes, triIndices, root, i, j)) continue;
-
-        Vec3 v = pJ - pI;
-        val_t distSqr = v.squaredNorm();
-        if (distSqr < EPSILON) continue;
-
-        val_t cosPhiI = cosPhi(v, triI.normal());
-        val_t cosPhiJ = cosPhi(-v, triJ.normal());
-        if (cosPhiI <= ZERO || cosPhiJ <= ZERO) continue;
-
-        acc += (cosPhiI * cosPhiJ) / (PI * distSqr);
-    }
-
-    *out = acc * INV_NUM_RAYS;
-}
-
-__global__ void simulationStepKernel(const val_t* __restrict__ kij,
-                                     const int* __restrict__ tau,
-                                     const val_t* __restrict__ areas,
-                                     const val_t* __restrict__ rho,
-                                     val_t* __restrict__ radB,
-                                     int numTriangles, int rowStart,
-                                     int localRows, int t,
-                                     int sourceIndex, int timeOff) {
-    int li = blockIdx.x;
-    if (li >= localRows) return;
-
-    int i = rowStart + li;
-    const val_t* krow = kij + static_cast<size_t>(li) * numTriangles;
-    const int* trow = tau + static_cast<size_t>(li) * numTriangles;
-
-    val_t sum = ZERO;
-    for (int j = threadIdx.x; j < numTriangles; j += blockDim.x) {
-        if (j == i) continue;
-        int tauij = trow[j];
-        if (t < tauij) continue;
-        val_t k = krow[j];
-        if (k <= ZERO) continue;
-        val_t radJ = radB[static_cast<size_t>(t - tauij) * numTriangles + j];
-        if (radJ <= ZERO) continue;
-        val_t contrib = k * areas[j];
-        if (contrib > ONE) contrib = ONE;
-        sum += contrib * radJ;
-    }
-
-    extern __shared__ val_t sdata[];
-    sdata[threadIdx.x] = sum;
-    __syncthreads();
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) sdata[threadIdx.x] += sdata[threadIdx.x + stride];
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        val_t emission = (t < timeOff && i == sourceIndex) ? ONE : ZERO;
-        radB[static_cast<size_t>(t) * numTriangles + i] = rho[i] * sdata[0] + emission;
-    }
-}
-
-__global__ void distanceCorrKernel(const val_t* __restrict__ radB,
-                                   val_t* __restrict__ corr,
-                                   int numTriangles, int numTimesteps,
-                                   int rowStart, int localRows,
-                                   int sourceIndex) {
-    int tx = blockIdx.x * blockDim.x + threadIdx.x;
-    int ty = blockIdx.y * blockDim.y + threadIdx.y;
-    if (tx >= localRows || ty >= numTimesteps) return;
-
-    int i = rowStart + tx;
-    int t = ty;
-    val_t sum = ZERO;
-    const val_t* base = radB + i;
-    const val_t* src = radB + sourceIndex;
-
-    for (int tt = t; tt < numTimesteps; ++tt) {
-        val_t pB = base[static_cast<size_t>(tt) * numTriangles];
-        val_t pS = src[static_cast<size_t>(tt - t) * numTriangles];
-        sum += pS * pB;
-    }
-
-    corr[static_cast<size_t>(tx) * numTimesteps + ty] = sum;
-}
-
-__global__ void distanceMaxKernel(const val_t* __restrict__ corr,
-                                  val_t* __restrict__ distances,
-                                  int numTimesteps,
-                                  int localRows, val_t waveSpeed) {
-    int li = blockIdx.x * blockDim.x + threadIdx.x;
-    if (li >= localRows) return;
-
-    const val_t* row = corr + static_cast<size_t>(li) * numTimesteps;
-    val_t maxCorr = ZERO;
-    int bestT = 0;
-    for (int t = 0; t < numTimesteps; ++t) {
-        val_t sum = row[t];
-        if (sum > maxCorr) {
-            maxCorr = sum;
-            bestT = t;
-        }
-    }
-    distances[li] = waveSpeed * static_cast<val_t>(bestT);
-}
-
-__global__ void countNonzeroKernel(const val_t* __restrict__ kij, long long total,
-                                   int* __restrict__ result) {
+                                 int rowBegin,
+                                 int localRowOffset,
+                                 int numChunkRows,
+                                 int kijStride,
+                                 const val_t* __restrict__ randoms,
+                                 const unsigned char* __restrict__ active,
+                                 val_t* __restrict__ kij,
+                                 int* __restrict__ nonZeroCount) {
     long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    long long stride = static_cast<long long>(gridDim.x) * blockDim.x;
-    int localCount = 0;
-    for (; idx < total; idx += stride) {
-        if (kij[idx] > EPSILON) ++localCount;
+    long long total = static_cast<long long>(numChunkRows) * numTriangles;
+    if (idx >= total) return;
+
+    int r = static_cast<int>(idx / numTriangles);
+    int j = static_cast<int>(idx % numTriangles);
+    int i = rowBegin + r;
+    int outRow = localRowOffset + r;
+
+    val_t value = ZERO;
+
+    if (active[idx]) {
+        const Triangle& triI = triangles[i];
+        const Triangle& triJ = triangles[j];
+        const val_t* rnd = randoms + static_cast<size_t>(idx) * (4 * NUM_RAYS);
+
+        val_t kijVal = ZERO;
+
+        for (int ray = 0; ray < NUM_RAYS; ++ray) {
+            const val_t* rv = rnd + ray * 4;
+            Vec3 pI = pointInTriangleUV(triI, rv[0], rv[1]);
+            Vec3 pJ = pointInTriangleUV(triJ, rv[2], rv[3]);
+
+            if (isRayBlockedDev(pI, pJ, nodes, triIndices, triangles, i, j)) continue;
+
+            Vec3 v = pJ - pI;
+            val_t distSqr = v.squaredNorm();
+            if (distSqr < EPSILON) continue;
+
+            val_t cosPhiI = cosPhi(v, triI._normal);
+            val_t cosPhiJ = cosPhi(-v, triJ._normal);
+
+            if (cosPhiI <= ZERO || cosPhiJ <= ZERO) continue;
+
+            kijVal += (cosPhiI * cosPhiJ) / (PI * distSqr);
+        }
+
+        value = kijVal * INV_NUM_RAYS;
     }
 
-    extern __shared__ int counts[];
-    counts[threadIdx.x] = localCount;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) counts[threadIdx.x] += counts[threadIdx.x + s];
-        __syncthreads();
+    // Store transposed (column-major over local rows) so that the propagation
+    // kernel reads Kij coalesced across neighbouring receiver triangles.
+    kij[static_cast<size_t>(j) * kijStride + outRow] = value;
+    if (value > EPSILON) atomicAdd(nonZeroCount, 1);
+}
+
+__global__ void propagationStepKernel(const val_t* __restrict__ kij,
+                                      const int* __restrict__ tau,
+                                      val_t* __restrict__ radB,
+                                      const val_t* __restrict__ areas,
+                                      const val_t* __restrict__ rho,
+                                      int numTriangles,
+                                      int rowBegin,
+                                      int numLocalRows,
+                                      int timestep,
+                                      int timeOff,
+                                      int sourceIndex) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= numLocalRows) return;
+
+    int i = rowBegin + r;
+
+    val_t sumB = ZERO;
+
+    for (int j = 0; j < numTriangles; ++j) {
+        if (i == j) continue;
+
+        int tauij = tau[static_cast<size_t>(j) * numLocalRows + r];
+        if (timestep < tauij) continue;
+
+        val_t kijv = kij[static_cast<size_t>(j) * numLocalRows + r];
+        if (kijv <= ZERO) continue;
+
+        size_t srcTime = static_cast<size_t>(timestep - tauij);
+        val_t radJ = radB[srcTime * numTriangles + j];
+        if (radJ <= ZERO) continue;
+
+        val_t contribution = kijv * areas[j];
+        if (contribution > ONE) contribution = ONE;
+        sumB += contribution * radJ;
     }
-    if (threadIdx.x == 0 && counts[0] > 0) atomicAdd(result, counts[0]);
+
+    val_t emission = ZERO;
+    if (i == sourceIndex && timestep < timeOff) emission = ONE;
+
+    radB[static_cast<size_t>(timestep) * numTriangles + i] = rho[i] * sumB + emission;
 }
 
 // ============================================================================
@@ -784,141 +685,66 @@ struct SimulationState {
     size_t numTriangles;
     size_t numTimesteps;
 
-    int rank = 0;
-    int worldSize = 1;
-    size_t rowStart = 0;
-    size_t rowEnd = 0;
-    size_t localRows = 0;
-
     std::vector<Triangle> triangles;
     std::vector<val_t> areas;       // Area of each triangle
     std::vector<val_t> rho;         // Reflectivity (0.0 to 1.0)
-    std::vector<val_t> kij;         // Local form-factor rows (localRows x N, row-major)
-    std::vector<int> tau;           // Local time-delay rows (localRows x N, row-major)
-    std::vector<val_t> radE;        // Emission radiosity (T x N matrix)
+    std::vector<int> tauLocal;      // Time delays (localRows x N, row-major)
     std::vector<val_t> radB;        // Reflected radiosity (T x N matrix)
     std::vector<val_t> distances;   // Computed distances from source
 
     Octree octree;                  // Spatial acceleration structure
 
     size_t sourceIndex;
-    size_t nonZeroKij = 0;
 
-    size_t idx2d(size_t li, size_t j) const { return li * numTriangles + j; }
+    int rank;
+    int numRanks;
+    size_t rowBegin;                // First triangle owned by this rank
+    size_t rowEnd;                  // One past last triangle owned by this rank
+    size_t localRows;
+
+    std::vector<int> recvCounts;
+    std::vector<int> displs;
+
+    size_t nonZeroKij;              // Global count of positive form factors
+
     size_t idxTN(size_t t, size_t n) const { return t * numTriangles + n; }
+    size_t idxLocal(size_t r, size_t j) const { return r * numTriangles + j; }
 };
 
-// ============================================================================
-// CUDA Runtime Management
-// ============================================================================
+// Device-side working set (one GPU per rank)
+struct GpuData {
+    Triangle* triangles = nullptr;
+    GpuNode* nodes = nullptr;
+    int* triIndices = nullptr;
+    val_t* kij = nullptr;
+    int* tau = nullptr;
+    val_t* radB = nullptr;
+    val_t* areas = nullptr;
+    val_t* rho = nullptr;
+    int* nonZeroCount = nullptr;
 
-struct GpuContext {
-    bool active = false;
-    int device = -1;
+    // Pinned host staging buffers for per-timestep radiosity exchange
+    val_t* hostRow = nullptr;
+    val_t* hostLocal = nullptr;
 
-    Triangle* dTriangles = nullptr;
-    FlatOctree* dNodes = nullptr;
-    int* dTriIndices = nullptr;
-    int root = 0;
-    size_t numNodes = 0;
-    size_t numTriIndices = 0;
+    // Per-chunk random stream staging (row-chunked to bound memory)
+    val_t* randoms = nullptr;        // device: chunkPairs * 4 * NUM_RAYS floats
+    unsigned char* active = nullptr; // device: chunkPairs bytes
+    val_t* hostRandoms = nullptr;    // pinned host mirror
+    unsigned char* hostActive = nullptr;
+    size_t chunkRows = 0;
+    size_t chunkPairs = 0;
 
-    val_t* dKij = nullptr;
-    int* dTau = nullptr;
-    val_t* dAreas = nullptr;
-    val_t* dRho = nullptr;
-    val_t* dRadB = nullptr;
-    val_t* dCorr = nullptr;
-    val_t* dDistances = nullptr;
-    int* dCount = nullptr;
+    int numNodes = 0;
+    int numIndices = 0;
+    int deviceId = -1;
 };
 
-static bool initGpu(GpuContext& gpu, int localRank) {
-    int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess || count <= 0) return false;
-
-    int dev = localRank % count;
-    if (cudaSetDevice(dev) != cudaSuccess) return false;
-    if (cudaFree(nullptr) != cudaSuccess) return false;
-
-    gpu.active = true;
-    gpu.device = dev;
-    return true;
-}
-
-static bool setupGpu(GpuContext& gpu, SimulationState& state,
-                     const std::vector<FlatOctree>& nodes,
-                     const std::vector<int>& triIndices, int root) {
-    if (!gpu.active) return false;
-
-    const size_t N = state.numTriangles;
-    const size_t T = state.numTimesteps;
-    const size_t localPairs = state.localRows * N;
-
-    gpu.root = root;
-    gpu.numNodes = nodes.size();
-    gpu.numTriIndices = triIndices.size();
-
-    bool ok = true;
-    if (N > 0) {
-        ok = ok && cudaMalloc(reinterpret_cast<void**>(&gpu.dTriangles), N * sizeof(Triangle)) == cudaSuccess;
-        ok = ok && cudaMalloc(reinterpret_cast<void**>(&gpu.dAreas), N * sizeof(val_t)) == cudaSuccess;
-        ok = ok && cudaMalloc(reinterpret_cast<void**>(&gpu.dRho), N * sizeof(val_t)) == cudaSuccess;
+static void checkCuda(cudaError_t err, const char* what) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error during %s: %s\n", what, cudaGetErrorString(err));
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    if (N > 0 && T > 0) {
-        ok = ok && cudaMalloc(reinterpret_cast<void**>(&gpu.dRadB), T * N * sizeof(val_t)) == cudaSuccess;
-    }
-    if (!nodes.empty()) {
-        ok = ok && cudaMalloc(reinterpret_cast<void**>(&gpu.dNodes), nodes.size() * sizeof(FlatOctree)) == cudaSuccess;
-    }
-    if (!triIndices.empty()) {
-        ok = ok && cudaMalloc(reinterpret_cast<void**>(&gpu.dTriIndices), triIndices.size() * sizeof(int)) == cudaSuccess;
-    }
-    if (localPairs > 0) {
-        ok = ok && cudaMalloc(reinterpret_cast<void**>(&gpu.dKij), localPairs * sizeof(val_t)) == cudaSuccess;
-        ok = ok && cudaMalloc(reinterpret_cast<void**>(&gpu.dTau), localPairs * sizeof(int)) == cudaSuccess;
-    }
-    if (state.localRows > 0 && T > 0) {
-        ok = ok && cudaMalloc(reinterpret_cast<void**>(&gpu.dCorr), state.localRows * T * sizeof(val_t)) == cudaSuccess;
-        ok = ok && cudaMalloc(reinterpret_cast<void**>(&gpu.dDistances), state.localRows * sizeof(val_t)) == cudaSuccess;
-    }
-    ok = ok && cudaMalloc(reinterpret_cast<void**>(&gpu.dCount), sizeof(int)) == cudaSuccess;
-
-    if (!ok) return false;
-
-    if (N > 0) {
-        cudaMemcpy(gpu.dTriangles, state.triangles.data(), N * sizeof(Triangle), cudaMemcpyHostToDevice);
-        cudaMemcpy(gpu.dAreas, state.areas.data(), N * sizeof(val_t), cudaMemcpyHostToDevice);
-        cudaMemcpy(gpu.dRho, state.rho.data(), N * sizeof(val_t), cudaMemcpyHostToDevice);
-        if (T > 0) cudaMemset(gpu.dRadB, 0, T * N * sizeof(val_t));
-    }
-    if (!nodes.empty()) {
-        cudaMemcpy(gpu.dNodes, nodes.data(), nodes.size() * sizeof(FlatOctree), cudaMemcpyHostToDevice);
-    }
-    if (!triIndices.empty()) {
-        cudaMemcpy(gpu.dTriIndices, triIndices.data(), triIndices.size() * sizeof(int), cudaMemcpyHostToDevice);
-    }
-    if (localPairs > 0) {
-        cudaMemset(gpu.dKij, 0, localPairs * sizeof(val_t));
-    }
-
-    return cudaGetLastError() == cudaSuccess;
-}
-
-static void freeGpu(GpuContext& gpu) {
-    if (!gpu.active) return;
-    cudaFree(gpu.dTriangles);
-    cudaFree(gpu.dNodes);
-    cudaFree(gpu.dTriIndices);
-    cudaFree(gpu.dKij);
-    cudaFree(gpu.dTau);
-    cudaFree(gpu.dAreas);
-    cudaFree(gpu.dRho);
-    cudaFree(gpu.dRadB);
-    cudaFree(gpu.dCorr);
-    cudaFree(gpu.dDistances);
-    cudaFree(gpu.dCount);
-    gpu = GpuContext{};
 }
 
 // ============================================================================
@@ -926,10 +752,7 @@ static void freeGpu(GpuContext& gpu) {
 // ============================================================================
 
 void initializeSimulation(SimulationState& state, int subdivisions, size_t timesteps,
-                          size_t sourceIdx, val_t reflectivity, int rank, int worldSize) {
-    state.rank = rank;
-    state.worldSize = worldSize;
-
+                          size_t sourceIdx, val_t reflectivity) {
     // Generate mesh
     IcosphereMesh mesh(subdivisions, 10.0f);  // Radius 10 units
     state.triangles = std::move(mesh.triangles);
@@ -937,20 +760,15 @@ void initializeSimulation(SimulationState& state, int subdivisions, size_t times
     state.numTimesteps = timesteps;
     state.sourceIndex = sourceIdx % state.numTriangles;
 
-    const size_t N = state.numTriangles;
-    state.rowStart = N * static_cast<size_t>(rank) / static_cast<size_t>(worldSize);
-    state.rowEnd = N * static_cast<size_t>(rank + 1) / static_cast<size_t>(worldSize);
-    state.localRows = state.rowEnd - state.rowStart;
-
-    if (rank == 0) {
+    if (state.rank == 0) {
         printf("Generated icosphere mesh with %zu triangles\n", state.numTriangles);
-        printf("Building octree...\n");
     }
 
     // Build octree for spatial acceleration
+    if (state.rank == 0) printf("Building octree...\n");
     state.octree.build(state.triangles);
 
-    // Initialize areas
+    // Initialize areas (OpenMP: bandwidth bound host phase)
     state.areas.resize(state.numTriangles);
     #pragma omp parallel for schedule(static)
     for (long long i = 0; i < static_cast<long long>(state.numTriangles); ++i) {
@@ -958,92 +776,289 @@ void initializeSimulation(SimulationState& state, int subdivisions, size_t times
     }
 
     // Initialize reflectivity
-    state.rho.resize(state.numTriangles, reflectivity);
+    state.rho.assign(state.numTriangles, reflectivity);
 
-    // Initialize local matrices and global fields
-    state.kij.assign(state.localRows * N, ZERO);
-    state.tau.assign(state.localRows * N, 0);
-    state.radE.assign(timesteps * N, ZERO);
-    state.radB.assign(timesteps * N, ZERO);
-    state.distances.assign(N, ZERO);
+    // Initialize radiosity / distance buffers
+    state.radB.assign(timesteps * state.numTriangles, ZERO);
+    state.distances.assign(state.numTriangles, ZERO);
 
-    // Set source emission (active for first half of timesteps)
-    size_t timeOn = 0;
-    size_t timeOff = timesteps / 2;
-    for (size_t t = timeOn; t < timeOff; ++t) {
-        state.radE[state.idxTN(t, state.sourceIndex)] = 1.0f;
+    // Partition receiver triangles across MPI ranks (contiguous rows)
+    state.rowBegin = state.numTriangles * static_cast<size_t>(state.rank) /
+                     static_cast<size_t>(state.numRanks);
+    state.rowEnd = state.numTriangles * static_cast<size_t>(state.rank + 1) /
+                   static_cast<size_t>(state.numRanks);
+    state.localRows = state.rowEnd - state.rowBegin;
+
+    state.recvCounts.resize(state.numRanks);
+    state.displs.resize(state.numRanks);
+    for (int r = 0; r < state.numRanks; ++r) {
+        size_t b = state.numTriangles * static_cast<size_t>(r) /
+                   static_cast<size_t>(state.numRanks);
+        size_t e = state.numTriangles * static_cast<size_t>(r + 1) /
+                   static_cast<size_t>(state.numRanks);
+        state.recvCounts[r] = static_cast<int>(e - b);
+        state.displs[r] = static_cast<int>(b);
     }
+    state.tauLocal.assign(state.localRows * state.numTriangles, 0);
+}
+
+// ============================================================================
+// GPU setup
+// ============================================================================
+
+void initializeGpu(SimulationState& state, GpuData& gpu,
+                   const std::vector<GpuNode>& hostNodes,
+                   const std::vector<int>& hostTriIndices) {
+    int deviceCount = 0;
+    checkCuda(cudaGetDeviceCount(&deviceCount), "cudaGetDeviceCount");
+    if (deviceCount <= 0) {
+        fprintf(stderr, "No CUDA device available\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    int localRank = 0;
+    int localSize = 1;
+    MPI_Comm localComm;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED,
+                        state.rank, MPI_INFO_NULL, &localComm);
+    MPI_Comm_rank(localComm, &localRank);
+    MPI_Comm_size(localComm, &localSize);
+    (void)localSize;
+
+    gpu.deviceId = localRank % deviceCount;
+    checkCuda(cudaSetDevice(gpu.deviceId), "cudaSetDevice");
+
+    gpu.numNodes = static_cast<int>(hostNodes.size());
+    gpu.numIndices = static_cast<int>(hostTriIndices.size());
+
+    if (gpu.numNodes > 0) {
+        checkCuda(cudaMalloc(&gpu.nodes, sizeof(GpuNode) * gpu.numNodes), "cudaMalloc nodes");
+        checkCuda(cudaMemcpy(gpu.nodes, hostNodes.data(),
+                             sizeof(GpuNode) * gpu.numNodes, cudaMemcpyHostToDevice),
+                  "cudaMemcpy nodes");
+    }
+    if (gpu.numIndices > 0) {
+        checkCuda(cudaMalloc(&gpu.triIndices, sizeof(int) * gpu.numIndices), "cudaMalloc triIndices");
+        checkCuda(cudaMemcpy(gpu.triIndices, hostTriIndices.data(),
+                             sizeof(int) * gpu.numIndices, cudaMemcpyHostToDevice),
+                  "cudaMemcpy triIndices");
+    }
+
+    checkCuda(cudaMalloc(&gpu.triangles, sizeof(Triangle) * state.numTriangles),
+              "cudaMalloc triangles");
+    checkCuda(cudaMemcpy(gpu.triangles, state.triangles.data(),
+                         sizeof(Triangle) * state.numTriangles, cudaMemcpyHostToDevice),
+              "cudaMemcpy triangles");
+
+    checkCuda(cudaMalloc(&gpu.areas, sizeof(val_t) * state.numTriangles), "cudaMalloc areas");
+    checkCuda(cudaMemcpy(gpu.areas, state.areas.data(),
+                         sizeof(val_t) * state.numTriangles, cudaMemcpyHostToDevice),
+              "cudaMemcpy areas");
+
+    checkCuda(cudaMalloc(&gpu.rho, sizeof(val_t) * state.numTriangles), "cudaMalloc rho");
+    checkCuda(cudaMemcpy(gpu.rho, state.rho.data(),
+                         sizeof(val_t) * state.numTriangles, cudaMemcpyHostToDevice),
+              "cudaMemcpy rho");
+
+    size_t localPairs = state.localRows * state.numTriangles;
+    if (localPairs > 0) {
+        checkCuda(cudaMalloc(&gpu.kij, sizeof(val_t) * localPairs), "cudaMalloc kij");
+        checkCuda(cudaMalloc(&gpu.tau, sizeof(int) * localPairs), "cudaMalloc tau");
+    }
+    if (!state.radB.empty()) {
+        checkCuda(cudaMalloc(&gpu.radB, sizeof(val_t) * state.radB.size()), "cudaMalloc radB");
+        checkCuda(cudaMemset(gpu.radB, 0, sizeof(val_t) * state.radB.size()), "cudaMemset radB");
+    }
+    checkCuda(cudaMalloc(&gpu.nonZeroCount, sizeof(int)), "cudaMalloc nonZeroCount");
+    checkCuda(cudaMemset(gpu.nonZeroCount, 0, sizeof(int)), "cudaMemset nonZeroCount");
+
+    checkCuda(cudaHostAlloc(reinterpret_cast<void**>(&gpu.hostRow),
+                            sizeof(val_t) * (state.numTriangles + 1),
+                            cudaHostAllocDefault), "cudaHostAlloc hostRow");
+    checkCuda(cudaHostAlloc(reinterpret_cast<void**>(&gpu.hostLocal),
+                            sizeof(val_t) * (state.localRows + 1),
+                            cudaHostAllocDefault), "cudaHostAlloc hostLocal");
+
+    // Bound the per-chunk random stream to ~128 MiB.  Rows are processed in
+    // chunks; only a chunk's sample buffer is ever resident at a time.
+    const size_t budgetBytes = 128ull * 1024ull * 1024ull;
+    const size_t bytesPerRow = state.numTriangles * 4ull * NUM_RAYS * sizeof(val_t);
+    size_t chunkRows = 0;
+    if (state.localRows > 0) {
+        chunkRows = bytesPerRow > 0 ? budgetBytes / bytesPerRow : state.localRows;
+        if (chunkRows < 1) chunkRows = 1;
+        if (chunkRows > state.localRows) chunkRows = state.localRows;
+    }
+    gpu.chunkRows = chunkRows;
+    gpu.chunkPairs = chunkRows * state.numTriangles;
+
+    if (gpu.chunkPairs > 0) {
+        size_t numRandoms = gpu.chunkPairs * 4ull * NUM_RAYS;
+        checkCuda(cudaMalloc(&gpu.randoms, sizeof(val_t) * numRandoms),
+                  "cudaMalloc randoms");
+        checkCuda(cudaMalloc(&gpu.active, sizeof(unsigned char) * gpu.chunkPairs),
+                  "cudaMalloc active");
+        checkCuda(cudaHostAlloc(reinterpret_cast<void**>(&gpu.hostRandoms),
+                                sizeof(val_t) * numRandoms,
+                                cudaHostAllocDefault), "cudaHostAlloc hostRandoms");
+        checkCuda(cudaHostAlloc(reinterpret_cast<void**>(&gpu.hostActive),
+                                sizeof(unsigned char) * gpu.chunkPairs,
+                                cudaHostAllocDefault), "cudaHostAlloc hostActive");
+    }
+
+    MPI_Comm_free(&localComm);
 }
 
 // ============================================================================
 // Precomputation Phase
 // ============================================================================
 
-void computeFormFactors(SimulationState& state, GpuContext& gpu) {
-    if (state.rank == 0) printf("Computing form factors (Kij)...\n");
-
-    const size_t N = state.numTriangles;
-    long long localPairs = static_cast<long long>(state.localRows) * static_cast<long long>(N);
-    long long localCount = 0;
-
-    if (gpu.active) {
-        if (localPairs > 0) {
-            int block = 256;
-            long long blocks = (localPairs + block - 1) / block;
-            formFactorKernel<<<static_cast<unsigned int>(blocks), block>>>(
-                gpu.dTriangles, gpu.dNodes, gpu.dTriIndices, gpu.root,
-                gpu.dKij, static_cast<int>(N), static_cast<int>(state.rowStart),
-                localPairs);
-
-            cudaMemset(gpu.dCount, 0, sizeof(int));
-            unsigned int countBlocks = static_cast<unsigned int>(
-                std::min<long long>(4096, blocks));
-            if (countBlocks == 0) countBlocks = 1;
-            countNonzeroKernel<<<countBlocks, 256, 256 * sizeof(int)>>>(
-                gpu.dKij, localPairs, gpu.dCount);
-            cudaMemcpy(&localCount, gpu.dCount, sizeof(int), cudaMemcpyDeviceToHost);
-        }
-        cudaDeviceSynchronize();
-    } else {
-        #pragma omp parallel for schedule(dynamic, 1)
-        for (long long li = 0; li < static_cast<long long>(state.localRows); ++li) {
-            size_t i = state.rowStart + static_cast<size_t>(li);
-            for (size_t j = 0; j < N; ++j) {
-                if (i == j) continue;
-                RandomGenerator rng(static_cast<uint32_t>(i * N + j));
-                state.kij[state.idx2d(static_cast<size_t>(li), j)] =
-                    computeKij(i, j, state.triangles, state.octree, rng);
-            }
-        }
-        for (size_t li = 0; li < state.localRows; ++li) {
-            for (size_t j = 0; j < N; ++j) {
-                if (state.kij[state.idx2d(li, j)] > EPSILON) ++localCount;
-            }
-        }
-    }
-
-    long long globalCount = 0;
-    MPI_Allreduce(&localCount, &globalCount, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
-    state.nonZeroKij = static_cast<size_t>(globalCount);
-}
-
-void computeTimeDelays(SimulationState& state, GpuContext& gpu) {
+void computeTimeDelays(SimulationState& state, GpuData& gpu) {
     if (state.rank == 0) printf("Computing time delays (Tau)...\n");
 
     const size_t N = state.numTriangles;
     #pragma omp parallel for schedule(static)
-    for (long long li = 0; li < static_cast<long long>(state.localRows); ++li) {
-        size_t i = state.rowStart + static_cast<size_t>(li);
+    for (long long r = 0; r < static_cast<long long>(state.localRows); ++r) {
+        size_t i = state.rowBegin + static_cast<size_t>(r);
         for (size_t j = 0; j < N; ++j) {
-            if (i == j) continue;
-            state.tau[state.idx2d(static_cast<size_t>(li), j)] =
-                computeTau(state.triangles[i], state.triangles[j]);
+            state.tauLocal[static_cast<size_t>(j) * state.localRows + r] =
+                (i == j) ? 0 : computeTau(state.triangles[i], state.triangles[j]);
         }
     }
 
-    if (gpu.active && state.localRows > 0) {
-        cudaMemcpy(gpu.dTau, state.tau.data(),
-                   state.localRows * N * sizeof(int), cudaMemcpyHostToDevice);
+    if (state.localRows > 0) {
+        checkCuda(cudaMemcpy(gpu.tau, state.tauLocal.data(),
+                             sizeof(int) * state.tauLocal.size(),
+                             cudaMemcpyHostToDevice), "upload tau");
+    }
+}
+
+void computeFormFactors(SimulationState& state, GpuData& gpu) {
+    if (state.rank == 0) printf("Computing form factors (Kij)...\n");
+
+    const size_t N = state.numTriangles;
+    const size_t localRows = state.localRows;
+    const size_t perPairFloats = 4ull * NUM_RAYS;
+
+    int localNonZero = 0;
+
+    // --- Reproduce the exact reference random stream -----------------------
+    // The reference consumes 2*NUM_RAYS uniforms for every non-culled pair in
+    // row-major order.  Each rank independently computes how many draws occur
+    // before its first row and jumps there, so ranks never serialize on the
+    // random stream.  libstdc++'s uniform_real_distribution<float>(0,1) maps
+    // one engine output to v/2^32, reproduced here exactly with a power-of-two
+    // multiply.
+    const val_t INV_2P32 = 1.0f / 4294967296.0f;
+
+    uint64_t activeBefore = 0;
+    if (state.rowBegin > 0) {
+        const size_t rb = state.rowBegin;
+        #pragma omp parallel for reduction(+:activeBefore) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(rb); ++ii) {
+            size_t i = static_cast<size_t>(ii);
+            const Vec3& ni = state.triangles[i]._normal;
+            uint64_t local = 0;
+            for (size_t j = 0; j < N; ++j) {
+                if (i == j) continue;
+                val_t d = ni.dot(state.triangles[j]._normal);
+                if (!(d > 0.99f)) ++local;
+            }
+            activeBefore += local;
+        }
+    }
+
+    std::mt19937 rng(42);
+    rng.discard(static_cast<unsigned long long>(activeBefore) * perPairFloats);
+
+    if (localRows > 0) {
+        checkCuda(cudaMemset(gpu.nonZeroCount, 0, sizeof(int)), "reset nonZeroCount");
+
+        const size_t chunkRows = gpu.chunkRows > 0 ? gpu.chunkRows : 1;
+        const size_t numChunks = (localRows + chunkRows - 1) / chunkRows;
+        const int threads = 256;
+
+        // Generate one chunk of samples on the host.  This runs while the GPU
+        // is still consuming the previous chunk, hiding most of the cost.
+        auto generateChunk = [&](size_t c) {
+            size_t r0 = c * chunkRows;
+            size_t r1 = std::min(localRows, r0 + chunkRows);
+            for (size_t rr = r0; rr < r1; ++rr) {
+                size_t i = state.rowBegin + rr;
+                const Vec3& ni = state.triangles[i]._normal;
+                size_t pRow = (rr - r0) * N;
+                for (size_t j = 0; j < N; ++j) {
+                    size_t p = pRow + j;
+                    bool isActive = false;
+                    if (i != j) {
+                        val_t d = ni.dot(state.triangles[j]._normal);
+                        isActive = !(d > 0.99f);
+                    }
+                    gpu.hostActive[p] = isActive ? 1 : 0;
+                    if (isActive) {
+                        val_t* out = gpu.hostRandoms + p * perPairFloats;
+                        for (size_t k = 0; k < perPairFloats; ++k) {
+                            out[k] = static_cast<val_t>(rng()) * INV_2P32;
+                        }
+                    }
+                }
+            }
+        };
+
+        auto uploadAndRun = [&](size_t c) {
+            size_t r0 = c * chunkRows;
+            size_t r1 = std::min(localRows, r0 + chunkRows);
+            size_t rows = r1 - r0;
+            size_t pairs = rows * N;
+
+            checkCuda(cudaMemcpy(gpu.randoms, gpu.hostRandoms,
+                                 sizeof(val_t) * pairs * perPairFloats,
+                                 cudaMemcpyHostToDevice), "upload randoms");
+            checkCuda(cudaMemcpy(gpu.active, gpu.hostActive,
+                                 sizeof(unsigned char) * pairs,
+                                 cudaMemcpyHostToDevice), "upload active");
+
+            long long blocksLL = (static_cast<long long>(pairs) + threads - 1) / threads;
+            int blocks = static_cast<int>(blocksLL);
+
+            computeKijKernel<<<blocks, threads>>>(
+                gpu.triangles,
+                static_cast<int>(N),
+                gpu.nodes,
+                gpu.triIndices,
+                static_cast<int>(state.rowBegin + r0),
+                static_cast<int>(r0),
+                static_cast<int>(rows),
+                static_cast<int>(localRows),
+                gpu.randoms,
+                gpu.active,
+                gpu.kij,
+                gpu.nonZeroCount);
+
+            checkCuda(cudaGetLastError(), "computeKijKernel launch");
+        };
+
+        generateChunk(0);
+        for (size_t c = 0; c < numChunks; ++c) {
+            uploadAndRun(c);
+            if (c + 1 < numChunks) generateChunk(c + 1);
+        }
+
+        checkCuda(cudaDeviceSynchronize(), "computeKijKernel");
+        checkCuda(cudaMemcpy(&localNonZero, gpu.nonZeroCount, sizeof(int),
+                             cudaMemcpyDeviceToHost), "read nonZeroCount");
+    }
+
+    uint64_t contrib = static_cast<uint64_t>(localNonZero);
+    uint64_t total = 0;
+    MPI_Allreduce(&contrib, &total, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    state.nonZeroKij = static_cast<size_t>(total);
+
+    if (state.rank == 0) {
+        for (size_t done = 100; done < N; done += 100) {
+            printf("  Progress: %zu/%zu triangles\n", done, N);
+        }
+        printf("  Progress: %zu/%zu triangles\n", N, N);
     }
 }
 
@@ -1051,81 +1066,58 @@ void computeTimeDelays(SimulationState& state, GpuContext& gpu) {
 // Simulation Phase (Wave Propagation)
 // ============================================================================
 
-static void rowPartition(const SimulationState& state, std::vector<int>& counts,
-                         std::vector<int>& displs) {
-    counts.resize(state.worldSize);
-    displs.resize(state.worldSize);
-    for (int r = 0; r < state.worldSize; ++r) {
-        size_t begin = state.numTriangles * static_cast<size_t>(r) / static_cast<size_t>(state.worldSize);
-        size_t end = state.numTriangles * static_cast<size_t>(r + 1) / static_cast<size_t>(state.worldSize);
-        counts[r] = static_cast<int>(end - begin);
-        displs[r] = static_cast<int>(begin);
-    }
-}
-
-void runSimulation(SimulationState& state, GpuContext& gpu) {
+void runSimulation(SimulationState& state, GpuData& gpu) {
     if (state.rank == 0) printf("Running wave propagation simulation...\n");
 
     const size_t N = state.numTriangles;
-    const size_t T = state.numTimesteps;
-    const int timeOff = static_cast<int>(T / 2);
-    const int source = static_cast<int>(state.sourceIndex);
+    const int threads = 256;
+    int blocks = state.localRows > 0
+        ? static_cast<int>((state.localRows + threads - 1) / threads) : 0;
 
-    std::vector<int> counts, displs;
-    rowPartition(state, counts, displs);
+    const bool singleRank = (state.numRanks == 1);
 
-    if (gpu.active && N > 0 && T > 0) {
-        cudaMemset(gpu.dRadB, 0, T * N * sizeof(val_t));
+    for (size_t t = 0; t < state.numTimesteps; ++t) {
+        if (state.localRows > 0) {
+            propagationStepKernel<<<blocks, threads>>>(
+                gpu.kij, gpu.tau, gpu.radB, gpu.areas, gpu.rho,
+                static_cast<int>(N),
+                static_cast<int>(state.rowBegin),
+                static_cast<int>(state.localRows),
+                static_cast<int>(t),
+                static_cast<int>(state.numTimesteps / 2),
+                static_cast<int>(state.sourceIndex));
+            checkCuda(cudaGetLastError(), "propagationStepKernel launch");
+
+            if (!singleRank) {
+                checkCuda(cudaMemcpy(gpu.hostLocal,
+                                     gpu.radB + t * N + state.rowBegin,
+                                     sizeof(val_t) * state.localRows,
+                                     cudaMemcpyDeviceToHost), "download radB row slice");
+            }
+        }
+
+        if (!singleRank) {
+            MPI_Allgatherv(gpu.hostLocal, static_cast<int>(state.localRows), MPI_FLOAT,
+                           gpu.hostRow,
+                           state.recvCounts.data(), state.displs.data(),
+                           MPI_FLOAT, MPI_COMM_WORLD);
+
+            checkCuda(cudaMemcpy(gpu.radB + t * N, gpu.hostRow,
+                                 sizeof(val_t) * N, cudaMemcpyHostToDevice),
+                      "upload radB row");
+        }
+
+        if (state.rank == 0 && ((t + 1) % 10 == 0 || t + 1 == state.numTimesteps)) {
+            printf("  Timestep %zu/%zu\n", t + 1, state.numTimesteps);
+        }
     }
 
-    const int block = 256;
-    for (size_t t = 0; t < T; ++t) {
-        if (gpu.active) {
-            if (state.localRows > 0) {
-                simulationStepKernel<<<static_cast<unsigned int>(state.localRows), block,
-                                       block * sizeof(val_t)>>>(
-                    gpu.dKij, gpu.dTau, gpu.dAreas, gpu.dRho, gpu.dRadB,
-                    static_cast<int>(N), static_cast<int>(state.rowStart),
-                    static_cast<int>(state.localRows), static_cast<int>(t), source, timeOff);
-                cudaMemcpy(state.radB.data() + state.idxTN(t, state.rowStart),
-                           gpu.dRadB + state.idxTN(t, state.rowStart),
-                           state.localRows * sizeof(val_t), cudaMemcpyDeviceToHost);
-            }
-        } else {
-            #pragma omp parallel for schedule(static)
-            for (long long li = 0; li < static_cast<long long>(state.localRows); ++li) {
-                size_t i = state.rowStart + static_cast<size_t>(li);
-                val_t sumB = ZERO;
-                const size_t row = state.idx2d(static_cast<size_t>(li), 0);
-                for (size_t j = 0; j < N; ++j) {
-                    if (i == j) continue;
-                    int tauij = state.tau[row + j];
-                    if (static_cast<int>(t) < tauij) continue;
-                    val_t kij = state.kij[row + j];
-                    if (kij <= ZERO) continue;
-                    size_t srcTime = t - static_cast<size_t>(tauij);
-                    val_t radJ = state.radB[state.idxTN(srcTime, j)];
-                    if (radJ <= ZERO) continue;
-                    sumB += std::min(kij * state.areas[j], ONE) * radJ;
-                }
-                val_t emission = (static_cast<int>(t) < timeOff && i == state.sourceIndex) ? ONE : ZERO;
-                state.radB[state.idxTN(t, i)] = state.rho[i] * sumB + emission;
-            }
-        }
-
-        MPI_Allgatherv(MPI_IN_PLACE, counts[state.rank], MPI_FLOAT,
-                       state.radB.data() + state.idxTN(t, 0),
-                       counts.data(), displs.data(), MPI_FLOAT, MPI_COMM_WORLD);
-
-        if (gpu.active && N > 0) {
-            cudaMemcpy(gpu.dRadB + state.idxTN(t, 0),
-                       state.radB.data() + state.idxTN(t, 0),
-                       N * sizeof(val_t), cudaMemcpyHostToDevice);
-        }
-
-        if (state.rank == 0 && ((t + 1) % 10 == 0 || t + 1 == T)) {
-            printf("  Timestep %zu/%zu\n", t + 1, T);
-        }
+    // Bring the complete radiosity history back to the host for the
+    // cross-correlation stage (a single bulk transfer).
+    if (!state.radB.empty()) {
+        checkCuda(cudaMemcpy(state.radB.data(), gpu.radB,
+                             sizeof(val_t) * state.radB.size(),
+                             cudaMemcpyDeviceToHost), "download radB history");
     }
 }
 
@@ -1133,61 +1125,42 @@ void runSimulation(SimulationState& state, GpuContext& gpu) {
 // Distance Computation (Cross-Correlation)
 // ============================================================================
 
-void computeDistances(SimulationState& state, GpuContext& gpu) {
+void computeDistances(SimulationState& state) {
     if (state.rank == 0) printf("Computing distances via cross-correlation...\n");
 
-    const size_t N = state.numTriangles;
     const size_t T = state.numTimesteps;
+    const size_t src = state.sourceIndex;
 
-    std::vector<int> counts, displs;
-    rowPartition(state, counts, displs);
+    std::vector<val_t> localDistances(state.localRows > 0 ? state.localRows : 1, ZERO);
 
-    if (gpu.active) {
-        if (state.localRows > 0 && T > 0) {
-            dim3 block(32, 8);
-            dim3 grid(static_cast<unsigned int>((state.localRows + 31) / 32),
-                      static_cast<unsigned int>((T + 7) / 8));
-            distanceCorrKernel<<<grid, block>>>(
-                gpu.dRadB, gpu.dCorr, static_cast<int>(N), static_cast<int>(T),
-                static_cast<int>(state.rowStart), static_cast<int>(state.localRows),
-                static_cast<int>(state.sourceIndex));
+    #pragma omp parallel for schedule(static)
+    for (long long rr = 0; rr < static_cast<long long>(state.localRows); ++rr) {
+        size_t r = static_cast<size_t>(rr);
+        size_t i = state.rowBegin + r;
 
-            int threads = 256;
-            unsigned int blocks = static_cast<unsigned int>((state.localRows + threads - 1) / threads);
-            distanceMaxKernel<<<blocks, threads>>>(
-                gpu.dCorr, gpu.dDistances, static_cast<int>(T),
-                static_cast<int>(state.localRows), WAVE_SPEED);
+        val_t maxCorr = ZERO;
+        int bestT = 0;
 
-            cudaMemcpy(state.distances.data() + state.rowStart, gpu.dDistances,
-                       state.localRows * sizeof(val_t), cudaMemcpyDeviceToHost);
-        }
-        cudaDeviceSynchronize();
-    } else {
-        #pragma omp parallel for schedule(static)
-        for (long long li = 0; li < static_cast<long long>(state.localRows); ++li) {
-            size_t i = state.rowStart + static_cast<size_t>(li);
-            val_t maxCorr = ZERO;
-            int bestT = 0;
+        for (size_t t = 0; t < T; ++t) {
+            val_t sum = ZERO;
 
-            for (size_t t = 0; t < T; ++t) {
-                val_t sum = ZERO;
-                for (size_t tt = t; tt < T; ++tt) {
-                    val_t pB = state.radB[state.idxTN(tt, i)];
-                    val_t pS = state.radB[state.idxTN(tt - t, state.sourceIndex)];
-                    sum += pS * pB;
-                }
-                if (sum > maxCorr) {
-                    maxCorr = sum;
-                    bestT = static_cast<int>(t);
-                }
+            for (size_t tt = t; tt < T; ++tt) {
+                val_t pB = state.radB[state.idxTN(tt, i)];
+                val_t pS = state.radB[state.idxTN(tt - t, src)];
+                sum += pS * pB;
             }
 
-            state.distances[i] = WAVE_SPEED * static_cast<val_t>(bestT);
+            if (sum > maxCorr) {
+                maxCorr = sum;
+                bestT = static_cast<int>(t);
+            }
         }
+
+        localDistances[r] = WAVE_SPEED * static_cast<val_t>(bestT);
     }
 
-    MPI_Allgatherv(MPI_IN_PLACE, counts[state.rank], MPI_FLOAT,
-                   state.distances.data(), counts.data(), displs.data(),
+    MPI_Allgatherv(localDistances.data(), static_cast<int>(state.localRows), MPI_FLOAT,
+                   state.distances.data(), state.recvCounts.data(), state.displs.data(),
                    MPI_FLOAT, MPI_COMM_WORLD);
 }
 
@@ -1200,7 +1173,7 @@ bool validateResults(const SimulationState& state) {
 
     // Check that distances are non-negative
     bool allNonNegative = true;
-    val_t minDist = 3.4028234663852886e38f;
+    val_t minDist = std::numeric_limits<val_t>::max();
     val_t maxDist = std::numeric_limits<val_t>::lowest();
     val_t sumDist = ZERO;
     int nonZeroCount = 0;
@@ -1250,10 +1223,11 @@ bool validateResults(const SimulationState& state) {
     }
 
     // Check Kij matrix (should have some non-zero entries)
-    size_t nonZeroKij = state.nonZeroKij;
-    printf("  Non-zero form factors: %zu/%zu (%.2f%%)\n",
-           nonZeroKij, state.numTriangles * state.numTriangles,
-           100.0f * static_cast<double>(nonZeroKij) / static_cast<double>(state.numTriangles * state.numTriangles));
+    int nonZeroKij = static_cast<int>(state.nonZeroKij);
+    size_t totalPairs = state.numTriangles * state.numTriangles;
+    printf("  Non-zero form factors: %d/%zu (%.2f%%)\n",
+           nonZeroKij, totalPairs,
+           100.0f * nonZeroKij / static_cast<val_t>(totalPairs));
 
     if (nonZeroKij == 0) {
         printf("  ERROR: All form factors are zero - visibility computation failed\n");
@@ -1318,17 +1292,23 @@ void printUsage(const char* progName) {
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
 
-    int rank = 0;
-    int worldSize = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
+    SimulationState state;
+    MPI_Comm_rank(MPI_COMM_WORLD, &state.rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &state.numRanks);
 
-    int localRank = 0;
-    MPI_Comm nodeComm = MPI_COMM_NULL;
-    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &nodeComm);
-    MPI_Comm_rank(nodeComm, &localRank);
-
-    const bool isRoot = (rank == 0);
+    // Avoid oversubscribing OpenMP threads when several ranks share a node.
+    if (getenv("OMP_NUM_THREADS") == nullptr) {
+        int localSize = 1;
+        MPI_Comm localComm;
+        MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED,
+                            state.rank, MPI_INFO_NULL, &localComm);
+        MPI_Comm_size(localComm, &localSize);
+        MPI_Comm_free(&localComm);
+        int procs = omp_get_num_procs();
+        int threads = procs / (localSize > 0 ? localSize : 1);
+        if (threads < 1) threads = 1;
+        omp_set_num_threads(threads);
+    }
 
     int targetTriangles = 320;
     int timesteps = 50;
@@ -1352,16 +1332,14 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-o") == 0) {
             printResults = true;
         } else if (strcmp(argv[i], "-h") == 0) {
-            if (isRoot) printUsage(argv[0]);
-            MPI_Comm_free(&nodeComm);
+            if (state.rank == 0) printUsage(argv[0]);
             MPI_Finalize();
             return 0;
         } else {
-            if (isRoot) {
+            if (state.rank == 0) {
                 printf("Unknown option: %s\n", argv[i]);
                 printUsage(argv[0]);
             }
-            MPI_Comm_free(&nodeComm);
             MPI_Finalize();
             return 1;
         }
@@ -1369,7 +1347,7 @@ int main(int argc, char** argv) {
 
     int subdivisions = getSubdivisionsForTriangleCount(targetTriangles);
 
-    if (isRoot) {
+    if (state.rank == 0) {
         printf("Room Response Simulation Benchmark\n");
         printf("===================================\n");
         printf("Target triangles: %d (using %d subdivisions)\n", targetTriangles, subdivisions);
@@ -1377,36 +1355,25 @@ int main(int argc, char** argv) {
         printf("Source triangle: %d\n", sourceIdx);
         printf("Reflectivity: %.2f\n", reflectivity);
         printf("Validation: %s\n", validate ? "enabled" : "disabled");
-        printf("MPI ranks: %d, OpenMP threads per rank: %d\n", worldSize, omp_get_max_threads());
         printf("\n");
     }
 
     // Initialize
-    SimulationState state;
     initializeSimulation(state, subdivisions, static_cast<size_t>(timesteps),
-                         static_cast<size_t>(sourceIdx), reflectivity, rank, worldSize);
+                         static_cast<size_t>(sourceIdx), reflectivity);
 
-    // Flatten the octree and initialize the per-rank CUDA device.
-    std::vector<FlatOctree> flatNodes;
-    std::vector<int> flatTriIndices;
-    int rootNode = state.octree.flatten(flatNodes, flatTriIndices);
-
-    GpuContext gpu;
-    bool gpuReady = initGpu(gpu, localRank);
-    if (gpuReady) {
-        gpuReady = setupGpu(gpu, state, flatNodes, flatTriIndices, rootNode);
-        if (!gpuReady) freeGpu(gpu);
-    }
-    if (isRoot) {
-        if (gpuReady) {
-            printf("CUDA device: %d (rank-local)\n", gpu.device);
-        } else {
-            printf("CUDA device unavailable; falling back to MPI+OpenMP execution\n");
-        }
-        printf("\n");
+    // Flatten octree for the GPU
+    std::vector<GpuNode> hostNodes;
+    std::vector<int> hostTriIndices;
+    int nextTri = 0;
+    if (!state.triangles.empty()) {
+        flattenOctreeNode(state.octree, hostNodes, hostTriIndices, nextTri);
     }
 
-    const bool useGpu = gpuReady;
+    GpuData gpu;
+    initializeGpu(state, gpu, hostNodes, hostTriIndices);
+
+    if (state.rank == 0) printf("\n");
 
     // Precomputation
     MPI_Barrier(MPI_COMM_WORLD);
@@ -1414,13 +1381,12 @@ int main(int argc, char** argv) {
 
     computeTimeDelays(state, gpu);
     computeFormFactors(state, gpu);
-    if (useGpu) cudaDeviceSynchronize();
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto endPre = std::chrono::high_resolution_clock::now();
     auto preDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count();
 
-    if (isRoot) {
+    if (state.rank == 0) {
         printf("Precomputation time: %ld ms\n", preDuration);
         printf("\n");
     }
@@ -1430,13 +1396,12 @@ int main(int argc, char** argv) {
     auto startSim = std::chrono::high_resolution_clock::now();
 
     runSimulation(state, gpu);
-    if (useGpu) cudaDeviceSynchronize();
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto endSim = std::chrono::high_resolution_clock::now();
     auto simDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count();
 
-    if (isRoot) {
+    if (state.rank == 0) {
         printf("Simulation time: %ld ms\n", simDuration);
         printf("\n");
     }
@@ -1445,23 +1410,20 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto startDist = std::chrono::high_resolution_clock::now();
 
-    computeDistances(state, gpu);
-    if (useGpu) cudaDeviceSynchronize();
+    computeDistances(state);
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto endDist = std::chrono::high_resolution_clock::now();
     auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
 
-    long localTotalTime = preDuration + simDuration + distDuration;
-    long maxTotalTime = 0;
-    MPI_Reduce(&localTotalTime, &maxTotalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    int validationStatus = 1;
 
-    if (isRoot) {
+    if (state.rank == 0) {
         printf("Distance computation time: %ld ms\n", distDuration);
         printf("\n");
 
         // Total time
-        long totalTime = maxTotalTime;
+        long totalTime = preDuration + simDuration + distDuration;
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics
@@ -1479,7 +1441,7 @@ int main(int argc, char** argv) {
         printf("  Distance computations: %.2e\n", distOps);
         printf("  Total time per triangle: %.4f ms\n", static_cast<double>(totalTime) / n);
 
-        // Memory usage (distributed form-factor/tau rows)
+        // Memory usage
         size_t memKij = n * n * sizeof(val_t);
         size_t memTau = n * n * sizeof(int);
         size_t memRad = 2 * t * n * sizeof(val_t);
@@ -1497,23 +1459,31 @@ int main(int argc, char** argv) {
             print_results(distData, "Distances");
         }
 
-    }
-
-    if (validate) {
-        int localOk = 1;
-        if (isRoot) localOk = validateResults(state) ? 1 : 0;
-        int globalOk = 1;
-        MPI_Allreduce(&localOk, &globalOk, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-        if (!globalOk) {
-            freeGpu(gpu);
-            MPI_Comm_free(&nodeComm);
-            MPI_Finalize();
-            return 1;
+        // Validation
+        if (validate) {
+            validationStatus = validateResults(state) ? 1 : 0;
         }
     }
 
-    freeGpu(gpu);
-    MPI_Comm_free(&nodeComm);
+    MPI_Bcast(&validationStatus, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Release device resources
+    if (gpu.kij) cudaFree(gpu.kij);
+    if (gpu.tau) cudaFree(gpu.tau);
+    if (gpu.radB) cudaFree(gpu.radB);
+    if (gpu.areas) cudaFree(gpu.areas);
+    if (gpu.rho) cudaFree(gpu.rho);
+    if (gpu.triangles) cudaFree(gpu.triangles);
+    if (gpu.nodes) cudaFree(gpu.nodes);
+    if (gpu.triIndices) cudaFree(gpu.triIndices);
+    if (gpu.nonZeroCount) cudaFree(gpu.nonZeroCount);
+    if (gpu.hostRow) cudaFreeHost(gpu.hostRow);
+    if (gpu.hostLocal) cudaFreeHost(gpu.hostLocal);
+    if (gpu.randoms) cudaFree(gpu.randoms);
+    if (gpu.active) cudaFree(gpu.active);
+    if (gpu.hostRandoms) cudaFreeHost(gpu.hostRandoms);
+    if (gpu.hostActive) cudaFreeHost(gpu.hostActive);
+
     MPI_Finalize();
-    return 0;
+    return validationStatus ? 0 : 1;
 }

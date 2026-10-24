@@ -7,21 +7,15 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
-        set(CMAKE_CUDA_ARCHITECTURES native)
-    endif()
+  set(CMAKE_CUDA_ARCHITECTURES 70 75 80 86 89 90)
 endif()
 
+add_executable(cahn_hilliard cahn_hilliard.cpp)
 set_source_files_properties(cahn_hilliard.cpp PROPERTIES LANGUAGE CUDA)
 
-add_executable(cahn_hilliard cahn_hilliard.cpp)
-
-# Enable optimizations
 target_compile_options(cahn_hilliard PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -Wall -Wextra>
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+  $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+  $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -Wall -Wextra>
+)
 
-find_package(CUDAToolkit REQUIRED)
-
-# Link CUDA runtime and math library
-target_link_libraries(cahn_hilliard PRIVATE CUDA::cudart m)
+target_link_libraries(cahn_hilliard PRIVATE m)

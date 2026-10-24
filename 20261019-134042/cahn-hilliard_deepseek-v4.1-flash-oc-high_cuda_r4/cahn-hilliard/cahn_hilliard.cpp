@@ -10,125 +10,143 @@
 
 #include "../common/results_output.hpp"
 
-#define CUDA_CHECK(call)                                                                      \
-    do {                                                                                      \
-        cudaError_t err_ = (call);                                                            \
-        if (err_ != cudaSuccess) {                                                            \
-            std::fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,             \
-                         cudaGetErrorString(err_));                                           \
-            std::exit(EXIT_FAILURE);                                                          \
-        }                                                                                     \
+// Tile dimensions for the CUDA kernels.  Each block computes a BX x BY x BZ
+// tile of the grid; the shared-memory tile additionally holds one layer of
+// halo cells in every direction.
+constexpr int BX = 16;
+constexpr int BY = 8;
+constexpr int BZ = 4;
+
+constexpr int SX = BX + 2;
+constexpr int SY = BY + 2;
+constexpr int SZ = BZ + 2;
+constexpr int TILE_ELEMS = SX * SY * SZ;
+
+#define CUDA_CHECK(call)                                                                 \
+    do {                                                                                 \
+        cudaError_t err__ = (call);                                                      \
+        if (err__ != cudaSuccess) {                                                      \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,              \
+                    cudaGetErrorString(err__));                                          \
+            exit(EXIT_FAILURE);                                                          \
+        }                                                                                \
     } while (0)
 
-// One thread per grid cell. A 16x2x16 block gives fully occupied SMs while
-// keeping memory accesses coalesced along x.
-constexpr int BLOCK_X = 16;
-constexpr int BLOCK_Y = 2;
-constexpr int BLOCK_Z = 16;
-constexpr int BLOCK_SIZE = BLOCK_X * BLOCK_Y * BLOCK_Z;
-constexpr int MIN_BLOCKS_PER_SM = 3;
-
-__device__ __forceinline__ size_t globalIndex(int x, int y, int z, int nx, int ny) {
-    return (static_cast<size_t>(z) * ny + y) * nx + x;
+__device__ __forceinline__ int clampIndex(const int v, const int n) {
+    return v < 0 ? 0 : (v >= n ? n - 1 : v);
 }
 
-__global__ void initializeConcentrationKernel(double* __restrict__ c, size_t vol) {
-    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= vol) {
-        return;
+// Load a (BX+2) x (BY+2) x (BZ+2) tile into shared memory, replicating the
+// clamped boundary conditions used by the original serial implementation.
+__device__ __forceinline__ void loadTile(const double* __restrict__ src,
+                                         double* __restrict__ tile,
+                                         const int nx, const int ny, const int nz,
+                                         const int baseX, const int baseY, const int baseZ) {
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tz = threadIdx.z;
+
+    for (int sz = tz; sz < SZ; sz += BZ) {
+        const int gz = clampIndex(baseZ + sz - 1, nz);
+        for (int sy = ty; sy < SY; sy += BY) {
+            const int gy = clampIndex(baseY + sy - 1, ny);
+            const int row = (gz * ny + gy) * nx;
+            const int srow = (sz * SY + sy) * SX;
+            for (int sx = tx; sx < SX; sx += BX) {
+                const int gx = clampIndex(baseX + sx - 1, nx);
+                tile[srow + sx] = src[row + gx];
+            }
+        }
     }
+}
+
+// Compute chemical potential
+__global__ void computeChemicalPotentialKernel(const double* __restrict__ c,
+                                               double* __restrict__ mu,
+                                               const int nx, const int ny, const int nz,
+                                               const double invdx2, const double invdy2,
+                                               const double invdz2,
+                                               const double gamma, const double e_AA,
+                                               const double e_BB, const double e_AB) {
+    __shared__ double tile[TILE_ELEMS];
+
+    const int baseX = blockIdx.x * BX;
+    const int baseY = blockIdx.y * BY;
+    const int baseZ = blockIdx.z * BZ;
+
+    loadTile(c, tile, nx, ny, nz, baseX, baseY, baseZ);
+    __syncthreads();
+
+    const int x = baseX + threadIdx.x;
+    const int y = baseY + threadIdx.y;
+    const int z = baseZ + threadIdx.z;
+    if (x >= nx || y >= ny || z >= nz) return;
+
+    const int c0 = ((threadIdx.z + 1) * SY + (threadIdx.y + 1)) * SX + (threadIdx.x + 1);
+    const double center = tile[c0];
+    const double cxx = (tile[c0 + 1] + tile[c0 - 1] - 2.0 * center) * invdx2;
+    const double cyy = (tile[c0 + SX] + tile[c0 - SX] - 2.0 * center) * invdy2;
+    const double czz = (tile[c0 + SY * SX] + tile[c0 - SY * SX] - 2.0 * center) * invdz2;
+    const double lap = cxx + cyy + czz;
+
+    const double cv = center;
+    mu[(z * ny + y) * nx + x] =
+        4.5 * ((cv + 1.0) * e_AA + (cv - 1.0) * e_BB - 2.0 * cv * e_AB)
+        + 3.0 * cv + cv * cv * cv
+        - gamma * lap;
+}
+
+// Cahn-Hilliard update step
+__global__ void cahnHilliardUpdateKernel(double* __restrict__ cnew,
+                                         const double* __restrict__ cold,
+                                         const double* __restrict__ mu,
+                                         const int nx, const int ny, const int nz,
+                                         const double D, const double dt,
+                                         const double invdx2, const double invdy2,
+                                         const double invdz2) {
+    __shared__ double tile[TILE_ELEMS];
+
+    const int baseX = blockIdx.x * BX;
+    const int baseY = blockIdx.y * BY;
+    const int baseZ = blockIdx.z * BZ;
+
+    loadTile(mu, tile, nx, ny, nz, baseX, baseY, baseZ);
+    __syncthreads();
+
+    const int x = baseX + threadIdx.x;
+    const int y = baseY + threadIdx.y;
+    const int z = baseZ + threadIdx.z;
+    if (x >= nx || y >= ny || z >= nz) return;
+
+    const int c0 = ((threadIdx.z + 1) * SY + (threadIdx.y + 1)) * SX + (threadIdx.x + 1);
+    const double center = tile[c0];
+    const double cxx = (tile[c0 + 1] + tile[c0 - 1] - 2.0 * center) * invdx2;
+    const double cyy = (tile[c0 + SX] + tile[c0 - SX] - 2.0 * center) * invdy2;
+    const double czz = (tile[c0 + SY * SX] + tile[c0 - SY * SX] - 2.0 * center) * invdz2;
+    const double lap = cxx + cyy + czz;
+
+    const size_t idx = (static_cast<size_t>(z) * ny + y) * nx + x;
+    cnew[idx] = cold[idx] + dt * D * lap;
+}
+
+// Initialize concentration field
+__global__ void initializeConcentrationKernel(double* __restrict__ c,
+                                               const int nx, const int ny, const int nz,
+                                               const unsigned long long vol) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int z = blockIdx.z * blockDim.z + threadIdx.z;
+    if (x >= nx || y >= ny || z >= nz) return;
+
+    const unsigned long long linear_id =
+        (static_cast<unsigned long long>(z) * ny + y) * nx + x;
     const double pseudo =
-        ((((i + 1) * static_cast<size_t>(1299709)) % vol) / static_cast<double>(vol));
-    c[i] = -1.0 + 2.0 * pseudo;
+        static_cast<double>(((linear_id + 1ull) * 1299709ull) % vol) /
+        static_cast<double>(vol);
+    c[(static_cast<size_t>(z) * ny + y) * nx + x] = -1.0 + 2.0 * pseudo;
 }
 
-// mu = f(c) - gamma * laplacian(c)
-//
-// The polynomial part of the reference chemical-potential expression is
-// rearranged into coefficient form (mathematically identical):
-//   4.5*((c+1)*eAA + (c-1)*eBB - 2*c*eAB) + 3*c + c^3
-//     = c^3 + (4.5*(eAA+eBB-2*eAB)+3)*c + 4.5*(eAA-eBB)
-// and evaluated with two FMAs.
-template <bool UNIT_SPACING>
-__global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void computeMuKernel(
-    const double* __restrict__ c, double* __restrict__ mu, int nx, int ny, int nz,
-    double invdx2, double invdy2, double invdz2, double invdiag, double gamma, double coefB,
-    double coefC) {
-    const int x = static_cast<int>(blockIdx.x) * BLOCK_X + threadIdx.x;
-    const int y = static_cast<int>(blockIdx.y) * BLOCK_Y + threadIdx.y;
-    const int z = static_cast<int>(blockIdx.z) * BLOCK_Z + threadIdx.z;
-    if (x >= nx || y >= ny || z >= nz) {
-        return;
-    }
-
-    const int xp = (x < nx - 1) ? x + 1 : x;
-    const int yp = (y < ny - 1) ? y + 1 : y;
-    const int zp = (z < nz - 1) ? z + 1 : z;
-    const int xn = (x > 0) ? x - 1 : 0;
-    const int yn = (y > 0) ? y - 1 : 0;
-    const int zn = (z > 0) ? z - 1 : 0;
-
-    const size_t idx = globalIndex(x, y, z, nx, ny);
-    const double cv = c[idx];
-    const double xsum =
-        c[globalIndex(xp, y, z, nx, ny)] + c[globalIndex(xn, y, z, nx, ny)];
-    const double ysum =
-        c[globalIndex(x, yp, z, nx, ny)] + c[globalIndex(x, yn, z, nx, ny)];
-    const double zsum =
-        c[globalIndex(x, y, zp, nx, ny)] + c[globalIndex(x, y, zn, nx, ny)];
-
-    double lap;
-    if constexpr (UNIT_SPACING) {
-        lap = fma(-6.0, cv, xsum + ysum + zsum);
-    } else {
-        lap = fma(-cv, invdiag, xsum * invdx2 + ysum * invdy2 + zsum * invdz2);
-    }
-
-    const double poly = fma(cv, fma(cv, cv, coefB), coefC);
-    mu[idx] = fma(-gamma, lap, poly);
-}
-
-// c = c + dt*D*laplacian(mu)
-// The update only reads c at the same cell, so it is safe to update in place.
-template <bool UNIT_SPACING>
-__global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void updateKernel(
-    double* __restrict__ c, const double* __restrict__ mu, int nx, int ny, int nz,
-    double invdx2, double invdy2, double invdz2, double invdiag, double dtD) {
-    const int x = static_cast<int>(blockIdx.x) * BLOCK_X + threadIdx.x;
-    const int y = static_cast<int>(blockIdx.y) * BLOCK_Y + threadIdx.y;
-    const int z = static_cast<int>(blockIdx.z) * BLOCK_Z + threadIdx.z;
-    if (x >= nx || y >= ny || z >= nz) {
-        return;
-    }
-
-    const int xp = (x < nx - 1) ? x + 1 : x;
-    const int yp = (y < ny - 1) ? y + 1 : y;
-    const int zp = (z < nz - 1) ? z + 1 : z;
-    const int xn = (x > 0) ? x - 1 : 0;
-    const int yn = (y > 0) ? y - 1 : 0;
-    const int zn = (z > 0) ? z - 1 : 0;
-
-    const size_t idx = globalIndex(x, y, z, nx, ny);
-    const double muc = mu[idx];
-    const double xsum =
-        mu[globalIndex(xp, y, z, nx, ny)] + mu[globalIndex(xn, y, z, nx, ny)];
-    const double ysum =
-        mu[globalIndex(x, yp, z, nx, ny)] + mu[globalIndex(x, yn, z, nx, ny)];
-    const double zsum =
-        mu[globalIndex(x, y, zp, nx, ny)] + mu[globalIndex(x, y, zn, nx, ny)];
-
-    double lap;
-    if constexpr (UNIT_SPACING) {
-        lap = fma(-6.0, muc, xsum + ysum + zsum);
-    } else {
-        lap = fma(-muc, invdiag, xsum * invdx2 + ysum * invdy2 + zsum * invdz2);
-    }
-
-    c[idx] = fma(dtD, lap, c[idx]);
-}
-
-bool validateResult(const std::vector<double>& c, [[maybe_unused]] const size_t nx,
-                    [[maybe_unused]] const size_t ny, [[maybe_unused]] const size_t nz) {
+bool validateResult(const std::vector<double>& c, [[maybe_unused]] const size_t nx, [[maybe_unused]] const size_t ny, [[maybe_unused]] const size_t nz) {
     // Check for NaN or Inf
     for (const auto& val : c) {
         if (std::isnan(val) || std::isinf(val)) {
@@ -136,7 +154,7 @@ bool validateResult(const std::vector<double>& c, [[maybe_unused]] const size_t 
             return false;
         }
     }
-
+    
     // Check if values are in reasonable range for concentration field
     // After Cahn-Hilliard evolution, values should typically remain bounded
     double minVal = c[0];
@@ -145,15 +163,15 @@ bool validateResult(const std::vector<double>& c, [[maybe_unused]] const size_t 
         minVal = std::min(minVal, val);
         maxVal = std::max(maxVal, val);
     }
-
+    
     printf("Concentration range: [%.6f, %.6f]\n", minVal, maxVal);
-
+    
     // Values should generally stay within reasonable bounds
     if (maxVal > 10.0 || minVal < -10.0) {
         printf("Validation failed: values out of expected range\n");
         return false;
     }
-
+    
     return true;
 }
 
@@ -176,7 +194,7 @@ int main(int argc, char** argv) {
     int iterations = 20;
     bool validate = false;
     bool printResults = false;
-
+    
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-x") == 0 && i + 1 < argc) {
@@ -200,15 +218,15 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-
+    
     if (ny == 0) ny = nx;
     if (nz == 0) nz = nx;
-
+    
     printf("Cahn-Hilliard Phase Separation Benchmark\n");
     printf("Grid size: %zu x %zu x %zu\n", nx, ny, nz);
     printf("Time steps: %d\n", iterations);
     printf("Validation: %s\n", validate ? "enabled" : "disabled");
-
+    
     // Physical parameters
     const double dx = 1.0;
     const double dy = 1.0;
@@ -219,93 +237,84 @@ int main(int argc, char** argv) {
     const double e_AB = (2.0 / 9.0);
     const double gamma = 0.5;
     const double D = 1.0;
-
-    const size_t gridSize = nx * ny * nz;
-    const double invdx2 = 1.0 / (dx * dx);
-    const double invdy2 = 1.0 / (dy * dy);
-    const double invdz2 = 1.0 / (dz * dz);
-    const double invdiag = 2.0 * (invdx2 + invdy2 + invdz2);
-    const double coefB = 4.5 * (e_AA + e_BB - 2.0 * e_AB) + 3.0;
-    const double coefC = 4.5 * (e_AA - e_BB);
-    const double dtD = dt * D;
-    const bool unitSpacing = (dx == 1.0 && dy == 1.0 && dz == 1.0);
-
-    CUDA_CHECK(cudaSetDevice(0));
-
-    double* d_c = nullptr;
+    
+    size_t gridSize = nx * ny * nz;
+    
+    // Allocate device arrays
+    double* d_cold = nullptr;
+    double* d_cnew = nullptr;
     double* d_mu = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_c, gridSize * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_cold, gridSize * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_cnew, gridSize * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_mu, gridSize * sizeof(double)));
-
-    // Initialize concentration field on the device.
+    
+    // Initialize concentration field
     printf("Initializing concentration field...\n");
-    const unsigned int initBlocks = static_cast<unsigned int>((gridSize + 255) / 256);
-    if (initBlocks > 0) {
-        initializeConcentrationKernel<<<initBlocks, 256>>>(d_c, gridSize);
+    {
+        const dim3 block(8, 8, 4);
+        const dim3 grid((unsigned)((nx + block.x - 1) / block.x),
+                        (unsigned)((ny + block.y - 1) / block.y),
+                        (unsigned)((nz + block.z - 1) / block.z));
+        initializeConcentrationKernel<<<grid, block>>>(d_cold, (int)nx, (int)ny, (int)nz,
+                                                       (unsigned long long)gridSize);
         CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    const dim3 block(BLOCK_X, BLOCK_Y, BLOCK_Z);
-    const dim3 grid(static_cast<unsigned int>((nx + BLOCK_X - 1) / BLOCK_X),
-                    static_cast<unsigned int>((ny + BLOCK_Y - 1) / BLOCK_Y),
-                    static_cast<unsigned int>((nz + BLOCK_Z - 1) / BLOCK_Z));
-    const int inx = static_cast<int>(nx);
-    const int iny = static_cast<int>(ny);
-    const int inz = static_cast<int>(nz);
-
+    
     // Run simulation
     printf("Running Cahn-Hilliard simulation...\n");
     auto start = std::chrono::high_resolution_clock::now();
-
+    
+    const dim3 block(BX, BY, BZ);
+    const dim3 grid((unsigned)((nx + BX - 1) / BX),
+                    (unsigned)((ny + BY - 1) / BY),
+                    (unsigned)((nz + BZ - 1) / BZ));
+    const double invdx2 = 1.0 / (dx * dx);
+    const double invdy2 = 1.0 / (dy * dy);
+    const double invdz2 = 1.0 / (dz * dz);
+    
     for (int t = 0; t < iterations; ++t) {
-        if (unitSpacing) {
-            computeMuKernel<true><<<grid, block>>>(d_c, d_mu, inx, iny, inz, invdx2, invdy2,
-                                                   invdz2, invdiag, gamma, coefB, coefC);
-            updateKernel<true><<<grid, block>>>(d_c, d_mu, inx, iny, inz, invdx2, invdy2,
-                                                invdz2, invdiag, dtD);
-        } else {
-            computeMuKernel<false><<<grid, block>>>(d_c, d_mu, inx, iny, inz, invdx2, invdy2,
-                                                    invdz2, invdiag, gamma, coefB, coefC);
-            updateKernel<false><<<grid, block>>>(d_c, d_mu, inx, iny, inz, invdx2, invdy2,
-                                                 invdz2, invdiag, dtD);
-        }
-        CUDA_CHECK(cudaGetLastError());
+        // Compute chemical potential
+        computeChemicalPotentialKernel<<<grid, block>>>(d_cold, d_mu, (int)nx, (int)ny, (int)nz,
+                                                        invdx2, invdy2, invdz2,
+                                                        gamma, e_AA, e_BB, e_AB);
+        
+        // Update concentration
+        cahnHilliardUpdateKernel<<<grid, block>>>(d_cnew, d_cold, d_mu, (int)nx, (int)ny, (int)nz,
+                                                  D, dt, invdx2, invdy2, invdz2);
+        
+        // Swap buffers
+        std::swap(d_cold, d_cnew);
     }
-
+    
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+    
     auto end = std::chrono::high_resolution_clock::now();
-    const double elapsedMs =
-        std::chrono::duration<double, std::milli>(end - start).count();
-
-    printf("Computation time: %.3f ms\n", elapsedMs);
-
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    const double elapsedSec = duration.count() / 1e6;
+    
+    printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
+    
     // Calculate performance
     double cellUpdates = (double)gridSize * iterations;
-    double mcups = elapsedMs > 0.0 ? cellUpdates / (elapsedMs / 1000.0) / 1e6 : 0.0;
+    double mcups = (elapsedSec > 0.0) ? cellUpdates / elapsedSec / 1e6 : 0.0;
     printf("Performance: %.3f MCellUpdates/s\n", mcups);
-
-    // Only transfer the final field back when it is actually observed.
-    std::vector<double> hostCold;
-    if (printResults || validate) {
-        hostCold.resize(gridSize);
-        CUDA_CHECK(
-            cudaMemcpy(hostCold.data(), d_c, gridSize * sizeof(double), cudaMemcpyDeviceToHost));
-    }
-
-    CUDA_CHECK(cudaFree(d_c));
-    CUDA_CHECK(cudaFree(d_mu));
-
+    
+    // Copy the final field back to the host
+    std::vector<double> cold(gridSize);
+    CUDA_CHECK(cudaMemcpy(cold.data(), d_cold, gridSize * sizeof(double), cudaMemcpyDeviceToHost));
+    
     // Print results for external validation
     if (printResults) {
-        print_results(hostCold, "Concentration");
+        print_results(cold, "Concentration");
     }
-
+    
     // Validation
     if (validate) {
         printf("Validating result...\n");
-        bool valid = validateResult(hostCold, nx, ny, nz);
-
+        bool valid = validateResult(cold, nx, ny, nz);
+        
         if (valid) {
             printf("Validation: PASSED\n");
             return 0;
@@ -314,6 +323,6 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-
+    
     return 0;
 }

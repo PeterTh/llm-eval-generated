@@ -1,15 +1,17 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
 
-#include <cuda_runtime.h>
 #include <mpi.h>
 #include <omp.h>
+#include <cuda_runtime.h>
 
 #include "../common/results_output.hpp"
 
@@ -61,61 +63,25 @@ double blackScholes(const OptionInput& option) noexcept {
     const double q = option.q;
     const double T = option.t;
     const double sigma = option.vol;
-
+    
     if (T <= 0.0 || sigma <= 0.0) {
         return 0.0;
     }
-
+    
     const double d1 = (log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrt(T));
     const double d2 = d1 - sigma * sqrt(T);
-
+    
     const double Nd1 = cumulativeNormal(d1);
     const double Nd2 = cumulativeNormal(d2);
     const double discount = exp(-r * T);
-
+    
     double price;
     if (option.type == CALL) {
         price = S * exp(-q * T) * Nd1 - K * discount * Nd2;
     } else { // PUT
         price = K * discount * cumulativeNormal(-d2) - S * exp(-q * T) * cumulativeNormal(-d1);
     }
-
-    return price;
-}
-
-// Device-side equivalent of the pricing routine above.  The tiny, read-only test
-// set lives in device global memory so it is served from L1/L2 to every thread
-// block without consuming any meaningful memory bandwidth.
-__device__ inline double cumulativeNormalDevice(const double x) noexcept {
-    return 0.5 * (1.0 + erf(x * M_SQRT1_2));
-}
-
-__device__ inline double blackScholesDevice(const OptionInput& option) noexcept {
-    const double S = option.spot;
-    const double K = option.strike;
-    const double r = option.r;
-    const double q = option.q;
-    const double T = option.t;
-    const double sigma = option.vol;
-
-    if (T <= 0.0 || sigma <= 0.0) {
-        return 0.0;
-    }
-
-    const double d1 = (log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrt(T));
-    const double d2 = d1 - sigma * sqrt(T);
-
-    const double Nd1 = cumulativeNormalDevice(d1);
-    const double Nd2 = cumulativeNormalDevice(d2);
-    const double discount = exp(-r * T);
-
-    double price;
-    if (option.type == CALL) {
-        price = S * exp(-q * T) * Nd1 - K * discount * Nd2;
-    } else { // PUT
-        price = K * discount * cumulativeNormalDevice(-d2) - S * exp(-q * T) * cumulativeNormalDevice(-d1);
-    }
-
+    
     return price;
 }
 
@@ -132,155 +98,49 @@ inline constexpr std::array<OptionInput, 7> getTestOptions() noexcept {
     }};
 }
 
-__device__ OptionInput deviceTestOptions[7];
-
-__global__ void blackScholesKernel(const unsigned long long count,
-                                   const unsigned long long offset,
-                                   double* __restrict__ results) {
-    const unsigned long long local =
-        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (local >= count) {
-        return;
-    }
-
-    const unsigned long long i = offset + local;
-    OptionInput option = deviceTestOptions[i % 7];
-    const double factor = 1.0 + 0.1 * (i / 7.0);
+inline OptionInput makeOption(const size_t index) noexcept {
+    constexpr auto testOptions = getTestOptions();
+    const OptionInput& base = testOptions[index % testOptions.size()];
+    OptionInput option = base;
+    const double factor = 1.0 + 0.1 * (index / static_cast<double>(testOptions.size()));
     option.spot *= factor;
     option.strike *= factor;
-    results[local] = blackScholesDevice(option);
+    return option;
 }
 
 // Generate a larger set of options by scaling the test set
 void generateOptions(std::vector<OptionInput>& options, const size_t numOptions) {
-    constexpr auto testOptions = getTestOptions();
     options.resize(numOptions);
-
-    for (size_t i = 0; i < numOptions; ++i) {
-        // Cycle through test options and vary parameters slightly
-        const OptionInput& base = testOptions[i % testOptions.size()];
-        options[i] = base;
-
-        // Add some variation for larger datasets
-        const double factor = 1.0 + 0.1 * (i / static_cast<double>(testOptions.size()));
-        options[i].spot *= factor;
-        options[i].strike *= factor;
+    
+    #pragma omp parallel for schedule(static)
+    for (long long i = 0; i < static_cast<long long>(numOptions); ++i) {
+        options[static_cast<size_t>(i)] = makeOption(static_cast<size_t>(i));
     }
 }
 
-// Build only the options that validation actually inspects.
-std::vector<OptionInput> generateValidationOptions(const size_t numOptions) {
-    constexpr auto testOptions = getTestOptions();
-    const size_t count = std::min(static_cast<size_t>(10), numOptions);
-    std::vector<OptionInput> options(count);
-
-    for (size_t i = 0; i < count; ++i) {
-        const OptionInput& base = testOptions[i % testOptions.size()];
-        options[i] = base;
-        const double factor = 1.0 + 0.1 * (i / static_cast<double>(testOptions.size()));
-        options[i].spot *= factor;
-        options[i].strike *= factor;
-    }
-
-    return options;
-}
-
-bool validateResults(const std::vector<OptionInput>& options,
+bool validateResults(const std::vector<OptionInput>& options, 
                      const std::vector<double>& results) {
     bool allPassed = true;
     const int numChecks = std::min(static_cast<size_t>(10), options.size());
-
+    
     printf("Checking computed option prices:\n");
     for (int i = 0; i < numChecks; ++i) {
         const double computed = results[i];
         const double expected = options[i].value;
         const double error = fabs(computed - expected);
         const double relError = error / (fabs(expected) + 1e-10);
-
-        printf("  Option %d: computed=%.4f, expected=%.4f, rel_error=%.4e\n",
+        
+        printf("  Option %d: computed=%.4f, expected=%.4f, rel_error=%.4e\n", 
                i, computed, expected, relError);
-
+        
         // Relaxed validation - just check values are positive and reasonable
         if (computed < 0.0 || computed > 1000.0 || std::isnan(computed) || std::isinf(computed)) {
             printf("Validation failed at option %d: invalid value %.4f\n", i, computed);
             allPassed = false;
         }
     }
-
+    
     return allPassed;
-}
-
-// Fraction of the work assigned to the host CPU.  The measured per-thread CPU
-// rate and per-GPU rate make the two sides finish at approximately the same time.
-static inline size_t cpuWorkItems(const size_t count, const int threads) {
-    if (count == 0) {
-        return 0;
-    }
-    const double cpuRate = 10.0 * static_cast<double>(threads); // million options/s
-    const double gpuRate = 850.0;                               // million options/s
-    double fraction = cpuRate / (cpuRate + gpuRate);
-    fraction = std::min(0.5, std::max(0.0, fraction));
-
-    size_t cpuCount = static_cast<size_t>(static_cast<double>(count) * fraction);
-    if (cpuCount >= count) {
-        cpuCount = count - 1;
-    }
-    return cpuCount;
-}
-
-// Prices the global interval [start, start + count) using a device kernel while
-// OpenMP threads concurrently price a fraction of the same interval on the CPU.
-// This keeps every accelerator and the host cores busy.  Device allocation and
-// host-buffer setup happen in the caller so that they are not part of the timed
-// computation region.
-static void priceOptions(const size_t start, const size_t count,
-                         const size_t cpuCount, const size_t gpuCount,
-                         double* deviceResults, std::vector<double>& results,
-                         const bool materialize) {
-    if (count == 0) {
-        return;
-    }
-
-    if (gpuCount > 0) {
-        const unsigned int blockSize = 256;
-        const unsigned int gridSize =
-            static_cast<unsigned int>((gpuCount + blockSize - 1) / blockSize);
-        blackScholesKernel<<<gridSize, blockSize>>>(gpuCount, start + cpuCount,
-                                                    deviceResults);
-        const cudaError_t launchStatus = cudaGetLastError();
-        if (launchStatus != cudaSuccess) {
-            fprintf(stderr, "CUDA kernel launch failed: %s\n",
-                    cudaGetErrorString(launchStatus));
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-    }
-
-    if (cpuCount > 0) {
-        constexpr auto testOptions = getTestOptions();
-        const int threads = std::max(1, omp_get_max_threads());
-        #pragma omp parallel for schedule(static) num_threads(threads)
-        for (long long k = 0; k < static_cast<long long>(cpuCount); ++k) {
-            const size_t i = start + static_cast<size_t>(k);
-            const OptionInput& base = testOptions[i % testOptions.size()];
-            OptionInput option = base;
-            const double factor = 1.0 + 0.1 * (i / static_cast<double>(testOptions.size()));
-            option.spot *= factor;
-            option.strike *= factor;
-            results[static_cast<size_t>(k)] = blackScholes(option);
-        }
-    }
-
-    if (gpuCount > 0) {
-        cudaError_t status = cudaDeviceSynchronize();
-        if (status == cudaSuccess && materialize) {
-            status = cudaMemcpy(results.data() + cpuCount, deviceResults,
-                                gpuCount * sizeof(double), cudaMemcpyDeviceToHost);
-        }
-        if (status != cudaSuccess) {
-            fprintf(stderr, "CUDA execution failed: %s\n", cudaGetErrorString(status));
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-    }
 }
 
 void printUsage(const char* progName) {
@@ -292,36 +152,127 @@ void printUsage(const char* progName) {
     printf("  -h           Show this help message\n");
 }
 
+__constant__ OptionInput c_testOptions[7];
+
+__device__ __forceinline__ double cumulativeNormalDevice(const double x) noexcept {
+    return 0.5 * (1.0 + erf(x * M_SQRT1_2));
+}
+
+__device__ __forceinline__ double blackScholesDevice(const OptionInput& option) noexcept {
+    const double S = option.spot;
+    const double K = option.strike;
+    const double r = option.r;
+    const double q = option.q;
+    const double T = option.t;
+    const double sigma = option.vol;
+
+    if (T <= 0.0 || sigma <= 0.0) {
+        return 0.0;
+    }
+
+    const double sqrtT = sqrt(T);
+    const double sigmaSqrtT = sigma * sqrtT;
+    const double d1 = (log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / sigmaSqrtT;
+    const double d2 = d1 - sigmaSqrtT;
+    const double discount = exp(-r * T);
+    const double carry = S * exp(-q * T);
+
+    if (option.type == CALL) {
+        return carry * cumulativeNormalDevice(d1) - K * discount * cumulativeNormalDevice(d2);
+    } else { // PUT
+        return K * discount * cumulativeNormalDevice(-d2) - carry * cumulativeNormalDevice(-d1);
+    }
+}
+
+__global__ void blackScholesKernel(double* __restrict__ results,
+                                   const size_t begin,
+                                   const size_t count) {
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    for (size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < count; idx += stride) {
+        const size_t globalIndex = begin + idx;
+        const OptionInput& base = c_testOptions[globalIndex % 7];
+        OptionInput option = base;
+        const double factor = 1.0 + 0.1 * (globalIndex / 7.0);
+        option.spot *= factor;
+        option.strike *= factor;
+        results[idx] = blackScholesDevice(option);
+    }
+}
+
+static bool computeRangeOnDevice(int device,
+                                 const size_t globalBegin,
+                                 const size_t count,
+                                 double* hostOut) {
+    if (cudaSetDevice(device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+
+    constexpr auto testOptions = getTestOptions();
+    cudaError_t err = cudaMemcpyToSymbol(c_testOptions, testOptions.data(),
+                                         sizeof(OptionInput) * testOptions.size());
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+
+    if (count == 0) {
+        return true;
+    }
+
+    constexpr size_t maxTile = static_cast<size_t>(1) << 20;
+    const size_t tile = std::min(maxTile, count);
+    double* deviceResults = nullptr;
+    err = cudaMalloc(reinterpret_cast<void**>(&deviceResults), tile * sizeof(double));
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+
+    constexpr int blockSize = 256;
+    constexpr size_t maxBlocks = static_cast<size_t>(1) << 20;
+    bool ok = true;
+
+    for (size_t done = 0; done < count; done += tile) {
+        const size_t n = std::min(tile, count - done);
+        const size_t neededBlocks = (n + blockSize - 1) / blockSize;
+        const int gridSize = static_cast<int>(std::min(neededBlocks, maxBlocks));
+
+        blackScholesKernel<<<gridSize, blockSize>>>(deviceResults,
+                                                    globalBegin + done, n);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
+
+        err = cudaMemcpy(hostOut + done, deviceResults, n * sizeof(double),
+                         cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
+    }
+
+    cudaFree(deviceResults);
+    return ok;
+}
+
 int main(int argc, char** argv) {
-    int provided = 0;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+    MPI_Init(&argc, &argv);
+
     int rank = 0;
     int numRanks = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
 
-    // Select one accelerator per rank.  When CUDA_VISIBLE_DEVICES exposes a
-    // single device (as on the cluster launch wrapper) this is always device 0;
-    // otherwise ranks sharing a node are spread across all local devices.
-    MPI_Comm nodeComm = MPI_COMM_NULL;
-    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL,
-                        &nodeComm);
-    int localRank = 0;
-    MPI_Comm_rank(nodeComm, &localRank);
-    int deviceCount = 0;
-    if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount <= 0) {
-        if (rank == 0) {
-            fprintf(stderr, "No CUDA device available\n");
-        }
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    cudaSetDevice(localRank % deviceCount);
-    MPI_Comm_free(&nodeComm);
-
     size_t numOptions = 10000;
     bool validate = false;
     bool printResults = false;
-
+    
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
@@ -345,135 +296,181 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-
-    const bool needResults = printResults || validate;
-
+    
     if (rank == 0) {
         printf("Black-Scholes Option Pricing Benchmark\n");
         printf("Number of options: %zu\n", numOptions);
         printf("Validation: %s\n", validate ? "enabled" : "disabled");
+        printf("Pricing options...\n");
     }
 
-    // Upload the immutable option templates to constant memory once per rank.
-    constexpr auto testOptions = getTestOptions();
-    cudaError_t copyStatus = cudaMemcpyToSymbol(deviceTestOptions, testOptions.data(),
-                                                sizeof(OptionInput) * testOptions.size());
-    if (copyStatus != cudaSuccess) {
-        fprintf(stderr, "CUDA constant upload failed: %s\n", cudaGetErrorString(copyStatus));
-        MPI_Abort(MPI_COMM_WORLD, 1);
+    const size_t localBegin = (numOptions * static_cast<size_t>(rank)) /
+                              static_cast<size_t>(numRanks);
+    const size_t localEnd = (numOptions * static_cast<size_t>(rank + 1)) /
+                            static_cast<size_t>(numRanks);
+    const size_t localCount = localEnd - localBegin;
+
+    std::vector<double> localResults(localCount);
+
+    int devicesPerRank = 0;
+    std::vector<int> devices;
+    if (localCount > 0) {
+        int deviceCount = 0;
+        if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount <= 0) {
+            if (rank == 0) {
+                printf("CUDA device discovery failed\n");
+            }
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        int localRank = 0;
+        int localSize = 1;
+        MPI_Comm localComm = MPI_COMM_NULL;
+        MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank,
+                            MPI_INFO_NULL, &localComm);
+        MPI_Comm_rank(localComm, &localRank);
+        MPI_Comm_size(localComm, &localSize);
+
+        if (localSize >= deviceCount) {
+            devices.push_back(localRank % deviceCount);
+        } else {
+            for (int d = localRank; d < deviceCount; d += localSize) {
+                devices.push_back(d);
+            }
+        }
+        devicesPerRank = static_cast<int>(devices.size());
+
+        MPI_Comm_free(&localComm);
     }
 
-    // Contiguous, balanced partition of the global index space.
-    const size_t localStart =
-        static_cast<size_t>((static_cast<unsigned long long>(numOptions) * rank) / numRanks);
-    const size_t localEnd =
-        static_cast<size_t>((static_cast<unsigned long long>(numOptions) * (rank + 1)) / numRanks);
-    const size_t localCount = localEnd - localStart;
-
-    const int threads = std::max(1, omp_get_max_threads());
-    const size_t cpuCount = cpuWorkItems(localCount, threads);
-    const size_t gpuCount = localCount - cpuCount;
-
-    std::vector<double> localResults;
-    localResults.resize(needResults ? localCount : cpuCount);
-
-    double* deviceResults = nullptr;
-    if (gpuCount > 0) {
-        const cudaError_t status =
-            cudaMalloc(reinterpret_cast<void**>(&deviceResults), gpuCount * sizeof(double));
-        if (status != cudaSuccess) {
-            fprintf(stderr, "CUDA allocation failed: %s\n", cudaGetErrorString(status));
+    if (localCount > 0 && devicesPerRank > 0) {
+        std::atomic<int> initFailure{0};
+        #pragma omp parallel for schedule(static) num_threads(devicesPerRank)
+        for (int d = 0; d < devicesPerRank; ++d) {
+            double warmup = 0.0;
+            if (!computeRangeOnDevice(devices[static_cast<size_t>(d)], 0, 1,
+                                      &warmup)) {
+                initFailure.store(1, std::memory_order_relaxed);
+            }
+        }
+        if (initFailure.load() != 0) {
+            if (rank == 0) {
+                printf("CUDA initialization failed\n");
+            }
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
     }
 
-    // Touch the host buffers before timing so page faults do not inflate the
-    // measured pricing interval.
-    if (!localResults.empty()) {
-        const long long hostCount = static_cast<long long>(localResults.size());
-        #pragma omp parallel for schedule(static) num_threads(threads)
-        for (long long k = 0; k < hostCount; ++k) {
-            localResults[static_cast<size_t>(k)] = 0.0;
-        }
-    }
-
-    if (rank == 0) {
-        printf("Pricing options...\n");
-    }
+    std::atomic<int> deviceFailure{0};
+    double localSeconds = 0.0;
 
     MPI_Barrier(MPI_COMM_WORLD);
     const auto start = std::chrono::high_resolution_clock::now();
-    priceOptions(localStart, localCount, cpuCount, gpuCount, deviceResults,
-                 localResults, needResults);
-    const auto end = std::chrono::high_resolution_clock::now();
 
-    if (deviceResults != nullptr) {
-        cudaFree(deviceResults);
-        deviceResults = nullptr;
+    if (localCount > 0 && devicesPerRank > 0) {
+        #pragma omp parallel for schedule(static) num_threads(devicesPerRank)
+        for (int d = 0; d < devicesPerRank; ++d) {
+            const size_t subBegin = (localCount * static_cast<size_t>(d)) /
+                                    static_cast<size_t>(devicesPerRank);
+            const size_t subEnd = (localCount * static_cast<size_t>(d + 1)) /
+                                  static_cast<size_t>(devicesPerRank);
+            if (subEnd > subBegin) {
+                if (!computeRangeOnDevice(devices[static_cast<size_t>(d)],
+                                          localBegin + subBegin,
+                                          subEnd - subBegin,
+                                          localResults.data() + subBegin)) {
+                    deviceFailure.store(1, std::memory_order_relaxed);
+                }
+            }
+        }
     }
 
-    const double localSeconds =
-        std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
+    const auto end = std::chrono::high_resolution_clock::now();
+    localSeconds = std::chrono::duration<double>(end - start).count();
+
+    if (deviceFailure.load() != 0) {
+        if (rank == 0) {
+            printf("CUDA computation failed\n");
+        }
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
     double maxSeconds = 0.0;
-    MPI_Reduce(&localSeconds, &maxSeconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&localSeconds, &maxSeconds, 1, MPI_DOUBLE, MPI_MAX, 0,
+               MPI_COMM_WORLD);
 
     if (rank == 0) {
         printf("Computation time: %.3f ms\n", maxSeconds * 1000.0);
-        if (maxSeconds > 0.0) {
-            printf("Options per second: %.0f\n", numOptions / maxSeconds);
-        } else {
-            printf("Options per second: 0\n");
-        }
+        printf("Options per second: %.0f\n",
+               maxSeconds > 0.0 ? numOptions / maxSeconds : 0.0);
     }
 
+    const bool needResults = printResults || validate;
     std::vector<double> results;
+    std::vector<int> counts;
+    std::vector<int> displs;
+
     if (needResults) {
-        std::vector<int> counts;
-        std::vector<int> displs;
-        const int localCountInt = static_cast<int>(localCount);
-        if (rank == 0) {
-            counts.resize(numRanks);
-            displs.resize(numRanks);
+        if (localCount > static_cast<size_t>(INT_MAX)) {
+            if (rank == 0) {
+                printf("Too many options per process for MPI_Gatherv\n");
+            }
+            MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        MPI_Gather(&localCountInt, 1, MPI_INT,
-                   rank == 0 ? counts.data() : nullptr, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
         if (rank == 0) {
             results.resize(numOptions);
-            displs[0] = 0;
-            for (int r = 1; r < numRanks; ++r) {
-                displs[r] = displs[r - 1] + counts[r - 1];
+            counts.resize(static_cast<size_t>(numRanks));
+            displs.resize(static_cast<size_t>(numRanks));
+            for (int r = 0; r < numRanks; ++r) {
+                const size_t begin = (numOptions * static_cast<size_t>(r)) /
+                                     static_cast<size_t>(numRanks);
+                const size_t finish = (numOptions * static_cast<size_t>(r + 1)) /
+                                      static_cast<size_t>(numRanks);
+                counts[static_cast<size_t>(r)] = static_cast<int>(finish - begin);
+                displs[static_cast<size_t>(r)] = static_cast<int>(begin);
             }
         }
-        MPI_Gatherv(localResults.data(), localCountInt, MPI_DOUBLE,
+
+        MPI_Gatherv(localResults.data(), static_cast<int>(localCount), MPI_DOUBLE,
                     rank == 0 ? results.data() : nullptr,
                     rank == 0 ? counts.data() : nullptr,
                     rank == 0 ? displs.data() : nullptr,
                     MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
     }
 
-    int exitCode = 0;
-    if (needResults && rank == 0) {
+    int returnCode = 0;
+
+    if (rank == 0) {
+        // Print results for external validation
         if (printResults) {
             print_results(results, "OptionPrices");
         }
 
         if (validate) {
             printf("Validating results...\n");
-            const std::vector<OptionInput> checkOptions =
-                generateValidationOptions(numOptions);
-            const bool valid = validateResults(checkOptions, results);
+            const size_t validationCount =
+                std::min(static_cast<size_t>(10), numOptions);
+            std::vector<OptionInput> validationOptions(validationCount);
+            #pragma omp parallel for schedule(static)
+            for (long long i = 0;
+                 i < static_cast<long long>(validationCount); ++i) {
+                validationOptions[static_cast<size_t>(i)] =
+                    makeOption(static_cast<size_t>(i));
+            }
 
+            const bool valid = validateResults(validationOptions, results);
             if (valid) {
                 printf("Validation: PASSED\n");
             } else {
                 printf("Validation: FAILED\n");
+                returnCode = 1;
             }
-            exitCode = valid ? 0 : 1;
         }
     }
 
-    MPI_Bcast(&exitCode, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&returnCode, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
     MPI_Finalize();
-    return exitCode;
+    return returnCode;
 }

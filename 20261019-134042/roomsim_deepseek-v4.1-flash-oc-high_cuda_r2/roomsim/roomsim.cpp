@@ -1,26 +1,22 @@
 /**
  * Room Response Simulation Benchmark
- *
- * CUDA-parallelized implementation of room impulse response simulation using
- * radiosity-based wave propagation. It models how sound/light waves propagate
- * between surfaces in a room by computing:
- *
+ * 
+ * This is a CUDA-parallelized implementation of room impulse response simulation
+ * using radiosity-based wave propagation. It models how sound/light waves
+ * propagate between surfaces in a room by computing:
+ * 
  * 1. Form factors (Kij) between all pairs of triangles based on visibility and geometry
  * 2. Wave propagation using radiosity equations with time delays (Tau)
  * 3. Distance estimation via cross-correlation of radiosity values
- *
+ * 
  * The implementation generates a procedural icosphere mesh to simulate a room.
- *
- * All compute-intensive phases (form factors, time delays, wave propagation and
- * cross-correlation) are executed on the GPU with CUDA.  The original sampling
- * random number sequence is preserved exactly: random samples are produced on
- * the host from the same mt19937 stream (in the same order) and streamed to the
- * device in chunks, so results are bit-for-bit equivalent to the sequential
- * reference implementation.
+ * All numerically intensive phases (time delays, form factors, wave propagation,
+ * and cross-correlation) run on the GPU.
  */
 
 #include <algorithm>
 #include <array>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -37,25 +33,11 @@
 
 #include "../common/results_output.hpp"
 
-// ============================================================================
-// CUDA helpers
-// ============================================================================
-
-#if defined(__CUDACC__)
-#define HOST_DEVICE __host__ __device__
+#ifdef __CUDACC__
+#define HD __host__ __device__
 #else
-#define HOST_DEVICE
+#define HD
 #endif
-
-#define CUDA_CHECK(call)                                                       \
-    do {                                                                       \
-        cudaError_t err_ = (call);                                             \
-        if (err_ != cudaSuccess) {                                             \
-            std::fprintf(stderr, "CUDA error: %s (%s:%d)\n",                   \
-                         cudaGetErrorString(err_), __FILE__, __LINE__);        \
-            std::exit(1);                                                      \
-        }                                                                      \
-    } while (0)
 
 // ============================================================================
 // Types and Constants
@@ -73,9 +55,6 @@ constexpr int NUM_RAYS = 16;              // Number of rays for visibility sampl
 constexpr val_t INV_NUM_RAYS = 1.0f / NUM_RAYS;
 constexpr val_t EPSILON = 1e-6f;
 
-// Form-factor work is streamed to the GPU in chunks of triangle pairs.
-constexpr size_t KIJ_CHUNK_PAIRS = 1u << 16;
-
 // ============================================================================
 // Vector and Triangle Types
 // ============================================================================
@@ -83,30 +62,36 @@ constexpr size_t KIJ_CHUNK_PAIRS = 1u << 16;
 struct Vec3 {
     val_t x, y, z;
 
-    HOST_DEVICE constexpr Vec3() : x(0), y(0), z(0) {}
-    HOST_DEVICE constexpr Vec3(val_t x, val_t y, val_t z) : x(x), y(y), z(z) {}
-    HOST_DEVICE explicit constexpr Vec3(val_t v) : x(v), y(v), z(v) {}
+    HD constexpr Vec3() : x(0), y(0), z(0) {}
+    HD constexpr Vec3(val_t x, val_t y, val_t z) : x(x), y(y), z(z) {}
+    HD explicit constexpr Vec3(val_t v) : x(v), y(v), z(v) {}
 
-    HOST_DEVICE Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
-    HOST_DEVICE Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
-    HOST_DEVICE Vec3 operator*(val_t s) const { return {x * s, y * s, z * s}; }
-    HOST_DEVICE Vec3 operator/(val_t s) const { return {x / s, y / s, z / s}; }
-    HOST_DEVICE Vec3 operator-() const { return {-x, -y, -z}; }
+    HD Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+    HD Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+    HD Vec3 operator*(val_t s) const { return {x * s, y * s, z * s}; }
+    HD Vec3 operator/(val_t s) const { return {x / s, y / s, z / s}; }
+    HD Vec3 operator-() const { return {-x, -y, -z}; }
 
-    HOST_DEVICE val_t dot(const Vec3& o) const { return x * o.x + y * o.y + z * o.z; }
-    HOST_DEVICE Vec3 cross(const Vec3& o) const {
+    HD val_t dot(const Vec3& o) const { return x * o.x + y * o.y + z * o.z; }
+    HD Vec3 cross(const Vec3& o) const {
         return {y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x};
     }
 
-    HOST_DEVICE val_t squaredNorm() const { return x * x + y * y + z * z; }
-    HOST_DEVICE val_t norm() const { return sqrtf(squaredNorm()); }
-    HOST_DEVICE Vec3 normalized() const {
+    HD val_t squaredNorm() const { return x * x + y * y + z * z; }
+    HD val_t norm() const {
+#ifdef __CUDA_ARCH__
+        return sqrtf(squaredNorm());
+#else
+        return std::sqrt(squaredNorm());
+#endif
+    }
+    HD Vec3 normalized() const {
         val_t n = norm();
         return n > EPSILON ? *this / n : Vec3();
     }
 
-    HOST_DEVICE bool operator==(const Vec3& o) const {
-        return fabsf(x - o.x) < EPSILON && fabsf(y - o.y) < EPSILON && fabsf(z - o.z) < EPSILON;
+    bool operator==(const Vec3& o) const {
+        return std::abs(x - o.x) < EPSILON && std::abs(y - o.y) < EPSILON && std::abs(z - o.z) < EPSILON;
     }
 };
 
@@ -114,20 +99,20 @@ struct Triangle {
     Vec3 a, b, c;
     Vec3 _normal;
 
-    HOST_DEVICE Triangle() = default;
-    HOST_DEVICE Triangle(const Vec3& a, const Vec3& b, const Vec3& c)
+    Triangle() = default;
+    Triangle(const Vec3& a, const Vec3& b, const Vec3& c)
         : a(a), b(b), c(c), _normal((b - a).cross(c - a).normalized()) {}
 
-    HOST_DEVICE Vec3 center() const { return (a + b + c) / 3.0f; }
-    HOST_DEVICE Vec3 normal() const { return _normal; }
+    Vec3 center() const { return (a + b + c) / 3.0f; }
+    Vec3 normal() const { return _normal; }
 
-    HOST_DEVICE val_t area() const {
+    val_t area() const {
         Vec3 ab = b - a;
         Vec3 ac = c - a;
         return 0.5f * ab.cross(ac).norm();
     }
 
-    HOST_DEVICE bool operator==(const Triangle& o) const { return a == o.a && b == o.b && c == o.c; }
+    bool operator==(const Triangle& o) const { return a == o.a && b == o.b && c == o.c; }
 };
 
 // ============================================================================
@@ -320,10 +305,34 @@ public:
 
         return true;
     }
+
+    // Apply a function to all triangles potentially intersecting the ray
+    // Returns true if the function returns true for any triangle
+    template<typename Func>
+    bool applyToTris(const Vec3& p1, const Vec3& p2, Func&& func) const {
+        // If leaf node, check triangles directly
+        if (!triangleIndices.empty()) {
+            for (size_t idx : triangleIndices) {
+                if (func(idx, (*allTriangles)[idx])) return true;
+            }
+            return false;
+        }
+
+        // Otherwise, descend to children
+        for (int i = 0; i < 8; ++i) {
+            if (children[i] && children[i]->rayIntersectsBox(p1, p2)) {
+                if (children[i]->applyToTris(p1, p2, func)) return true;
+            }
+        }
+        return false;
+    }
 };
 
-// Flattened octree representation used by the GPU traversal.
-struct GpuOctNode {
+// ============================================================================
+// Flattened octree representation for the GPU
+// ============================================================================
+
+struct FlatNode {
     Vec3 center;
     Vec3 halfExtent;
     int child[8];
@@ -331,33 +340,33 @@ struct GpuOctNode {
     int triCount;
 };
 
-static int flattenOctreeNode(const Octree& node,
-                             std::vector<GpuOctNode>& nodes,
-                             std::vector<int>& leafTriangles) {
-    const int index = static_cast<int>(nodes.size());
-    nodes.emplace_back();
-    GpuOctNode& g = nodes[index];
-    g.center = node.center;
-    g.halfExtent = node.halfExtent;
-    for (int c = 0; c < 8; ++c) g.child[c] = -1;
-    g.triStart = 0;
-    g.triCount = 0;
+void flattenOctree(const Octree& node, std::vector<FlatNode>& nodes,
+                   std::vector<int>& triIndices) {
+    int self = static_cast<int>(nodes.size());
 
-    if (!node.triangleIndices.empty()) {
-        g.triStart = static_cast<int>(leafTriangles.size());
-        g.triCount = static_cast<int>(node.triangleIndices.size());
-        for (size_t idx : node.triangleIndices) {
-            leafTriangles.push_back(static_cast<int>(idx));
-        }
-    } else {
-        for (int c = 0; c < 8; ++c) {
-            if (node.children[c]) {
-                const int childIndex = flattenOctreeNode(*node.children[c], nodes, leafTriangles);
-                nodes[index].child[c] = childIndex;
-            }
+    FlatNode flat;
+    flat.center = node.center;
+    flat.halfExtent = node.halfExtent;
+    for (int i = 0; i < 8; ++i) flat.child[i] = -1;
+    flat.triStart = 0;
+    flat.triCount = 0;
+    nodes.push_back(flat);
+
+    for (int i = 0; i < 8; ++i) {
+        if (node.children[i]) {
+            int childIndex = static_cast<int>(nodes.size());
+            flattenOctree(*node.children[i], nodes, triIndices);
+            nodes[self].child[i] = childIndex;
         }
     }
-    return index;
+
+    if (!node.triangleIndices.empty()) {
+        nodes[self].triStart = static_cast<int>(triIndices.size());
+        nodes[self].triCount = static_cast<int>(node.triangleIndices.size());
+        for (size_t idx : node.triangleIndices) {
+            triIndices.push_back(static_cast<int>(idx));
+        }
+    }
 }
 
 // ============================================================================
@@ -448,152 +457,161 @@ public:
     val_t rand() { return dist(rng); }
 };
 
+// MT19937 with an externally visible state.  The C++ standard engine state is
+// not accessible, so this compatible implementation is used to snapshot the
+// generator at the beginning of every row.  The row states are then used by the
+// GPU to regenerate the exact same random sequence in parallel.
+struct MTState {
+    uint32_t x[624];
+    uint32_t p;
+};
+
+class MT19937 {
+    MTState s;
+public:
+    explicit MT19937(uint32_t seed = 5489) {
+        s.x[0] = seed;
+        for (uint32_t i = 1; i < 624; ++i) {
+            s.x[i] = 1812433253u * (s.x[i - 1] ^ (s.x[i - 1] >> 30)) + i;
+        }
+        s.p = 624;
+    }
+
+    const MTState& state() const { return s; }
+
+    void twist() {
+        uint32_t* x = s.x;
+        for (uint32_t i = 0; i < 227; ++i) {
+            uint32_t y = (x[i] & 0x80000000u) | (x[i + 1] & 0x7fffffffu);
+            x[i] = x[i + 397] ^ (y >> 1) ^ ((y & 1u) ? 0x9908b0dfu : 0u);
+        }
+        for (uint32_t i = 227; i < 623; ++i) {
+            uint32_t y = (x[i] & 0x80000000u) | (x[i + 1] & 0x7fffffffu);
+            x[i] = x[i - 227] ^ (y >> 1) ^ ((y & 1u) ? 0x9908b0dfu : 0u);
+        }
+        uint32_t y = (x[623] & 0x80000000u) | (x[0] & 0x7fffffffu);
+        x[623] = x[396] ^ (y >> 1) ^ ((y & 1u) ? 0x9908b0dfu : 0u);
+        s.p = 0;
+    }
+
+    uint32_t next() {
+        if (s.p >= 624) twist();
+        uint32_t y = s.x[s.p++];
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9d2c5680u;
+        y ^= (y << 15) & 0xefc60000u;
+        y ^= y >> 18;
+        return y;
+    }
+
+    void discard(uint64_t z) {
+        while (z > static_cast<uint64_t>(624 - s.p)) {
+            z -= static_cast<uint64_t>(624 - s.p);
+            twist();
+        }
+        s.p += static_cast<uint32_t>(z);
+    }
+};
+
+// Generate a random point inside a triangle using barycentric coordinates
+Vec3 randomPointInTriangle(const Triangle& t, RandomGenerator& rng) {
+    val_t u = rng.rand();
+    val_t v = rng.rand();
+    if (u + v > 1.0f) {
+        u = 1.0f - u;
+        v = 1.0f - v;
+    }
+    Vec3 ab = t.b - t.a;
+    Vec3 ac = t.c - t.a;
+    return t.a + ab * u + ac * v;
+}
+
 // ============================================================================
-// Ray-Triangle Intersection (Möller-Trumbore algorithm) - device
+// Ray-Triangle Intersection (Möller-Trumbore algorithm)
 // ============================================================================
 
-HOST_DEVICE val_t rayTriangleIntersect(const Vec3& orig, const Vec3& dir,
-                                       const Vec3& v0, const Vec3& v1, const Vec3& v2) {
+val_t rayTriangleIntersect(const Vec3& orig, const Vec3& dir,
+                            const Vec3& v0, const Vec3& v1, const Vec3& v2) {
     Vec3 e1 = v1 - v0;
     Vec3 e2 = v2 - v0;
     Vec3 pvec = dir.cross(e2);
     val_t det = e1.dot(pvec);
 
-    if (fabsf(det) < EPSILON) return 3.402823466e+38F;
+    if (std::abs(det) < EPSILON) return std::numeric_limits<val_t>::max();
 
     val_t invDet = 1.0f / det;
     Vec3 tvec = orig - v0;
     val_t u = tvec.dot(pvec) * invDet;
-    if (u < 0.0f || u > 1.0f) return 3.402823466e+38F;
+    if (u < 0.0f || u > 1.0f) return std::numeric_limits<val_t>::max();
 
     Vec3 qvec = tvec.cross(e1);
     val_t v = dir.dot(qvec) * invDet;
-    if (v < 0.0f || u + v > 1.0f) return 3.402823466e+38F;
+    if (v < 0.0f || u + v > 1.0f) return std::numeric_limits<val_t>::max();
 
     return e2.dot(qvec) * invDet;
 }
 
 // ============================================================================
-// Visibility Testing (Octree-accelerated) - device
+// Visibility Testing (Octree-accelerated)
 // ============================================================================
 
-HOST_DEVICE bool rayIntersectsBoxDevice(const Vec3& p1, const Vec3& p2,
-                                        const Vec3& center, const Vec3& halfExtent) {
-    Vec3 d = (p2 - p1) * 0.5f;
-    Vec3 c = p1 + d - center;
-    Vec3 ad = {fabsf(d.x), fabsf(d.y), fabsf(d.z)};
-
-    if (fabsf(c.x) > halfExtent.x + ad.x) return false;
-    if (fabsf(c.y) > halfExtent.y + ad.y) return false;
-    if (fabsf(c.z) > halfExtent.z + ad.z) return false;
-
-    if (fabsf(d.y * c.z - d.z * c.y) > halfExtent.y * ad.z + halfExtent.z * ad.y + EPSILON) return false;
-    if (fabsf(d.z * c.x - d.x * c.z) > halfExtent.z * ad.x + halfExtent.x * ad.z + EPSILON) return false;
-    if (fabsf(d.x * c.y - d.y * c.x) > halfExtent.x * ad.y + halfExtent.y * ad.x + EPSILON) return false;
-
-    return true;
-}
-
-__device__ bool isRayBlockedDevice(const Vec3& from, const Vec3& to,
-                                   const GpuOctNode* __restrict__ nodes,
-                                   const int* __restrict__ leafTriangles,
-                                   const Triangle* __restrict__ triangles,
-                                   int srcTriIdx, int dstTriIdx) {
+// Check if a ray between two triangles is blocked by any other triangle
+// Uses octree for O(log N) instead of O(N) search
+bool isRayBlocked(const Vec3& from, const Vec3& to,
+                  const Octree& octree,
+                  size_t srcTriIdx, size_t dstTriIdx) {
     Vec3 dir = to - from;
     val_t rayLen = dir.norm();
     if (rayLen < EPSILON) return true;
     Vec3 dirNorm = dir / rayLen;
 
-    int stack[32];
-    int sp = 0;
-    stack[sp++] = 0;
+    return octree.applyToTris(from, to, [&](size_t idx, const Triangle& tri) {
+        if (idx == srcTriIdx || idx == dstTriIdx) return false;
 
-    while (sp > 0) {
-        const int nodeIdx = stack[--sp];
-        const GpuOctNode& node = nodes[nodeIdx];
-
-        if (node.triCount > 0) {
-            const int start = node.triStart;
-            const int count = node.triCount;
-            for (int k = 0; k < count; ++k) {
-                const int idx = leafTriangles[start + k];
-                if (idx == srcTriIdx || idx == dstTriIdx) continue;
-
-                const Triangle& tri = triangles[idx];
-                const val_t dist = rayTriangleIntersect(from, dirNorm, tri.a, tri.b, tri.c);
-                if (dist > EPSILON && dist < rayLen - EPSILON) {
-                    return true;  // Ray is blocked
-                }
-            }
-        } else {
-            #pragma unroll
-            for (int c = 0; c < 8; ++c) {
-                const int childIdx = node.child[c];
-                if (childIdx < 0) continue;
-                const GpuOctNode& child = nodes[childIdx];
-                if (rayIntersectsBoxDevice(from, to, child.center, child.halfExtent)) {
-                    if (sp < 32) stack[sp++] = childIdx;
-                }
-            }
+        val_t dist = rayTriangleIntersect(from, dirNorm, tri.a, tri.b, tri.c);
+        if (dist > EPSILON && dist < rayLen - EPSILON) {
+            return true;  // Ray is blocked
         }
-    }
-    return false;
+        return false;
+    });
 }
 
 // ============================================================================
-// Form Factor Computation (Kij) - device
+// Form Factor Computation (Kij)
 // ============================================================================
 
-HOST_DEVICE val_t cosPhi(const Vec3& v, const Vec3& normal) {
+// Compute the cosine of angle between vector and triangle normal
+val_t cosPhi(const Vec3& v, const Vec3& normal) {
     val_t vNorm = v.norm();
     if (vNorm <= EPSILON) return ZERO;
-    return fmaxf(ZERO, v.dot(normal) / vNorm);
+    return std::max(ZERO, v.dot(normal) / vNorm);
 }
 
-__device__ val_t computeKijDevice(size_t idxI, size_t idxJ,
-                                  const Triangle* __restrict__ triangles,
-                                  const GpuOctNode* __restrict__ nodes,
-                                  const int* __restrict__ leafTriangles,
-                                  const val_t* __restrict__ randomValues,
-                                  int randomOffset) {
+// Compute form factor Kij between triangle i (receiver) and triangle j (emitter)
+val_t computeKij(size_t idxI, size_t idxJ,
+                  const std::vector<Triangle>& triangles,
+                  const Octree& octree,
+                  RandomGenerator& rng) {
     const Triangle& triI = triangles[idxI];
     const Triangle& triJ = triangles[idxJ];
 
+    // Cull triangles facing the same direction
+    if (triI.normal().dot(triJ.normal()) > 0.99f) return ZERO;
+
     val_t kij = ZERO;
-    const val_t* rnd = randomValues + randomOffset;
 
     for (int r = 0; r < NUM_RAYS; ++r) {
-        // Random point in triI
-        val_t u = rnd[0];
-        val_t v = rnd[1];
-        rnd += 2;
-        if (u + v > 1.0f) {
-            u = 1.0f - u;
-            v = 1.0f - v;
-        }
-        const Vec3 pI = triI.a + (triI.b - triI.a) * u + (triI.c - triI.a) * v;
+        Vec3 pI = randomPointInTriangle(triI, rng);
+        Vec3 pJ = randomPointInTriangle(triJ, rng);
 
-        // Random point in triJ
-        u = rnd[0];
-        v = rnd[1];
-        rnd += 2;
-        if (u + v > 1.0f) {
-            u = 1.0f - u;
-            v = 1.0f - v;
-        }
-        const Vec3 pJ = triJ.a + (triJ.b - triJ.a) * u + (triJ.c - triJ.a) * v;
+        if (isRayBlocked(pI, pJ, octree, idxI, idxJ)) continue;
 
-        if (isRayBlockedDevice(pI, pJ, nodes, leafTriangles, triangles,
-                               static_cast<int>(idxI), static_cast<int>(idxJ))) {
-            continue;
-        }
-
-        const Vec3 vv = pJ - pI;
-        const val_t distSqr = vv.squaredNorm();
+        Vec3 v = pJ - pI;
+        val_t distSqr = v.squaredNorm();
         if (distSqr < EPSILON) continue;
 
-        const val_t cosPhiI = cosPhi(vv, triI.normal());
-        const val_t cosPhiJ = cosPhi(-vv, triJ.normal());
+        val_t cosPhiI = cosPhi(v, triI.normal());
+        val_t cosPhiJ = cosPhi(-v, triJ.normal());
 
         if (cosPhiI <= ZERO || cosPhiJ <= ZERO) continue;
 
@@ -603,68 +621,399 @@ __device__ val_t computeKijDevice(size_t idxI, size_t idxJ,
     return kij * INV_NUM_RAYS;
 }
 
-__global__ void computeKijChunkKernel(size_t pairStart,
-                                      int pairCount,
-                                      const val_t* __restrict__ randomValues,
-                                      const int* __restrict__ randomOffsets,
-                                      const Triangle* __restrict__ triangles,
-                                      size_t numTriangles,
-                                      const GpuOctNode* __restrict__ nodes,
-                                      const int* __restrict__ leafTriangles,
-                                      val_t* __restrict__ kij) {
-    const int local = blockIdx.x * blockDim.x + threadIdx.x;
-    if (local >= pairCount) return;
+// ============================================================================
+// Tau (time delay) Computation
+// ============================================================================
 
-    const int offset = randomOffsets[local];
-    const size_t pair = pairStart + static_cast<size_t>(local);
-
-    const size_t rowSize = numTriangles - 1;
-    const size_t i = pair / rowSize;
-    const size_t rem = pair - i * rowSize;
-    const size_t j = (rem < i) ? rem : rem + 1;
-
-    if (offset < 0) {
-        // Triangle pair is culled by the same normal test used by the
-        // sequential implementation (and consumes no random numbers).
-        kij[i * numTriangles + j] = ZERO;
-        return;
-    }
-
-    kij[i * numTriangles + j] = computeKijDevice(
-        i, j, triangles, nodes, leafTriangles, randomValues, offset);
+int computeTau(const Triangle& triI, const Triangle& triJ) {
+    val_t dist = (triI.center() - triJ.center()).norm();
+    return static_cast<int>(std::ceil(dist * INV_WAVE_SPEED));
 }
 
 // ============================================================================
-// Tau (time delay) Computation - device
+// CUDA device helpers and kernels
 // ============================================================================
 
-__global__ void computeTauKernel(size_t numTriangles,
-                                 const Triangle* __restrict__ triangles,
-                                 int* __restrict__ tau) {
-    const size_t i = static_cast<size_t>(blockIdx.y) * blockDim.y + threadIdx.y;
-    const size_t j = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= numTriangles || j >= numTriangles) return;
+__device__ __forceinline__ val_t deviceAbs(val_t v) {
+    return v < 0.0f ? -v : v;
+}
 
+__device__ __forceinline__ val_t deviceMax0(val_t v) {
+    return v > 0.0f ? v : 0.0f;
+}
+
+__device__ __forceinline__ val_t deviceMin(val_t a, val_t b) {
+    return b < a ? b : a;
+}
+
+__device__ __forceinline__ val_t rayTriangleIntersectDevice(
+    const Vec3& orig, const Vec3& dir,
+    const Vec3& v0, const Vec3& v1, const Vec3& v2) {
+    Vec3 e1 = v1 - v0;
+    Vec3 e2 = v2 - v0;
+    Vec3 pvec = dir.cross(e2);
+    val_t det = e1.dot(pvec);
+
+    if (deviceAbs(det) < EPSILON) return FLT_MAX;
+
+    val_t invDet = 1.0f / det;
+    Vec3 tvec = orig - v0;
+    val_t u = tvec.dot(pvec) * invDet;
+    if (u < 0.0f || u > 1.0f) return FLT_MAX;
+
+    Vec3 qvec = tvec.cross(e1);
+    val_t v = dir.dot(qvec) * invDet;
+    if (v < 0.0f || u + v > 1.0f) return FLT_MAX;
+
+    return e2.dot(qvec) * invDet;
+}
+
+__device__ __forceinline__ bool rayIntersectsBoxDevice(
+    const FlatNode* __restrict__ nodes, int nodeIndex,
+    const Vec3& p1, const Vec3& p2) {
+    const FlatNode& node = nodes[nodeIndex];
+    Vec3 d = (p2 - p1) * 0.5f;
+    Vec3 c = p1 + d - node.center;
+    Vec3 ad = {deviceAbs(d.x), deviceAbs(d.y), deviceAbs(d.z)};
+
+    if (deviceAbs(c.x) > node.halfExtent.x + ad.x) return false;
+    if (deviceAbs(c.y) > node.halfExtent.y + ad.y) return false;
+    if (deviceAbs(c.z) > node.halfExtent.z + ad.z) return false;
+
+    if (deviceAbs(d.y * c.z - d.z * c.y) >
+        node.halfExtent.y * ad.z + node.halfExtent.z * ad.y + EPSILON) return false;
+    if (deviceAbs(d.z * c.x - d.x * c.z) >
+        node.halfExtent.z * ad.x + node.halfExtent.x * ad.z + EPSILON) return false;
+    if (deviceAbs(d.x * c.y - d.y * c.x) >
+        node.halfExtent.x * ad.y + node.halfExtent.y * ad.x + EPSILON) return false;
+
+    return true;
+}
+
+__device__ bool isRayBlockedDevice(
+    const Vec3& from, const Vec3& to,
+    const Triangle* __restrict__ triangles,
+    const FlatNode* __restrict__ nodes,
+    const int* __restrict__ triIndices,
+    size_t srcTriIdx, size_t dstTriIdx) {
+    Vec3 dir = to - from;
+    val_t rayLen = dir.norm();
+    if (rayLen < EPSILON) return true;
+    Vec3 dirNorm = dir / rayLen;
+
+    int stack[64];
+    int sp = 0;
+    stack[sp++] = 0;
+
+    while (sp > 0) {
+        int nodeIndex = stack[--sp];
+        const FlatNode& node = nodes[nodeIndex];
+
+        if (node.triCount > 0) {
+            int start = node.triStart;
+            int count = node.triCount;
+            for (int k = 0; k < count; ++k) {
+                int idx = triIndices[start + k];
+                if (static_cast<size_t>(idx) == srcTriIdx ||
+                    static_cast<size_t>(idx) == dstTriIdx) continue;
+
+                const Triangle& tri = triangles[idx];
+                val_t dist = rayTriangleIntersectDevice(
+                    from, dirNorm, tri.a, tri.b, tri.c);
+                if (dist > EPSILON && dist < rayLen - EPSILON) {
+                    return true;
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                int childIndex = node.child[c];
+                if (childIndex >= 0 &&
+                    rayIntersectsBoxDevice(nodes, childIndex, from, to)) {
+                    if (sp < 64) stack[sp++] = childIndex;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+__device__ __forceinline__ Vec3 randomPointInTriangleDevice(
+    const Triangle& t, val_t u, val_t v) {
+    if (u + v > 1.0f) {
+        u = 1.0f - u;
+        v = 1.0f - v;
+    }
+    Vec3 ab = t.b - t.a;
+    Vec3 ac = t.c - t.a;
+    return t.a + ab * u + ac * v;
+}
+
+__device__ __forceinline__ val_t cosPhiDevice(const Vec3& v, const Vec3& normal) {
+    val_t vNorm = v.norm();
+    if (vNorm <= EPSILON) return ZERO;
+    return deviceMax0(v.dot(normal) / vNorm);
+}
+
+__device__ val_t computeKijDevice(
+    uint32_t idxI, uint32_t idxJ,
+    const Triangle* __restrict__ triangles,
+    const FlatNode* __restrict__ nodes,
+    const int* __restrict__ triIndices,
+    const val_t* __restrict__ rngValues) {
+    const Triangle& triI = triangles[idxI];
+    const Triangle& triJ = triangles[idxJ];
+
+    if (triI._normal.dot(triJ._normal) > 0.99f) return ZERO;
+
+    val_t kij = ZERO;
+    uint32_t rngPos = 0;
+
+    for (int r = 0; r < NUM_RAYS; ++r) {
+        val_t uI = rngValues[rngPos++];
+        val_t vI = rngValues[rngPos++];
+        val_t uJ = rngValues[rngPos++];
+        val_t vJ = rngValues[rngPos++];
+
+        Vec3 pI = randomPointInTriangleDevice(triI, uI, vI);
+        Vec3 pJ = randomPointInTriangleDevice(triJ, uJ, vJ);
+
+        if (isRayBlockedDevice(pI, pJ, triangles, nodes, triIndices, idxI, idxJ)) {
+            continue;
+        }
+
+        Vec3 v = pJ - pI;
+        val_t distSqr = v.squaredNorm();
+        if (distSqr < EPSILON) continue;
+
+        val_t cosPhiI = cosPhiDevice(v, triI._normal);
+        val_t cosPhiJ = cosPhiDevice(-v, triJ._normal);
+
+        if (cosPhiI <= ZERO || cosPhiJ <= ZERO) continue;
+
+        kij += (cosPhiI * cosPhiJ) / (PI * distSqr);
+    }
+
+    return kij * INV_NUM_RAYS;
+}
+
+__device__ __forceinline__ void mtTwistDevice(MTState& s) {
+    uint32_t* x = s.x;
+    for (uint32_t i = 0; i < 227; ++i) {
+        uint32_t y = (x[i] & 0x80000000u) | (x[i + 1] & 0x7fffffffu);
+        x[i] = x[i + 397] ^ (y >> 1) ^ ((y & 1u) ? 0x9908b0dfu : 0u);
+    }
+    for (uint32_t i = 227; i < 623; ++i) {
+        uint32_t y = (x[i] & 0x80000000u) | (x[i + 1] & 0x7fffffffu);
+        x[i] = x[i - 227] ^ (y >> 1) ^ ((y & 1u) ? 0x9908b0dfu : 0u);
+    }
+    uint32_t y = (x[623] & 0x80000000u) | (x[0] & 0x7fffffffu);
+    x[623] = x[396] ^ (y >> 1) ^ ((y & 1u) ? 0x9908b0dfu : 0u);
+    s.p = 0;
+}
+
+__device__ __forceinline__ val_t mtNextFloatDevice(MTState& s) {
+    if (s.p >= 624) mtTwistDevice(s);
+    uint32_t y = s.x[s.p++];
+    y ^= y >> 11;
+    y ^= (y << 7) & 0x9d2c5680u;
+    y ^= (y << 15) & 0xefc60000u;
+    y ^= y >> 18;
+    return static_cast<val_t>(y) / 4294967296.0f;
+}
+
+__device__ __forceinline__ void mtDiscardDevice(MTState& s, uint64_t z) {
+    while (z > static_cast<uint64_t>(624u - s.p)) {
+        z -= static_cast<uint64_t>(624u - s.p);
+        mtTwistDevice(s);
+    }
+    s.p += static_cast<uint32_t>(z);
+}
+
+__global__ void generateRngKernel(
+    const MTState* __restrict__ segmentStates,
+    uint64_t firstSegment, uint64_t numSegments,
+    uint64_t segmentLength,
+    uint64_t batchStart, uint64_t batchEnd,
+    val_t* __restrict__ rngValues) {
+    uint64_t t = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= numSegments) return;
+
+    uint64_t segmentIndex = firstSegment + t;
+    uint64_t segmentStart = segmentIndex * segmentLength;
+
+    MTState state = segmentStates[segmentIndex];
+
+    uint64_t writeStart = segmentStart > batchStart ? segmentStart : batchStart;
+    uint64_t segmentEnd = segmentStart + segmentLength;
+    uint64_t writeEnd = segmentEnd < batchEnd ? segmentEnd : batchEnd;
+    if (writeStart >= writeEnd) return;
+
+    mtDiscardDevice(state, writeStart - segmentStart);
+
+    for (uint64_t off = writeStart; off < writeEnd; ++off) {
+        rngValues[off - batchStart] = mtNextFloatDevice(state);
+    }
+}
+
+__global__ void timeDelaysKernel(
+    const Triangle* __restrict__ triangles,
+    int* __restrict__ tau, uint32_t n) {
+    size_t total = static_cast<size_t>(n) * n;
+    size_t id = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (id >= total) return;
+
+    uint32_t i = static_cast<uint32_t>(id / n);
+    uint32_t j = static_cast<uint32_t>(id - static_cast<size_t>(i) * n);
     if (i == j) {
-        tau[i * numTriangles + j] = 0;
+        tau[id] = 0;
         return;
     }
 
-    const Vec3 ci = triangles[i].center();
-    const Vec3 cj = triangles[j].center();
-    const val_t dist = (ci - cj).norm();
-    tau[i * numTriangles + j] = static_cast<int>(ceilf(dist * INV_WAVE_SPEED));
+    Vec3 ci = (triangles[i].a + triangles[i].b + triangles[i].c) / 3.0f;
+    Vec3 cj = (triangles[j].a + triangles[j].b + triangles[j].c) / 3.0f;
+    val_t dist = (ci - cj).norm();
+    tau[id] = static_cast<int>(ceilf(dist * INV_WAVE_SPEED));
 }
 
-// Forward declarations for kernels that are used during the initialization
-// warm-up below.
-__global__ void simulateStepKernel(int t, size_t numTriangles,
-                                   const val_t* kij, const int* tau,
-                                   const val_t* areas, const val_t* rho,
-                                   const val_t* radE, val_t* radB);
-__global__ void computeDistancesKernel(size_t numTriangles, size_t numTimesteps,
-                                       size_t sourceIndex, const val_t* radB,
-                                       val_t* distances);
+__global__ void formFactorsKernel(
+    const Triangle* __restrict__ triangles,
+    const FlatNode* __restrict__ nodes,
+    const int* __restrict__ triIndices,
+    const val_t* __restrict__ rngValues,
+    const uint32_t* __restrict__ pairRngOffset,
+    val_t* __restrict__ kij,
+    uint32_t n, uint32_t rowStart, uint32_t rows) {
+    uint32_t total = rows * n;
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+
+    uint32_t r = tid / n;
+    uint32_t j = tid - r * n;
+    uint32_t i = rowStart + r;
+    if (i == j) return;
+
+    uint32_t offset = pairRngOffset[tid];
+    val_t value = ZERO;
+    if (offset != UINT32_MAX) {
+        value = computeKijDevice(i, j, triangles, nodes, triIndices,
+                                 rngValues + offset);
+    }
+    kij[static_cast<size_t>(i) * n + j] = value;
+}
+
+__global__ void simulationKernel(
+    const val_t* __restrict__ radE,
+    val_t* __restrict__ radB,
+    const val_t* __restrict__ kij,
+    const int* __restrict__ tau,
+    const val_t* __restrict__ rho,
+    const val_t* __restrict__ areas,
+    uint32_t n, int t) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    val_t sumB = ZERO;
+    size_t row = static_cast<size_t>(i) * n;
+
+    for (uint32_t j = 0; j < n; ++j) {
+        if (i == j) continue;
+
+        int tauij = tau[row + j];
+        if (t < tauij) continue;
+
+        val_t kijVal = kij[row + j];
+        if (kijVal <= ZERO) continue;
+
+        size_t srcTime = static_cast<size_t>(t - tauij);
+        val_t radJ = radB[srcTime * n + j];
+        if (radJ <= ZERO) continue;
+
+        sumB += deviceMin(kijVal * areas[j], ONE) * radJ;
+    }
+
+    radB[static_cast<size_t>(t) * n + i] =
+        rho[i] * sumB + radE[static_cast<size_t>(t) * n + i];
+}
+
+__global__ void distanceKernel(
+    const val_t* __restrict__ radB,
+    uint32_t n, uint32_t numTimesteps, uint32_t sourceIndex,
+    val_t* __restrict__ distances) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    val_t maxCorr = ZERO;
+    int bestT = 0;
+
+    for (uint32_t t = 0; t < numTimesteps; ++t) {
+        val_t sum = ZERO;
+
+        for (uint32_t tt = t; tt < numTimesteps; ++tt) {
+            val_t pB = radB[static_cast<size_t>(tt) * n + i];
+            val_t pS = radB[static_cast<size_t>(tt - t) * n + sourceIndex];
+            sum += pS * pB;
+        }
+
+        if (sum > maxCorr) {
+            maxCorr = sum;
+            bestT = static_cast<int>(t);
+        }
+    }
+
+    distances[i] = WAVE_SPEED * static_cast<val_t>(bestT);
+}
+
+__global__ void countNonZeroKernel(
+    const val_t* __restrict__ kij, size_t total,
+    unsigned long long* __restrict__ counter) {
+    unsigned int count = 0;
+    size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    for (size_t id = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         id < total; id += stride) {
+        if (kij[id] > EPSILON) ++count;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        count += __shfl_down_sync(0xffffffffu, count, offset);
+    }
+
+    if ((threadIdx.x & 31u) == 0 && count > 0) {
+        atomicAdd(counter, static_cast<unsigned long long>(count));
+    }
+}
+
+// ============================================================================
+// GPU resource management
+// ============================================================================
+
+struct GpuState {
+    Triangle* d_triangles = nullptr;
+    FlatNode* d_nodes = nullptr;
+    int* d_triIndices = nullptr;
+    int numNodes = 0;
+
+    val_t* d_areas = nullptr;
+    val_t* d_rho = nullptr;
+    val_t* d_kij = nullptr;
+    int* d_tau = nullptr;
+    val_t* d_radE = nullptr;
+    val_t* d_radB = nullptr;
+    val_t* d_distances = nullptr;
+
+    val_t* d_rngValues = nullptr;
+    uint32_t* d_pairRngOffset = nullptr;
+    size_t rngCapacity = 0;
+    size_t pairCapacity = 0;
+};
+
+void checkCuda(cudaError_t err, const char* what) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error at %s: %s\n", what, cudaGetErrorString(err));
+        std::exit(1);
+    }
+}
 
 // ============================================================================
 // Room Response Simulation State
@@ -686,55 +1035,6 @@ struct SimulationState {
     Octree octree;                  // Spatial acceleration structure
 
     size_t sourceIndex;
-
-    // GPU resources
-    Triangle* d_triangles = nullptr;
-    GpuOctNode* d_nodes = nullptr;
-    int* d_leafTriangles = nullptr;
-    int d_numNodes = 0;
-    val_t* d_areas = nullptr;
-    val_t* d_rho = nullptr;
-    val_t* d_kij = nullptr;
-    int* d_tau = nullptr;
-    val_t* d_radE = nullptr;
-    val_t* d_radB = nullptr;
-    val_t* d_distances = nullptr;
-    val_t* d_random = nullptr;
-    int* d_offsets = nullptr;
-
-    SimulationState() : numTriangles(0), numTimesteps(0), sourceIndex(0) {}
-
-    ~SimulationState() { freeDevice(); }
-
-    SimulationState(const SimulationState&) = delete;
-    SimulationState& operator=(const SimulationState&) = delete;
-
-    void freeDevice() {
-        if (d_triangles) cudaFree(d_triangles);
-        if (d_nodes) cudaFree(d_nodes);
-        if (d_leafTriangles) cudaFree(d_leafTriangles);
-        if (d_areas) cudaFree(d_areas);
-        if (d_rho) cudaFree(d_rho);
-        if (d_kij) cudaFree(d_kij);
-        if (d_tau) cudaFree(d_tau);
-        if (d_radE) cudaFree(d_radE);
-        if (d_radB) cudaFree(d_radB);
-        if (d_distances) cudaFree(d_distances);
-        if (d_random) cudaFree(d_random);
-        if (d_offsets) cudaFree(d_offsets);
-        d_triangles = nullptr;
-        d_nodes = nullptr;
-        d_leafTriangles = nullptr;
-        d_areas = nullptr;
-        d_rho = nullptr;
-        d_kij = nullptr;
-        d_tau = nullptr;
-        d_radE = nullptr;
-        d_radB = nullptr;
-        d_distances = nullptr;
-        d_random = nullptr;
-        d_offsets = nullptr;
-    }
 
     size_t idx2d(size_t i, size_t j) const { return i * numTriangles + j; }
     size_t idxTN(size_t t, size_t n) const { return t * numTriangles + n; }
@@ -769,7 +1069,6 @@ void initializeSimulation(SimulationState& state, int subdivisions, size_t times
     state.rho.resize(state.numTriangles, reflectivity);
 
     // Initialize matrices
-    state.kij.resize(state.numTriangles * state.numTriangles, ZERO);
     state.radE.resize(timesteps * state.numTriangles, ZERO);
     state.radB.resize(timesteps * state.numTriangles, ZERO);
     state.distances.resize(state.numTriangles, ZERO);
@@ -780,271 +1079,309 @@ void initializeSimulation(SimulationState& state, int subdivisions, size_t times
     for (size_t t = timeOn; t < timeOff; ++t) {
         state.radE[state.idxTN(t, state.sourceIndex)] = 1.0f;
     }
+}
 
-    // Flatten octree for the GPU and upload all immutable data.
-    std::vector<GpuOctNode> flatNodes;
-    std::vector<int> flatLeafTriangles;
-    flattenOctreeNode(state.octree, flatNodes, flatLeafTriangles);
-    state.d_numNodes = static_cast<int>(flatNodes.size());
+void uploadStaticState(SimulationState& state, GpuState& gpu) {
+    size_t n = state.numTriangles;
+    size_t t = state.numTimesteps;
+    size_t nn = n * n;
 
-    const size_t n = state.numTriangles;
-    const size_t tn = timesteps * n;
+    std::vector<FlatNode> nodes;
+    std::vector<int> triIndices;
+    nodes.reserve(2 * n + 64);
+    flattenOctree(state.octree, nodes, triIndices);
+    gpu.numNodes = static_cast<int>(nodes.size());
 
-    CUDA_CHECK(cudaMalloc(&state.d_triangles, n * sizeof(Triangle)));
-    CUDA_CHECK(cudaMalloc(&state.d_nodes, flatNodes.size() * sizeof(GpuOctNode)));
-    CUDA_CHECK(cudaMalloc(&state.d_leafTriangles, flatLeafTriangles.size() * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&state.d_areas, n * sizeof(val_t)));
-    CUDA_CHECK(cudaMalloc(&state.d_rho, n * sizeof(val_t)));
-    CUDA_CHECK(cudaMalloc(&state.d_kij, n * n * sizeof(val_t)));
-    CUDA_CHECK(cudaMalloc(&state.d_tau, n * n * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&state.d_radE, tn * sizeof(val_t)));
-    CUDA_CHECK(cudaMalloc(&state.d_radB, tn * sizeof(val_t)));
-    CUDA_CHECK(cudaMalloc(&state.d_distances, n * sizeof(val_t)));
-    CUDA_CHECK(cudaMalloc(&state.d_random,
-                          KIJ_CHUNK_PAIRS * static_cast<size_t>(NUM_RAYS * 4) * sizeof(val_t)));
-    CUDA_CHECK(cudaMalloc(&state.d_offsets, KIJ_CHUNK_PAIRS * sizeof(int)));
+    checkCuda(cudaMalloc(&gpu.d_triangles, n * sizeof(Triangle)), "cudaMalloc triangles");
+    checkCuda(cudaMalloc(&gpu.d_nodes, nodes.size() * sizeof(FlatNode)), "cudaMalloc nodes");
+    checkCuda(cudaMalloc(&gpu.d_triIndices, triIndices.size() * sizeof(int)), "cudaMalloc triIndices");
+    checkCuda(cudaMalloc(&gpu.d_areas, n * sizeof(val_t)), "cudaMalloc areas");
+    checkCuda(cudaMalloc(&gpu.d_rho, n * sizeof(val_t)), "cudaMalloc rho");
+    checkCuda(cudaMalloc(&gpu.d_kij, nn * sizeof(val_t)), "cudaMalloc kij");
+    checkCuda(cudaMalloc(&gpu.d_tau, nn * sizeof(int)), "cudaMalloc tau");
+    checkCuda(cudaMalloc(&gpu.d_radE, t * n * sizeof(val_t)), "cudaMalloc radE");
+    checkCuda(cudaMalloc(&gpu.d_radB, t * n * sizeof(val_t)), "cudaMalloc radB");
+    checkCuda(cudaMalloc(&gpu.d_distances, n * sizeof(val_t)), "cudaMalloc distances");
 
-    CUDA_CHECK(cudaMemcpy(state.d_triangles, state.triangles.data(),
-                          n * sizeof(Triangle), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(state.d_nodes, flatNodes.data(),
-                          flatNodes.size() * sizeof(GpuOctNode), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(state.d_leafTriangles, flatLeafTriangles.data(),
-                          flatLeafTriangles.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(state.d_areas, state.areas.data(),
-                          n * sizeof(val_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(state.d_rho, state.rho.data(),
-                          n * sizeof(val_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(state.d_radE, state.radE.data(),
-                          tn * sizeof(val_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(state.d_kij, 0, n * n * sizeof(val_t)));
-    CUDA_CHECK(cudaMemset(state.d_radB, 0, tn * sizeof(val_t)));
+    checkCuda(cudaMemcpy(gpu.d_triangles, state.triangles.data(),
+                         n * sizeof(Triangle), cudaMemcpyHostToDevice), "copy triangles");
+    checkCuda(cudaMemcpy(gpu.d_nodes, nodes.data(),
+                         nodes.size() * sizeof(FlatNode), cudaMemcpyHostToDevice), "copy nodes");
+    checkCuda(cudaMemcpy(gpu.d_triIndices, triIndices.data(),
+                         triIndices.size() * sizeof(int), cudaMemcpyHostToDevice), "copy triIndices");
+    checkCuda(cudaMemcpy(gpu.d_areas, state.areas.data(),
+                         n * sizeof(val_t), cudaMemcpyHostToDevice), "copy areas");
+    checkCuda(cudaMemcpy(gpu.d_rho, state.rho.data(),
+                         n * sizeof(val_t), cudaMemcpyHostToDevice), "copy rho");
+    checkCuda(cudaMemcpy(gpu.d_radE, state.radE.data(),
+                         t * n * sizeof(val_t), cudaMemcpyHostToDevice), "copy radE");
 
-    // Load all kernel modules before the timed compute phases begin.
-    computeTauKernel<<<1, 1>>>(0, state.d_triangles, state.d_tau);
-    computeKijChunkKernel<<<1, 1>>>(0, 0, state.d_random, state.d_offsets,
-                                    state.d_triangles, n, state.d_nodes,
-                                    state.d_leafTriangles, state.d_kij);
-    simulateStepKernel<<<1, 1>>>(0, 0, state.d_kij, state.d_tau, state.d_areas,
-                                 state.d_rho, state.d_radE, state.d_radB);
-    computeDistancesKernel<<<1, 1>>>(0, timesteps, state.sourceIndex,
-                                     state.d_radB, state.d_distances);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    checkCuda(cudaMemset(gpu.d_kij, 0, nn * sizeof(val_t)), "memset kij");
+    checkCuda(cudaMemset(gpu.d_tau, 0, nn * sizeof(int)), "memset tau");
+    checkCuda(cudaMemset(gpu.d_radB, 0, t * n * sizeof(val_t)), "memset radB");
+}
+
+void releaseGpuState(GpuState& gpu) {
+    cudaFree(gpu.d_triangles);
+    cudaFree(gpu.d_nodes);
+    cudaFree(gpu.d_triIndices);
+    cudaFree(gpu.d_areas);
+    cudaFree(gpu.d_rho);
+    cudaFree(gpu.d_kij);
+    cudaFree(gpu.d_tau);
+    cudaFree(gpu.d_radE);
+    cudaFree(gpu.d_radB);
+    cudaFree(gpu.d_distances);
+    cudaFree(gpu.d_rngValues);
+    cudaFree(gpu.d_pairRngOffset);
 }
 
 // ============================================================================
 // Precomputation Phase
 // ============================================================================
 
-void computeFormFactors(SimulationState& state) {
-    printf("Computing form factors (Kij)...\n");
-
-    const size_t n = state.numTriangles;
-    if (n < 2) return;
-
-    const size_t totalPairs = n * (n - 1);
-    const size_t rowSize = n - 1;
-
-    // The reference implementation uses one mt19937 stream seeded with 42 and
-    // consumes 64 values for every non-culled triangle pair, in row-major
-    // order.  Reproduce that stream exactly on the host, then stream the
-    // samples to the device in chunks.
-    RandomGenerator rng(42);
-
-    const size_t randomCapacity = KIJ_CHUNK_PAIRS * static_cast<size_t>(NUM_RAYS * 4);
-    std::unique_ptr<val_t[]> h_random(new val_t[randomCapacity]);
-    std::unique_ptr<int[]> h_offsets(new int[KIJ_CHUNK_PAIRS]);
-
-    const int threads = 256;
-    size_t lastReportedTriangle = 0;
-
-    for (size_t pairStart = 0; pairStart < totalPairs; pairStart += KIJ_CHUNK_PAIRS) {
-        const size_t remaining = totalPairs - pairStart;
-        const int pairCount = static_cast<int>(
-            std::min<size_t>(KIJ_CHUNK_PAIRS, remaining));
-
-        size_t randomCount = 0;
-        for (int local = 0; local < pairCount; ++local) {
-            const size_t pair = pairStart + static_cast<size_t>(local);
-            const size_t i = pair / rowSize;
-            const size_t rem = pair - i * rowSize;
-            const size_t j = (rem < i) ? rem : rem + 1;
-
-            if (state.triangles[i].normal().dot(state.triangles[j].normal()) > 0.99f) {
-                h_offsets[local] = -1;
-                continue;
-            }
-
-            h_offsets[local] = static_cast<int>(randomCount);
-            for (int s = 0; s < NUM_RAYS * 4; ++s) {
-                h_random[randomCount++] = rng.rand();
-            }
-        }
-
-        if (randomCount > 0) {
-            CUDA_CHECK(cudaMemcpy(state.d_random, h_random.get(),
-                                  randomCount * sizeof(val_t),
-                                  cudaMemcpyHostToDevice));
-        }
-        CUDA_CHECK(cudaMemcpy(state.d_offsets, h_offsets.get(),
-                              pairCount * sizeof(int), cudaMemcpyHostToDevice));
-
-        const int blocks = (pairCount + threads - 1) / threads;
-        computeKijChunkKernel<<<blocks, threads>>>(
-            pairStart, pairCount, state.d_random, state.d_offsets,
-            state.d_triangles, n, state.d_nodes, state.d_leafTriangles,
-            state.d_kij);
-        CUDA_CHECK(cudaGetLastError());
-
-        const size_t lastPair = pairStart + static_cast<size_t>(pairCount);
-        const size_t completedTriangle = std::min(lastPair / rowSize, n);
-        while (lastReportedTriangle + 100 <= completedTriangle) {
-            lastReportedTriangle += 100;
-            printf("  Progress: %zu/%zu triangles\n", lastReportedTriangle, n);
-        }
-        if (lastPair == totalPairs && lastReportedTriangle < n) {
-            lastReportedTriangle = n;
-            printf("  Progress: %zu/%zu triangles\n", n, n);
-        }
-    }
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-void computeTimeDelays(SimulationState& state) {
+void computeTimeDelays(SimulationState& state, GpuState& gpu) {
     printf("Computing time delays (Tau)...\n");
 
-    const size_t n = state.numTriangles;
-    if (n == 0) return;
+    uint32_t n = static_cast<uint32_t>(state.numTriangles);
+    size_t total = static_cast<size_t>(n) * n;
+    int threads = 256;
+    unsigned int blocks = static_cast<unsigned int>((total + threads - 1) / threads);
 
-    const dim3 block(16, 16);
-    const dim3 grid(static_cast<unsigned>((n + block.x - 1) / block.x),
-                    static_cast<unsigned>((n + block.y - 1) / block.y));
-    computeTauKernel<<<grid, block>>>(n, state.d_triangles, state.d_tau);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    timeDelaysKernel<<<blocks, threads>>>(gpu.d_triangles, gpu.d_tau, n);
+    checkCuda(cudaGetLastError(), "timeDelaysKernel");
+    checkCuda(cudaDeviceSynchronize(), "time delays sync");
+}
+
+void computeFormFactors(SimulationState& state, GpuState& gpu) {
+    printf("Computing form factors (Kij)...\n");
+
+    const uint32_t n = static_cast<uint32_t>(state.numTriangles);
+
+    // Number of random draws consumed by each row in the original loop order.
+    std::vector<size_t> rowDraws(n, 0);
+    for (uint32_t i = 0; i < n; ++i) {
+        const Vec3 ni = state.triangles[i].normal();
+        size_t pairCount = 0;
+        for (uint32_t j = 0; j < n; ++j) {
+            if (i == j) continue;
+            if (ni.dot(state.triangles[j].normal()) > 0.99f) continue;
+            ++pairCount;
+        }
+        rowDraws[i] = pairCount * (2 * NUM_RAYS);
+    }
+
+    std::vector<uint64_t> rowBase(n + 1, 0);
+    for (uint32_t i = 0; i < n; ++i) {
+        rowBase[i + 1] = rowBase[i] + static_cast<uint64_t>(rowDraws[i]);
+    }
+    const uint64_t totalDraws = rowBase[n];
+
+    // Split the global MT19937 sequence into many small segments.  A snapshot
+    // of the generator is taken at the start of each segment, and each segment
+    // is then generated independently by one GPU thread.  This preserves the
+    // exact sequential random sequence while exposing a large amount of
+    // parallelism.
+    const uint64_t targetSegments = 32768;
+    const uint64_t maxStateBytes = 256ull * 1024ull * 1024ull;
+    const uint64_t maxSegments = maxStateBytes / sizeof(MTState);
+    uint64_t segmentLength = totalDraws / targetSegments;
+    if (segmentLength < 1024) segmentLength = 1024;
+    uint64_t minSegmentLength =
+        (maxSegments == 0) ? segmentLength : (totalDraws + maxSegments - 1) / maxSegments;
+    if (segmentLength < minSegmentLength) segmentLength = minSegmentLength;
+    if (segmentLength == 0) segmentLength = 1;
+
+    uint64_t numSegments = (totalDraws + segmentLength - 1) / segmentLength;
+    if (numSegments == 0) numSegments = 1;
+
+    MT19937 rng(42);
+    std::vector<MTState> segmentStates(numSegments);
+    for (uint64_t s = 0; s < numSegments; ++s) {
+        segmentStates[s] = rng.state();
+        rng.discard(segmentLength);
+    }
+
+    MTState* d_segmentStates = nullptr;
+    checkCuda(cudaMalloc(&d_segmentStates, numSegments * sizeof(MTState)),
+              "cudaMalloc segmentStates");
+    checkCuda(cudaMemcpy(d_segmentStates, segmentStates.data(),
+                         numSegments * sizeof(MTState), cudaMemcpyHostToDevice),
+              "copy segmentStates");
+
+    const size_t MAX_RNG_FLOATS = 256u * 1024u * 1024u;
+    const size_t MAX_PAIR_ENTRIES = 32u * 1024u * 1024u;
+
+    size_t rowStart = 0;
+    std::vector<uint32_t> hostPairOffsets;
+
+    while (rowStart < static_cast<size_t>(n)) {
+        size_t rows = 0;
+        size_t rngTotal = 0;
+        size_t mapTotal = 0;
+
+        while (rowStart + rows < static_cast<size_t>(n)) {
+            size_t addRng = rowDraws[rowStart + rows];
+            size_t addMap = n;
+            if (rows > 0 &&
+                (rngTotal + addRng > MAX_RNG_FLOATS ||
+                 mapTotal + addMap > MAX_PAIR_ENTRIES)) {
+                break;
+            }
+            rngTotal += addRng;
+            mapTotal += addMap;
+            ++rows;
+        }
+
+        hostPairOffsets.assign(mapTotal, UINT32_MAX);
+
+        size_t pos = 0;
+        for (size_t r = 0; r < rows; ++r) {
+            uint32_t i = static_cast<uint32_t>(rowStart + r);
+            const Vec3 ni = state.triangles[i].normal();
+            for (uint32_t j = 0; j < n; ++j) {
+                if (i == j) continue;
+                if (ni.dot(state.triangles[j].normal()) > 0.99f) continue;
+
+                hostPairOffsets[r * n + j] = static_cast<uint32_t>(pos);
+                pos += 2 * NUM_RAYS;
+            }
+        }
+
+        size_t allocRng = rngTotal > 0 ? rngTotal : 1;
+        if (allocRng > gpu.rngCapacity) {
+            cudaFree(gpu.d_rngValues);
+            checkCuda(cudaMalloc(&gpu.d_rngValues, allocRng * sizeof(val_t)),
+                      "cudaMalloc rngValues");
+            gpu.rngCapacity = allocRng;
+        }
+        if (mapTotal > gpu.pairCapacity) {
+            cudaFree(gpu.d_pairRngOffset);
+            checkCuda(cudaMalloc(&gpu.d_pairRngOffset, mapTotal * sizeof(uint32_t)),
+                      "cudaMalloc pairRngOffset");
+            gpu.pairCapacity = mapTotal;
+        }
+
+        checkCuda(cudaMemcpy(gpu.d_pairRngOffset, hostPairOffsets.data(),
+                             mapTotal * sizeof(uint32_t), cudaMemcpyHostToDevice),
+                  "copy pairRngOffset");
+
+        uint64_t batchStart = rowBase[rowStart];
+        uint64_t batchEnd = batchStart + static_cast<uint64_t>(rngTotal);
+
+        if (batchEnd > batchStart) {
+            uint64_t firstSegment = batchStart / segmentLength;
+            uint64_t lastSegment = (batchEnd + segmentLength - 1) / segmentLength;
+            uint64_t segCount = lastSegment - firstSegment;
+
+            int genThreads = 128;
+            uint64_t genBlocks64 = (segCount + genThreads - 1) / genThreads;
+            unsigned int genBlocks = static_cast<unsigned int>(genBlocks64);
+
+            generateRngKernel<<<genBlocks, genThreads>>>(
+                d_segmentStates, firstSegment, segCount, segmentLength,
+                batchStart, batchEnd, gpu.d_rngValues);
+            checkCuda(cudaGetLastError(), "generateRngKernel");
+        }
+
+        uint32_t totalEntries = static_cast<uint32_t>(mapTotal);
+        int threads = 256;
+        unsigned int blocks = (totalEntries + threads - 1) / threads;
+
+        formFactorsKernel<<<blocks, threads>>>(
+            gpu.d_triangles, gpu.d_nodes, gpu.d_triIndices,
+            gpu.d_rngValues, gpu.d_pairRngOffset, gpu.d_kij,
+            n, static_cast<uint32_t>(rowStart), static_cast<uint32_t>(rows));
+        checkCuda(cudaGetLastError(), "formFactorsKernel");
+
+        for (size_t r = 0; r < rows; ++r) {
+            size_t done = rowStart + r + 1;
+            if (done % 100 == 0 || done == state.numTriangles) {
+                printf("  Progress: %zu/%zu triangles\n", done, state.numTriangles);
+            }
+        }
+
+        rowStart += rows;
+    }
+
+    checkCuda(cudaDeviceSynchronize(), "form factors sync");
+    cudaFree(d_segmentStates);
 }
 
 // ============================================================================
 // Simulation Phase (Wave Propagation)
 // ============================================================================
 
-__global__ void simulateStepKernel(int t,
-                                   size_t numTriangles,
-                                   const val_t* __restrict__ kij,
-                                   const int* __restrict__ tau,
-                                   const val_t* __restrict__ areas,
-                                   const val_t* __restrict__ rho,
-                                   const val_t* __restrict__ radE,
-                                   val_t* __restrict__ radB) {
-    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= numTriangles) return;
-
-    const size_t rowOffset = i * numTriangles;
-    val_t sumB = ZERO;
-
-    for (size_t j = 0; j < numTriangles; ++j) {
-        if (i == j) continue;
-
-        const int tauij = tau[rowOffset + j];
-
-        // Skip if wave hasn't yet propagated from j to i
-        if (t < tauij) continue;
-
-        const val_t kijVal = kij[rowOffset + j];
-        if (kijVal <= ZERO) continue;
-
-        // Get radiosity from source triangle at time when emission occurred
-        const size_t srcTime = static_cast<size_t>(t) - static_cast<size_t>(tauij);
-        const val_t radJ = radB[srcTime * numTriangles + j];
-        if (radJ <= ZERO) continue;
-
-        // Accumulate contribution: form factor * area * source radiosity
-        sumB += fminf(kijVal * areas[j], ONE) * radJ;
-    }
-
-    // Update radiosity: reflection + emission
-    const size_t offset = static_cast<size_t>(t) * numTriangles + i;
-    radB[offset] = rho[i] * sumB + radE[offset];
-}
-
-void runSimulation(SimulationState& state) {
+void runSimulation(SimulationState& state, GpuState& gpu) {
     printf("Running wave propagation simulation...\n");
 
-    const size_t n = state.numTriangles;
-    const size_t t = state.numTimesteps;
-    const int threads = 256;
-    const int blocks = static_cast<int>((n + threads - 1) / threads);
+    uint32_t n = static_cast<uint32_t>(state.numTriangles);
+    int threads = 256;
+    unsigned int blocks = (n + threads - 1) / threads;
 
-    for (size_t step = 0; step < t; ++step) {
-        simulateStepKernel<<<blocks, threads>>>(
-            static_cast<int>(step), n, state.d_kij, state.d_tau, state.d_areas,
-            state.d_rho, state.d_radE, state.d_radB);
-        CUDA_CHECK(cudaGetLastError());
+    for (size_t t = 0; t < state.numTimesteps; ++t) {
+        simulationKernel<<<blocks, threads>>>(
+            gpu.d_radE, gpu.d_radB, gpu.d_kij, gpu.d_tau,
+            gpu.d_rho, gpu.d_areas, n, static_cast<int>(t));
+        checkCuda(cudaGetLastError(), "simulationKernel");
 
-        if ((step + 1) % 10 == 0 || step + 1 == t) {
-            printf("  Timestep %zu/%zu\n", step + 1, t);
+        if ((t + 1) % 10 == 0 || t + 1 == state.numTimesteps) {
+            printf("  Timestep %zu/%zu\n", t + 1, state.numTimesteps);
         }
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    checkCuda(cudaDeviceSynchronize(), "simulation sync");
 }
 
 // ============================================================================
 // Distance Computation (Cross-Correlation)
 // ============================================================================
 
-__global__ void computeDistancesKernel(size_t numTriangles,
-                                       size_t numTimesteps,
-                                       size_t sourceIndex,
-                                       const val_t* __restrict__ radB,
-                                       val_t* __restrict__ distances) {
-    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= numTriangles) return;
-
-    val_t maxCorr = ZERO;
-    int bestT = 0;
-
-    // Discrete cross-correlation to find time delay
-    for (size_t t = 0; t < numTimesteps; ++t) {
-        val_t sum = ZERO;
-
-        for (size_t tt = t; tt < numTimesteps; ++tt) {
-            const val_t pB = radB[tt * numTriangles + i];
-            const val_t pS = radB[(tt - t) * numTriangles + sourceIndex];
-            sum += pS * pB;
-        }
-
-        if (sum > maxCorr) {
-            maxCorr = sum;
-            bestT = static_cast<int>(t);
-        }
-    }
-
-    distances[i] = WAVE_SPEED * static_cast<val_t>(bestT);
-}
-
-void computeDistances(SimulationState& state) {
+void computeDistances(SimulationState& state, GpuState& gpu) {
     printf("Computing distances via cross-correlation...\n");
 
-    const size_t n = state.numTriangles;
-    const int threads = 256;
-    const int blocks = static_cast<int>((n + threads - 1) / threads);
+    uint32_t n = static_cast<uint32_t>(state.numTriangles);
+    int threads = 256;
+    unsigned int blocks = (n + threads - 1) / threads;
 
-    computeDistancesKernel<<<blocks, threads>>>(
-        n, state.numTimesteps, state.sourceIndex, state.d_radB, state.d_distances);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    distanceKernel<<<blocks, threads>>>(
+        gpu.d_radB, n, static_cast<uint32_t>(state.numTimesteps),
+        static_cast<uint32_t>(state.sourceIndex), gpu.d_distances);
+    checkCuda(cudaGetLastError(), "distanceKernel");
+    checkCuda(cudaDeviceSynchronize(), "distance sync");
 
-    CUDA_CHECK(cudaMemcpy(state.distances.data(), state.d_distances,
-                          n * sizeof(val_t), cudaMemcpyDeviceToHost));
+    checkCuda(cudaMemcpy(state.distances.data(), gpu.d_distances,
+                         n * sizeof(val_t), cudaMemcpyDeviceToHost),
+              "copy distances");
+}
+
+unsigned long long countNonZeroKij(const GpuState& gpu, size_t total) {
+    unsigned long long* d_counter = nullptr;
+    checkCuda(cudaMalloc(&d_counter, sizeof(unsigned long long)),
+              "cudaMalloc nonZero counter");
+    checkCuda(cudaMemset(d_counter, 0, sizeof(unsigned long long)),
+              "memset nonZero counter");
+
+    int threads = 256;
+    size_t needed = (total + threads - 1) / threads;
+    unsigned int blocks = static_cast<unsigned int>(std::min<size_t>(needed, 65535));
+
+    countNonZeroKernel<<<blocks, threads>>>(gpu.d_kij, total, d_counter);
+    checkCuda(cudaGetLastError(), "countNonZeroKernel");
+    checkCuda(cudaDeviceSynchronize(), "count non-zero sync");
+
+    unsigned long long result = 0;
+    checkCuda(cudaMemcpy(&result, d_counter, sizeof(unsigned long long),
+                         cudaMemcpyDeviceToHost), "copy nonZero counter");
+    cudaFree(d_counter);
+    return result;
 }
 
 // ============================================================================
 // Validation
 // ============================================================================
 
-bool validateResults(const SimulationState& state) {
+bool validateResults(const SimulationState& state, unsigned long long nonZeroKij) {
     printf("\nValidation:\n");
 
     // Check that distances are non-negative
@@ -1099,13 +1436,10 @@ bool validateResults(const SimulationState& state) {
     }
 
     // Check Kij matrix (should have some non-zero entries)
-    int nonZeroKij = 0;
-    for (size_t i = 0; i < state.numTriangles * state.numTriangles; ++i) {
-        if (state.kij[i] > EPSILON) nonZeroKij++;
-    }
-    printf("  Non-zero form factors: %d/%zu (%.2f%%)\n",
+    printf("  Non-zero form factors: %llu/%zu (%.2f%%)\n",
            nonZeroKij, state.numTriangles * state.numTriangles,
-           100.0f * nonZeroKij / static_cast<val_t>(state.numTriangles * state.numTriangles));
+           100.0f * static_cast<double>(nonZeroKij) /
+               static_cast<double>(state.numTriangles * state.numTriangles));
 
     if (nonZeroKij == 0) {
         printf("  ERROR: All form factors are zero - visibility computation failed\n");
@@ -1215,13 +1549,16 @@ int main(int argc, char** argv) {
     initializeSimulation(state, subdivisions, static_cast<size_t>(timesteps),
                          static_cast<size_t>(sourceIdx), reflectivity);
 
+    GpuState gpu;
+    uploadStaticState(state, gpu);
+
     printf("\n");
 
     // Precomputation
     auto startPre = std::chrono::high_resolution_clock::now();
 
-    computeTimeDelays(state);
-    computeFormFactors(state);
+    computeTimeDelays(state, gpu);
+    computeFormFactors(state, gpu);
 
     auto endPre = std::chrono::high_resolution_clock::now();
     auto preDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count();
@@ -1232,7 +1569,7 @@ int main(int argc, char** argv) {
     // Simulation
     auto startSim = std::chrono::high_resolution_clock::now();
 
-    runSimulation(state);
+    runSimulation(state, gpu);
 
     auto endSim = std::chrono::high_resolution_clock::now();
     auto simDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count();
@@ -1243,7 +1580,7 @@ int main(int argc, char** argv) {
     // Distance computation
     auto startDist = std::chrono::high_resolution_clock::now();
 
-    computeDistances(state);
+    computeDistances(state, gpu);
 
     auto endDist = std::chrono::high_resolution_clock::now();
     auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
@@ -1281,7 +1618,7 @@ int main(int argc, char** argv) {
     uint64_t hash = computeHash(state);
     printf("  Result hash: %016lX\n", hash);
     printf("\n");
-
+    
     // Print results for external validation
     if (printResults) {
         // Convert distances to double for output
@@ -1289,21 +1626,18 @@ int main(int argc, char** argv) {
         print_results(distData, "Distances");
     }
 
-    // Copy the prerequisite arrays back to the host before validating.
+    // Validation
     if (validate) {
-        if (n > 0) {
-            CUDA_CHECK(cudaMemcpy(state.kij.data(), state.d_kij,
-                                  n * n * sizeof(val_t), cudaMemcpyDeviceToHost));
-        }
-        const size_t tn = t * n;
-        if (tn > 0) {
-            CUDA_CHECK(cudaMemcpy(state.radB.data(), state.d_radB,
-                                  tn * sizeof(val_t), cudaMemcpyDeviceToHost));
-        }
-        if (!validateResults(state)) {
+        checkCuda(cudaMemcpy(state.radB.data(), gpu.d_radB,
+                             t * n * sizeof(val_t), cudaMemcpyDeviceToHost),
+                  "copy radB");
+        unsigned long long nonZeroKij = countNonZeroKij(gpu, n * n);
+        if (!validateResults(state, nonZeroKij)) {
+            releaseGpuState(gpu);
             return 1;
         }
     }
 
+    releaseGpuState(gpu);
     return 0;
 }

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,182 +13,191 @@
 
 #include "../common/results_output.hpp"
 
-// -----------------------------------------------------------------------------
-// CUDA error checking
-// -----------------------------------------------------------------------------
-#define CUDA_CHECK(call)                                                                       \
-    do {                                                                                       \
-        cudaError_t err__ = (call);                                                            \
-        if (err__ != cudaSuccess) {                                                            \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,                   \
-                    cudaGetErrorString(err__));                                                \
-            MPI_Abort(MPI_COMM_WORLD, 1);                                                      \
-        }                                                                                      \
+#define CUDA_CHECK(call)                                                                 \
+    do {                                                                                 \
+        cudaError_t err_ = (call);                                                       \
+        if (err_ != cudaSuccess) {                                                       \
+            fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(err_),        \
+                    __FILE__, __LINE__);                                                 \
+            MPI_Abort(MPI_COMM_WORLD, 1);                                                \
+        }                                                                                \
     } while (0)
 
-// 3D index calculation for the local, z-padded grid
-inline constexpr size_t idx3(const size_t x, const size_t y, const size_t lz,
-                             const size_t nx, const size_t ny) noexcept {
-    return lz * (nx * ny) + y * nx + x;
-}
-
-// -----------------------------------------------------------------------------
-// CUDA kernels.  The z dimension of each rank is padded with one ghost layer on
-// each side, so the z stencil never needs a branch.  The global z boundaries are
-// handled by replicating the boundary plane into the ghost layer, which exactly
-// reproduces the clamped (zero-flux) boundary condition of the original code.
-// -----------------------------------------------------------------------------
-
-__global__ void computeChemicalPotentialKernel(const double* __restrict__ c,
-                                               double* __restrict__ mu,
-                                               const int nx, const int ny, const int nzLocal,
-                                               const size_t plane,
-                                               const double invDx2, const double invDy2,
-                                               const double invDz2, const double gamma,
-                                               const double e_AA, const double e_BB,
-                                               const double e_AB) {
+__global__ void computeChemicalPotentialKernel(
+    const double* __restrict__ c, double* __restrict__ mu,
+    const int nx, const int ny, const int nzLocal, const int z0, const int nz,
+    const double dx, const double dy, const double dz,
+    const double gamma, const double e_AA, const double e_BB, const double e_AB) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    const int lz = blockIdx.z * blockDim.z + threadIdx.z + 1; // skip lower ghost
+    const int lzOwned = blockIdx.z * blockDim.z + threadIdx.z;
+    if (x >= nx || y >= ny || lzOwned >= nzLocal) return;
 
-    if (x >= nx || y >= ny || lz > nzLocal) return;
+    const int lz = lzOwned + 1;
+    const int gz = z0 + lzOwned;
+    const size_t layer = static_cast<size_t>(nx) * static_cast<size_t>(ny);
+    const size_t idx = static_cast<size_t>(lz) * layer +
+                       static_cast<size_t>(y) * static_cast<size_t>(nx) +
+                       static_cast<size_t>(x);
 
-    const int xm = (x > 0) ? x - 1 : 0;
     const int xp = (x < nx - 1) ? x + 1 : x;
-    const int ym = (y > 0) ? y - 1 : 0;
+    const int xn = (x > 0) ? x - 1 : 0;
     const int yp = (y < ny - 1) ? y + 1 : y;
+    const int yn = (y > 0) ? y - 1 : 0;
+    const int zp = (gz < nz - 1) ? lz + 1 : lz;
+    const int zn = (gz > 0) ? lz - 1 : lz;
 
-    const size_t row = static_cast<size_t>(lz) * plane + static_cast<size_t>(y) * nx;
-    const size_t rowYp = static_cast<size_t>(lz) * plane + static_cast<size_t>(yp) * nx;
-    const size_t rowYm = static_cast<size_t>(lz) * plane + static_cast<size_t>(ym) * nx;
-    const size_t rowZp = static_cast<size_t>(lz + 1) * plane + static_cast<size_t>(y) * nx;
-    const size_t rowZm = static_cast<size_t>(lz - 1) * plane + static_cast<size_t>(y) * nx;
+    const size_t bx = static_cast<size_t>(x);
+    const size_t bxp = static_cast<size_t>(xp);
+    const size_t bxn = static_cast<size_t>(xn);
+    const size_t byx = static_cast<size_t>(y) * static_cast<size_t>(nx);
+    const size_t bypx = static_cast<size_t>(yp) * static_cast<size_t>(nx);
+    const size_t bynx = static_cast<size_t>(yn) * static_cast<size_t>(nx);
+    const size_t base = static_cast<size_t>(lz) * layer;
 
-    const double cv = c[row + x];
-    const double cxx = (c[row + xp] + c[row + xm] - 2.0 * cv) * invDx2;
-    const double cyy = (c[rowYp + x] + c[rowYm + x] - 2.0 * cv) * invDy2;
-    const double czz = (c[rowZp + x] + c[rowZm + x] - 2.0 * cv) * invDz2;
-    const double lap = cxx + cyy + czz;
+    const double cv = c[idx];
+    const double cxx = (c[base + byx + bxp] + c[base + byx + bxn] - 2.0 * cv) / (dx * dx);
+    const double cyy = (c[base + bypx + bx] + c[base + bynx + bx] - 2.0 * cv) / (dy * dy);
+    const double czz = (c[static_cast<size_t>(zp) * layer + byx + bx] +
+                        c[static_cast<size_t>(zn) * layer + byx + bx] - 2.0 * cv) /
+                       (dz * dz);
 
-    mu[row + x] = 4.5 * ((cv + 1.0) * e_AA + (cv - 1.0) * e_BB - 2.0 * cv * e_AB)
-                + 3.0 * cv + cv * cv * cv - gamma * lap;
+    mu[idx] = 4.5 * ((cv + 1.0) * e_AA + (cv - 1.0) * e_BB - 2.0 * cv * e_AB) +
+              3.0 * cv + cv * cv * cv - gamma * (cxx + cyy + czz);
 }
 
-__global__ void cahnHilliardUpdateKernel(double* __restrict__ cnew,
-                                         const double* __restrict__ cold,
-                                         const double* __restrict__ mu,
-                                         const int nx, const int ny, const int nzLocal,
-                                         const size_t plane,
-                                         const double invDx2, const double invDy2,
-                                         const double invDz2, const double dtD) {
+__global__ void cahnHilliardUpdateKernel(
+    double* __restrict__ cnew, const double* __restrict__ cold,
+    const double* __restrict__ mu,
+    const int nx, const int ny, const int nzLocal, const int z0, const int nz,
+    const double D, const double dt,
+    const double dx, const double dy, const double dz) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    const int lz = blockIdx.z * blockDim.z + threadIdx.z + 1; // skip lower ghost
+    const int lzOwned = blockIdx.z * blockDim.z + threadIdx.z;
+    if (x >= nx || y >= ny || lzOwned >= nzLocal) return;
 
-    if (x >= nx || y >= ny || lz > nzLocal) return;
+    const int lz = lzOwned + 1;
+    const int gz = z0 + lzOwned;
+    const size_t layer = static_cast<size_t>(nx) * static_cast<size_t>(ny);
+    const size_t idx = static_cast<size_t>(lz) * layer +
+                       static_cast<size_t>(y) * static_cast<size_t>(nx) +
+                       static_cast<size_t>(x);
 
-    const int xm = (x > 0) ? x - 1 : 0;
     const int xp = (x < nx - 1) ? x + 1 : x;
-    const int ym = (y > 0) ? y - 1 : 0;
+    const int xn = (x > 0) ? x - 1 : 0;
     const int yp = (y < ny - 1) ? y + 1 : y;
+    const int yn = (y > 0) ? y - 1 : 0;
+    const int zp = (gz < nz - 1) ? lz + 1 : lz;
+    const int zn = (gz > 0) ? lz - 1 : lz;
 
-    const size_t row = static_cast<size_t>(lz) * plane + static_cast<size_t>(y) * nx;
-    const size_t rowYp = static_cast<size_t>(lz) * plane + static_cast<size_t>(yp) * nx;
-    const size_t rowYm = static_cast<size_t>(lz) * plane + static_cast<size_t>(ym) * nx;
-    const size_t rowZp = static_cast<size_t>(lz + 1) * plane + static_cast<size_t>(y) * nx;
-    const size_t rowZm = static_cast<size_t>(lz - 1) * plane + static_cast<size_t>(y) * nx;
+    const size_t bx = static_cast<size_t>(x);
+    const size_t bxp = static_cast<size_t>(xp);
+    const size_t bxn = static_cast<size_t>(xn);
+    const size_t byx = static_cast<size_t>(y) * static_cast<size_t>(nx);
+    const size_t bypx = static_cast<size_t>(yp) * static_cast<size_t>(nx);
+    const size_t bynx = static_cast<size_t>(yn) * static_cast<size_t>(nx);
+    const size_t base = static_cast<size_t>(lz) * layer;
 
-    const double center = mu[row + x];
-    const double muxx = (mu[row + xp] + mu[row + xm] - 2.0 * center) * invDx2;
-    const double muyy = (mu[rowYp + x] + mu[rowYm + x] - 2.0 * center) * invDy2;
-    const double muzz = (mu[rowZp + x] + mu[rowZm + x] - 2.0 * center) * invDz2;
+    const double muv = mu[idx];
+    const double muxx = (mu[base + byx + bxp] + mu[base + byx + bxn] - 2.0 * muv) / (dx * dx);
+    const double muyy = (mu[base + bypx + bx] + mu[base + bynx + bx] - 2.0 * muv) / (dy * dy);
+    const double muzz = (mu[static_cast<size_t>(zp) * layer + byx + bx] +
+                         mu[static_cast<size_t>(zn) * layer + byx + bx] - 2.0 * muv) /
+                        (dz * dz);
 
-    cnew[row + x] = cold[row + x] + dtD * (muxx + muyy + muzz);
+    cnew[idx] = cold[idx] + dt * D * (muxx + muyy + muzz);
 }
 
-// -----------------------------------------------------------------------------
-// Domain decomposition helpers
-// -----------------------------------------------------------------------------
-
-static void partitionZ(const size_t nz, const int nranks, const int rank,
-                       size_t& z0, size_t& z1) {
-    const size_t base = nz / static_cast<size_t>(nranks);
-    const size_t rem = nz % static_cast<size_t>(nranks);
-    z0 = static_cast<size_t>(rank) * base + std::min<size_t>(static_cast<size_t>(rank), rem);
-    z1 = z0 + base + (static_cast<size_t>(rank) < rem ? 1 : 0);
-}
-
-// Exchange one ghost layer in z.  Host staging is used so that the code works
-// with both CUDA-aware and non-CUDA-aware MPI implementations.
-static void exchangeHalos(double* d_field, const int nx, const int ny,
-                          const size_t nzLocal, const int rank, const int nranks,
-                          MPI_Comm comm, double* hbuf) {
-    const size_t plane = static_cast<size_t>(nx) * static_cast<size_t>(ny);
-    const int count = static_cast<int>(plane);
-    double* sendLo = hbuf;
-    double* sendHi = hbuf + plane;
-    double* recvLo = hbuf + 2 * plane;
-    double* recvHi = hbuf + 3 * plane;
-    const int lo = rank - 1;
-    const int hi = rank + 1;
-
-    if (rank > 0) {
-        CUDA_CHECK(cudaMemcpy(sendLo, d_field + plane, plane * sizeof(double),
-                              cudaMemcpyDeviceToHost));
-    }
-    if (rank < nranks - 1) {
-        CUDA_CHECK(cudaMemcpy(sendHi, d_field + nzLocal * plane, plane * sizeof(double),
-                              cudaMemcpyDeviceToHost));
-    }
-
-    if (rank > 0) {
-        MPI_Sendrecv(sendLo, count, MPI_DOUBLE, lo, 0,
-                     recvLo, count, MPI_DOUBLE, lo, 1, comm, MPI_STATUS_IGNORE);
-    }
-    if (rank < nranks - 1) {
-        MPI_Sendrecv(sendHi, count, MPI_DOUBLE, hi, 1,
-                     recvHi, count, MPI_DOUBLE, hi, 0, comm, MPI_STATUS_IGNORE);
-    }
-
-    if (rank == 0) {
-        CUDA_CHECK(cudaMemcpy(d_field, d_field + plane, plane * sizeof(double),
-                              cudaMemcpyDeviceToDevice));
-    } else {
-        CUDA_CHECK(cudaMemcpy(d_field, recvLo, plane * sizeof(double),
-                              cudaMemcpyHostToDevice));
-    }
-
-    if (rank == nranks - 1) {
-        CUDA_CHECK(cudaMemcpy(d_field + (nzLocal + 1) * plane, d_field + nzLocal * plane,
-                              plane * sizeof(double), cudaMemcpyDeviceToDevice));
-    } else {
-        CUDA_CHECK(cudaMemcpy(d_field + (nzLocal + 1) * plane, recvHi,
-                              plane * sizeof(double), cudaMemcpyHostToDevice));
-    }
-}
-
-// Initialize the local (z-padded) concentration field.  The pseudo-random values
-// are computed from the global linear index, so the result is identical for any
-// number of MPI ranks.
-static void initializeConcentration(std::vector<double>& c, const size_t z0,
-                                    const size_t nzLocal, const size_t nx,
-                                    const size_t ny, const size_t nz) {
-    const size_t plane = nx * ny;
-    const size_t vol = plane * nz;
+void initializeConcentration(std::vector<double>& c, const size_t z0, const size_t nzLocal,
+                             const size_t nx, const size_t ny, const size_t nz) {
+    const size_t layer = nx * ny;
+    const size_t vol = layer * nz;
 
 #pragma omp parallel for collapse(2) schedule(static)
-    for (size_t lz = 0; lz < nzLocal; ++lz) {
-        for (size_t y = 0; y < ny; ++y) {
-            const size_t gz = z0 + lz;
+    for (long long lz = 0; lz < static_cast<long long>(nzLocal); ++lz) {
+        for (long long y = 0; y < static_cast<long long>(ny); ++y) {
             for (size_t x = 0; x < nx; ++x) {
-                const size_t linear_id = gz * plane + y * nx + x;
-                const double pseudo =
-                    (static_cast<double>(((linear_id + 1) * 1299709) % vol) /
-                     static_cast<double>(vol));
-                c[idx3(x, y, lz + 1, nx, ny)] = -1.0 + 2.0 * pseudo;
+                const size_t idx = static_cast<size_t>(lz + 1) * layer +
+                                   static_cast<size_t>(y) * nx + x;
+                const size_t linear_id = (z0 + static_cast<size_t>(lz)) * layer +
+                                         static_cast<size_t>(y) * nx + x;
+                const double pseudo = ((((linear_id + 1) * 1299709) % vol) /
+                                       static_cast<double>(vol));
+                c[idx] = -1.0 + 2.0 * pseudo;
             }
         }
     }
+}
+
+void exchangeHalo(double* dev, const size_t nzLocal, const size_t layer,
+                  const bool hasPrev, const bool hasNext, const int prev, const int next,
+                  const int mpiCount, MPI_Comm comm, const int tag,
+                  double* sendLo, double* sendHi, double* recvLo, double* recvHi,
+                  cudaStream_t stream) {
+    if (nzLocal == 0) return;
+
+    const size_t bytes = layer * sizeof(double);
+
+    if (hasPrev) {
+        CUDA_CHECK(cudaMemcpyAsync(sendLo, dev + layer, bytes, cudaMemcpyDeviceToHost, stream));
+    }
+    if (hasNext) {
+        CUDA_CHECK(cudaMemcpyAsync(sendHi, dev + nzLocal * layer, bytes,
+                                   cudaMemcpyDeviceToHost, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (hasNext) {
+        MPI_Sendrecv(sendHi, mpiCount, MPI_DOUBLE, next, tag,
+                     recvHi, mpiCount, MPI_DOUBLE, next, tag + 1,
+                     comm, MPI_STATUS_IGNORE);
+    }
+    if (hasPrev) {
+        MPI_Sendrecv(sendLo, mpiCount, MPI_DOUBLE, prev, tag + 1,
+                     recvLo, mpiCount, MPI_DOUBLE, prev, tag,
+                     comm, MPI_STATUS_IGNORE);
+    }
+
+    if (hasPrev) {
+        CUDA_CHECK(cudaMemcpyAsync(dev, recvLo, bytes, cudaMemcpyHostToDevice, stream));
+    }
+    if (hasNext) {
+        CUDA_CHECK(cudaMemcpyAsync(dev + (nzLocal + 1) * layer, recvHi, bytes,
+                                   cudaMemcpyHostToDevice, stream));
+    }
+}
+
+bool validateResult(const std::vector<double>& c, [[maybe_unused]] const size_t nx,
+                    [[maybe_unused]] const size_t ny, [[maybe_unused]] const size_t nz) {
+    const long long n = static_cast<long long>(c.size());
+    int bad = 0;
+    double minVal = c[0];
+    double maxVal = c[0];
+
+#pragma omp parallel for schedule(static) reduction(|| : bad) reduction(min : minVal) reduction(max : maxVal)
+    for (long long i = 0; i < n; ++i) {
+        const double val = c[static_cast<size_t>(i)];
+        if (std::isnan(val) || std::isinf(val)) {
+            bad = 1;
+        }
+        minVal = std::min(minVal, val);
+        maxVal = std::max(maxVal, val);
+    }
+
+    if (bad) {
+        printf("Validation failed: found NaN or Inf value\n");
+        return false;
+    }
+
+    printf("Concentration range: [%.6f, %.6f]\n", minVal, maxVal);
+
+    if (maxVal > 10.0 || minVal < -10.0) {
+        printf("Validation failed: values out of expected range\n");
+        return false;
+    }
+
+    return true;
 }
 
 void printUsage(const char* progName) {
@@ -205,27 +215,10 @@ void printUsage(const char* progName) {
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
 
-    int rank = 0;
-    int nranks = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-
-    // Pick a GPU based on the node-local rank, unless the launcher already
-    // restricted the visible device set for this process.
-    int localRank = 0;
-    MPI_Comm nodeComm = MPI_COMM_NULL;
-    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &nodeComm);
-    MPI_Comm_rank(nodeComm, &localRank);
-    int deviceCount = 1;
-    CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
-    if (deviceCount < 1) {
-        if (rank == 0) fprintf(stderr, "No CUDA device available\n");
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    CUDA_CHECK(cudaSetDevice(localRank % deviceCount));
-    MPI_Comm_free(&nodeComm);
-
-    omp_set_num_threads(std::max(1, omp_get_max_threads()));
+    int worldRank = 0;
+    int worldSize = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
+    MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
 
     size_t nx = 64;
     size_t ny = 0;
@@ -234,14 +227,13 @@ int main(int argc, char** argv) {
     bool validate = false;
     bool printResults = false;
 
-    // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-x") == 0 && i + 1 < argc) {
-            nx = atoi(argv[++i]);
+            nx = static_cast<size_t>(atoi(argv[++i]));
         } else if (strcmp(argv[i], "-y") == 0 && i + 1 < argc) {
-            ny = atoi(argv[++i]);
+            ny = static_cast<size_t>(atoi(argv[++i]));
         } else if (strcmp(argv[i], "-z") == 0 && i + 1 < argc) {
-            nz = atoi(argv[++i]);
+            nz = static_cast<size_t>(atoi(argv[++i]));
         } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
             iterations = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-v") == 0) {
@@ -249,11 +241,11 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-r") == 0) {
             printResults = true;
         } else if (strcmp(argv[i], "-h") == 0) {
-            if (rank == 0) printUsage(argv[0]);
+            if (worldRank == 0) printUsage(argv[0]);
             MPI_Finalize();
             return 0;
         } else {
-            if (rank == 0) {
+            if (worldRank == 0) {
                 printf("Unknown option: %s\n", argv[i]);
                 printUsage(argv[0]);
             }
@@ -264,27 +256,73 @@ int main(int argc, char** argv) {
 
     if (ny == 0) ny = nx;
     if (nz == 0) nz = nx;
-    if (nx == 0 || ny == 0 || nz == 0) {
-        if (rank == 0) printf("Grid dimensions must be positive\n");
-        MPI_Finalize();
-        return 1;
-    }
-    if (static_cast<size_t>(nranks) > nz) {
-        if (rank == 0) {
-            printf("Number of MPI ranks (%d) exceeds the z grid size (%zu)\n", nranks, nz);
-        }
-        MPI_Finalize();
-        return 1;
-    }
 
-    if (rank == 0) {
+    MPI_Comm nodeComm = MPI_COMM_NULL;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &nodeComm);
+    int nodeRank = 0;
+    MPI_Comm_rank(nodeComm, &nodeRank);
+
+    int deviceCount = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+    if (deviceCount <= 0) {
+        if (worldRank == 0) printf("CUDA device required but none was found\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    const int deviceId = nodeRank % deviceCount;
+    CUDA_CHECK(cudaSetDevice(deviceId));
+    CUDA_CHECK(cudaFree(nullptr));
+    MPI_Comm_free(&nodeComm);
+
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+    const size_t layer = nx * ny;
+    const size_t baseCount = nz / static_cast<size_t>(worldSize);
+    const size_t remainder = nz % static_cast<size_t>(worldSize);
+    const size_t localNz = baseCount +
+                           (static_cast<size_t>(worldRank) < remainder ? 1 : 0);
+    const size_t z0 = static_cast<size_t>(worldRank) * baseCount +
+                      std::min(static_cast<size_t>(worldRank), remainder);
+    const int activeRanks = static_cast<int>(std::min(nz, static_cast<size_t>(worldSize)));
+    const bool hasPrev = worldRank > 0 && worldRank < activeRanks;
+    const bool hasNext = worldRank + 1 < activeRanks;
+    const int prev = worldRank - 1;
+    const int next = worldRank + 1;
+    const int mpiCount = static_cast<int>(layer);
+    const size_t localSize = (localNz + 2) * layer;
+    const size_t ownedSize = localNz * layer;
+
+    double* coldDev = nullptr;
+    double* cnewDev = nullptr;
+    double* muDev = nullptr;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&coldDev), localSize * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&cnewDev), localSize * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&muDev), localSize * sizeof(double)));
+
+    double* sendLo = nullptr;
+    double* sendHi = nullptr;
+    double* recvLo = nullptr;
+    double* recvHi = nullptr;
+    const size_t bytes = layer * sizeof(double);
+    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&sendLo), bytes, cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&sendHi), bytes, cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&recvLo), bytes, cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&recvHi), bytes, cudaHostAllocDefault));
+
+    std::vector<double> hostCold(localSize, 0.0);
+    if (worldRank == 0) {
         printf("Cahn-Hilliard Phase Separation Benchmark\n");
         printf("Grid size: %zu x %zu x %zu\n", nx, ny, nz);
         printf("Time steps: %d\n", iterations);
         printf("Validation: %s\n", validate ? "enabled" : "disabled");
+        printf("Initializing concentration field...\n");
     }
 
-    // Physical parameters
+    initializeConcentration(hostCold, z0, localNz, nx, ny, nz);
+    CUDA_CHECK(cudaMemcpyAsync(coldDev, hostCold.data(), localSize * sizeof(double),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
     const double dx = 1.0;
     const double dy = 1.0;
     const double dz = 1.0;
@@ -295,195 +333,135 @@ int main(int argc, char** argv) {
     const double gamma = 0.5;
     const double D = 1.0;
 
-    size_t z0 = 0;
-    size_t z1 = 0;
-    partitionZ(nz, nranks, rank, z0, z1);
-    const size_t nzLocal = z1 - z0;
-    const size_t plane = nx * ny;
-    const size_t localPadded = plane * (nzLocal + 2);
+    const dim3 block(32, 8, 1);
+    const dim3 grid((static_cast<unsigned>(nx) + block.x - 1) / block.x,
+                    (static_cast<unsigned>(ny) + block.y - 1) / block.y,
+                    static_cast<unsigned>(localNz));
 
-    const double invDx2 = 1.0 / (dx * dx);
-    const double invDy2 = 1.0 / (dy * dy);
-    const double invDz2 = 1.0 / (dz * dz);
-    const double dtD = dt * D;
+    if (worldRank == 0) printf("Running Cahn-Hilliard simulation...\n");
 
-    // Device buffers
-    double* dCold = nullptr;
-    double* dCnew = nullptr;
-    double* dMu = nullptr;
-    CUDA_CHECK(cudaMalloc(&dCold, localPadded * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&dCnew, localPadded * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&dMu, localPadded * sizeof(double)));
+    if (localNz > 0) {
+        computeChemicalPotentialKernel<<<grid, block, 0, stream>>>(
+            coldDev, muDev, static_cast<int>(nx), static_cast<int>(ny),
+            static_cast<int>(localNz), static_cast<int>(z0), static_cast<int>(nz),
+            dx, dy, dz, gamma, e_AA, e_BB, e_AB);
+        cahnHilliardUpdateKernel<<<grid, block, 0, stream>>>(
+            cnewDev, coldDev, muDev, static_cast<int>(nx), static_cast<int>(ny),
+            static_cast<int>(localNz), static_cast<int>(z0), static_cast<int>(nz),
+            D, dt, dx, dy, dz);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    double* hHalo = nullptr;
-    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&hHalo), 4 * plane * sizeof(double),
-                             cudaHostAllocDefault));
-
-    // Initialize concentration field (host preparation + OpenMP)
-    if (rank == 0) printf("Initializing concentration field...\n");
-    std::vector<double> hCold(localPadded, 0.0);
-    initializeConcentration(hCold, z0, nzLocal, nx, ny, nz);
-    CUDA_CHECK(cudaMemcpy(dCold, hCold.data(), localPadded * sizeof(double),
-                          cudaMemcpyHostToDevice));
-    hCold.clear();
-    hCold.shrink_to_fit();
-
-    exchangeHalos(dCold, static_cast<int>(nx), static_cast<int>(ny), nzLocal, rank, nranks,
-                  MPI_COMM_WORLD, hHalo);
-
-    const dim3 block(8, 8, 8);
-    const dim3 grid(static_cast<unsigned>((nx + block.x - 1) / block.x),
-                    static_cast<unsigned>((ny + block.y - 1) / block.y),
-                    static_cast<unsigned>((nzLocal + block.z - 1) / block.z));
-
-    // Run simulation
-    if (rank == 0) printf("Running Cahn-Hilliard simulation...\n");
-    CUDA_CHECK(cudaDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
     const auto start = std::chrono::high_resolution_clock::now();
 
     for (int t = 0; t < iterations; ++t) {
-        computeChemicalPotentialKernel<<<grid, block>>>(
-            dCold, dMu, static_cast<int>(nx), static_cast<int>(ny),
-            static_cast<int>(nzLocal), plane, invDx2, invDy2, invDz2, gamma,
-            e_AA, e_BB, e_AB);
-        CUDA_CHECK(cudaGetLastError());
+        exchangeHalo(coldDev, localNz, layer, hasPrev, hasNext, prev, next,
+                     mpiCount, MPI_COMM_WORLD, 100, sendLo, sendHi, recvLo, recvHi, stream);
 
-        exchangeHalos(dMu, static_cast<int>(nx), static_cast<int>(ny), nzLocal, rank, nranks,
-                      MPI_COMM_WORLD, hHalo);
-
-        cahnHilliardUpdateKernel<<<grid, block>>>(
-            dCnew, dCold, dMu, static_cast<int>(nx), static_cast<int>(ny),
-            static_cast<int>(nzLocal), plane, invDx2, invDy2, invDz2, dtD);
-        CUDA_CHECK(cudaGetLastError());
-
-        // Exchange the new concentration for the next time step.
-        if (t + 1 < iterations) {
-            exchangeHalos(dCnew, static_cast<int>(nx), static_cast<int>(ny), nzLocal, rank,
-                          nranks, MPI_COMM_WORLD, hHalo);
+        if (localNz > 0) {
+            computeChemicalPotentialKernel<<<grid, block, 0, stream>>>(
+                coldDev, muDev, static_cast<int>(nx), static_cast<int>(ny),
+                static_cast<int>(localNz), static_cast<int>(z0), static_cast<int>(nz),
+                dx, dy, dz, gamma, e_AA, e_BB, e_AB);
+            CUDA_CHECK(cudaGetLastError());
         }
 
-        std::swap(dCold, dCnew);
+        exchangeHalo(muDev, localNz, layer, hasPrev, hasNext, prev, next,
+                     mpiCount, MPI_COMM_WORLD, 200, sendLo, sendHi, recvLo, recvHi, stream);
+
+        if (localNz > 0) {
+            cahnHilliardUpdateKernel<<<grid, block, 0, stream>>>(
+                cnewDev, coldDev, muDev, static_cast<int>(nx), static_cast<int>(ny),
+                static_cast<int>(localNz), static_cast<int>(z0), static_cast<int>(nz),
+                D, dt, dx, dy, dz);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        std::swap(coldDev, cnewDev);
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
     const auto end = std::chrono::high_resolution_clock::now();
+    const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-    const long localDuration =
-        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    long duration = 0;
-    MPI_Reduce(&localDuration, &duration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    const size_t gridSize = nx * ny * nz;
 
-    if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration);
+    if (worldRank == 0) {
+        printf("Computation time: %ld ms\n", static_cast<long>(duration.count()));
 
-        const double gridSize = static_cast<double>(nx) * static_cast<double>(ny) *
-                                static_cast<double>(nz);
-        const double cellUpdates = gridSize * static_cast<double>(iterations);
-        const double seconds = static_cast<double>(duration) / 1000.0;
-        const double mcups = (seconds > 0.0) ? cellUpdates / seconds / 1e6 : 0.0;
+        const double cellUpdates = static_cast<double>(gridSize) * iterations;
+        const double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 
-    // Copy the local interior to a compact linear buffer for optional output and
-    // validation.  Ranks own contiguous z slabs, so concatenating the slabs in
-    // rank order reconstructs the original linear layout.
-    const size_t localSize = plane * nzLocal;
-    std::vector<double> local;
+    int result = 0;
     if (printResults || validate) {
-        local.resize(localSize);
-        CUDA_CHECK(cudaMemcpy2D(local.data(), plane * sizeof(double),
-                                dCold + plane, plane * sizeof(double),
-                                plane * sizeof(double), nzLocal,
-                                cudaMemcpyDeviceToHost));
-    }
+        std::vector<double> ownedHost(ownedSize);
+        if (ownedSize > 0) {
+            CUDA_CHECK(cudaMemcpy(ownedHost.data(), coldDev + layer,
+                                  ownedSize * sizeof(double), cudaMemcpyDeviceToHost));
+        }
 
-    // Print results for external validation
-    if (printResults) {
         std::vector<int> counts;
         std::vector<int> displs;
-        std::vector<double> global;
-
-        if (rank == 0) {
-            counts.resize(nranks);
-            displs.resize(nranks);
-            size_t disp = 0;
-            for (int r = 0; r < nranks; ++r) {
-                size_t r0 = 0, r1 = 0;
-                partitionZ(nz, nranks, r, r0, r1);
-                counts[r] = static_cast<int>(plane * (r1 - r0));
-                displs[r] = static_cast<int>(disp);
-                disp += plane * (r1 - r0);
+        if (worldRank == 0) {
+            counts.resize(static_cast<size_t>(worldSize));
+            displs.resize(static_cast<size_t>(worldSize));
+        }
+        for (int r = 0; r < worldSize; ++r) {
+            const size_t lz = baseCount + (static_cast<size_t>(r) < remainder ? 1 : 0);
+            if (worldRank == 0) {
+                counts[static_cast<size_t>(r)] = static_cast<int>(lz * layer);
             }
-            global.resize(static_cast<size_t>(disp));
+        }
+        if (worldRank == 0) {
+            int offset = 0;
+            for (int r = 0; r < worldSize; ++r) {
+                displs[static_cast<size_t>(r)] = offset;
+                offset += counts[static_cast<size_t>(r)];
+            }
         }
 
-        MPI_Gatherv(local.data(), static_cast<int>(localSize), MPI_DOUBLE,
-                    (rank == 0 ? global.data() : nullptr),
-                    (rank == 0 ? counts.data() : nullptr),
-                    (rank == 0 ? displs.data() : nullptr),
+        std::vector<double> global;
+        if (worldRank == 0) global.resize(gridSize);
+
+        MPI_Gatherv(ownedHost.data(), static_cast<int>(ownedSize), MPI_DOUBLE,
+                    worldRank == 0 ? global.data() : nullptr,
+                    worldRank == 0 ? counts.data() : nullptr,
+                    worldRank == 0 ? displs.data() : nullptr,
                     MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-        if (rank == 0) {
-            print_results(global, "Concentration");
-        }
-    }
-
-    // Validation
-    if (validate) {
-        double localMin = localSize > 0 ? local[0] : 0.0;
-        double localMax = localSize > 0 ? local[0] : 0.0;
-        bool localBad = false;
-
-#pragma omp parallel for reduction(min : localMin) reduction(max : localMax) \
-    reduction(|| : localBad) schedule(static)
-        for (size_t i = 0; i < localSize; ++i) {
-            const double val = local[i];
-            if (std::isnan(val) || std::isinf(val)) localBad = true;
-            localMin = std::min(localMin, val);
-            localMax = std::max(localMax, val);
-        }
-
-        int badFlag = localBad ? 1 : 0;
-        double globalMin = 0.0;
-        double globalMax = 0.0;
-        int globalBad = 0;
-        MPI_Allreduce(&localMin, &globalMin, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
-        MPI_Allreduce(&localMax, &globalMax, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-        MPI_Allreduce(&badFlag, &globalBad, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-
-        bool valid = true;
-        if (rank == 0) {
-            printf("Validating result...\n");
-            if (globalBad) {
-                printf("Validation failed: found NaN or Inf value\n");
-                valid = false;
-            } else {
-                printf("Concentration range: [%.6f, %.6f]\n", globalMin, globalMax);
-                if (globalMax > 10.0 || globalMin < -10.0) {
-                    printf("Validation failed: values out of expected range\n");
-                    valid = false;
+        if (worldRank == 0) {
+            if (printResults) {
+                print_results(global, "Concentration");
+            }
+            if (validate) {
+                printf("Validating result...\n");
+                const bool valid = validateResult(global, nx, ny, nz);
+                if (valid) {
+                    printf("Validation: PASSED\n");
+                } else {
+                    printf("Validation: FAILED\n");
+                    result = 1;
                 }
             }
-            printf("Validation: %s\n", valid ? "PASSED" : "FAILED");
         }
-
-        int validFlag = valid ? 1 : 0;
-        MPI_Bcast(&validFlag, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-        CUDA_CHECK(cudaFreeHost(hHalo));
-        CUDA_CHECK(cudaFree(dCold));
-        CUDA_CHECK(cudaFree(dCnew));
-        CUDA_CHECK(cudaFree(dMu));
-        MPI_Finalize();
-        return validFlag ? 0 : 1;
     }
 
-    CUDA_CHECK(cudaFreeHost(hHalo));
-    CUDA_CHECK(cudaFree(dCold));
-    CUDA_CHECK(cudaFree(dCnew));
-    CUDA_CHECK(cudaFree(dMu));
+    MPI_Bcast(&result, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    CUDA_CHECK(cudaFree(coldDev));
+    CUDA_CHECK(cudaFree(cnewDev));
+    CUDA_CHECK(cudaFree(muDev));
+    CUDA_CHECK(cudaFreeHost(sendLo));
+    CUDA_CHECK(cudaFreeHost(sendHi));
+    CUDA_CHECK(cudaFreeHost(recvLo));
+    CUDA_CHECK(cudaFreeHost(recvHi));
+
     MPI_Finalize();
-    return 0;
+    return result;
 }

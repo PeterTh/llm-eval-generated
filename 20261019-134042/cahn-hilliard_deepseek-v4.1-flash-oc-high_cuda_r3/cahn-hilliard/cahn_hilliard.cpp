@@ -10,118 +10,116 @@
 
 #include "../common/results_output.hpp"
 
-// 3D index calculation
-inline constexpr size_t idx3(const size_t x, const size_t y, const size_t z, const size_t nx, const size_t ny) noexcept {
-    return z * (nx * ny) + y * nx + x;
-}
-
-#define CUDA_CHECK(call)                                                        \
-    do {                                                                        \
-        cudaError_t err_ = (call);                                              \
-        if (err_ != cudaSuccess) {                                              \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,    \
-                    cudaGetErrorString(err_));                                  \
-            exit(EXIT_FAILURE);                                                 \
-        }                                                                       \
+#define CUDA_CHECK(call)                                                                 \
+    do {                                                                                 \
+        cudaError_t err_ = (call);                                                       \
+        if (err_ != cudaSuccess) {                                                       \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,             \
+                    cudaGetErrorString(err_));                                           \
+            std::exit(EXIT_FAILURE);                                                     \
+        }                                                                                \
     } while (0)
 
-// Thread-block dimensions. BX is a multiple of the warp size so that accesses
-// along the contiguous X dimension are fully coalesced.
-constexpr int BX = 32;
-constexpr int BY = 2;
-constexpr int BZ = 2;
+struct Parameters {
+    int nx;
+    int ny;
+    int nz;
+    double invDx2;
+    double invDy2;
+    double invDz2;
+    double gamma;
+    double eAA;
+    double eBB;
+    double eAB;
+    double dtD;
+};
 
-// Compute the Laplacian directly from global memory. Neighbouring threads
-// share stencil values through the read-only/L1 cache, and the clamped
-// boundary conditions match the original scalar code exactly.
-template <bool UNIT_SPACING>
-__device__ __forceinline__ double laplacianGlobal(const double* __restrict__ f,
-                                                  const int x, const int y, const int z,
-                                                  const int nx, const int ny, const int nz,
-                                                  const double invdx2, const double invdy2,
-                                                  const double invdz2) {
-    const size_t stride_y = nx;
-    const size_t stride_z = static_cast<size_t>(nx) * ny;
-    const size_t idx = static_cast<size_t>(z) * stride_z
-                     + static_cast<size_t>(y) * stride_y + x;
-    const double center = f[idx];
-    const double xp = (x < nx - 1) ? f[idx + 1] : center;
-    const double xn = (x > 0) ? f[idx - 1] : center;
-    const double yp = (y < ny - 1) ? f[idx + stride_y] : center;
-    const double yn = (y > 0) ? f[idx - stride_y] : center;
-    const double zp = (z < nz - 1) ? f[idx + stride_z] : center;
-    const double zn = (z > 0) ? f[idx - stride_z] : center;
-    if constexpr (UNIT_SPACING) {
-        return xp + xn + yp + yn + zp + zn - 6.0 * center;
-    } else {
-        const double cxx = (xp + xn - 2.0 * center) * invdx2;
-        const double cyy = (yp + yn - 2.0 * center) * invdy2;
-        const double czz = (zp + zn - 2.0 * center) * invdz2;
-        return cxx + cyy + czz;
-    }
+// Compute Laplacian with clamped boundary conditions
+__device__ __forceinline__ double computeLaplacian(const double* __restrict__ a,
+                                                   const size_t idx,
+                                                   const int x, const int y, const int z,
+                                                   const double center,
+                                                   const Parameters& p) {
+    const int xp = (x < p.nx - 1) ? x + 1 : x;
+    const int yp = (y < p.ny - 1) ? y + 1 : y;
+    const int zp = (z < p.nz - 1) ? z + 1 : z;
+    const int xn = (x > 0) ? x - 1 : 0;
+    const int yn = (y > 0) ? y - 1 : 0;
+    const int zn = (z > 0) ? z - 1 : 0;
+
+    const size_t sy = static_cast<size_t>(p.nx);
+    const size_t sz = static_cast<size_t>(p.nx) * static_cast<size_t>(p.ny);
+
+    const double cxx = (__ldg(&a[idx + (xp - x)]) +
+                        __ldg(&a[idx - (x - xn)]) -
+                        2.0 * center) * p.invDx2;
+    const double cyy = (__ldg(&a[idx + static_cast<size_t>(yp - y) * sy]) +
+                        __ldg(&a[idx - static_cast<size_t>(y - yn) * sy]) -
+                        2.0 * center) * p.invDy2;
+    const double czz = (__ldg(&a[idx + static_cast<size_t>(zp - z) * sz]) +
+                        __ldg(&a[idx - static_cast<size_t>(z - zn) * sz]) -
+                        2.0 * center) * p.invDz2;
+
+    return cxx + cyy + czz;
 }
 
 // Compute chemical potential
-template <bool UNIT_SPACING>
-__global__ void computeChemicalPotentialKernel(double* __restrict__ mu,
-                                               const double* __restrict__ c,
-                                               const int nx, const int ny, const int nz,
-                                               const double invdx2, const double invdy2,
-                                               const double invdz2,
-                                               const double gamma, const double coef_c,
-                                               const double coef_c0) {
-    const int x = blockIdx.x * BX + threadIdx.x;
-    const int y = blockIdx.y * BY + threadIdx.y;
-    const int z = blockIdx.z * BZ + threadIdx.z;
-    if (x >= nx || y >= ny || z >= nz) return;
+__global__ void computeChemicalPotentialKernel(const double* __restrict__ c,
+                                               double* __restrict__ mu,
+                                               const Parameters p) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int z = blockIdx.z * blockDim.z + threadIdx.z;
 
-    const size_t idx = static_cast<size_t>(z) * (static_cast<size_t>(ny) * nx)
-                     + static_cast<size_t>(y) * nx + x;
-    const double cv = c[idx];
-    const double lap = laplacianGlobal<UNIT_SPACING>(c, x, y, z, nx, ny, nz,
-                                                     invdx2, invdy2, invdz2);
+    if (x >= p.nx || y >= p.ny || z >= p.nz) {
+        return;
+    }
 
-    // Algebraically equivalent to the original expression, with the
-    // parameter-dependent terms folded into two host-computed coefficients.
-    mu[idx] = cv * (coef_c + cv * cv) + coef_c0 - gamma * lap;
+    const size_t idx = static_cast<size_t>(z) *
+                           (static_cast<size_t>(p.nx) * static_cast<size_t>(p.ny)) +
+                       static_cast<size_t>(y) * static_cast<size_t>(p.nx) +
+                       static_cast<size_t>(x);
+    const double cv = __ldg(&c[idx]);
+
+    mu[idx] = 4.5 * ((cv + 1.0) * p.eAA + (cv - 1.0) * p.eBB - 2.0 * cv * p.eAB)
+            + 3.0 * cv + cv * cv * cv
+            - p.gamma * computeLaplacian(c, idx, x, y, z, cv, p);
 }
 
 // Cahn-Hilliard update step
-template <bool UNIT_SPACING>
 __global__ void cahnHilliardUpdateKernel(double* __restrict__ cnew,
                                          const double* __restrict__ cold,
                                          const double* __restrict__ mu,
-                                         const int nx, const int ny, const int nz,
-                                         const double dtD,
-                                         const double invdx2, const double invdy2,
-                                         const double invdz2) {
-    const int x = blockIdx.x * BX + threadIdx.x;
-    const int y = blockIdx.y * BY + threadIdx.y;
-    const int z = blockIdx.z * BZ + threadIdx.z;
-    if (x >= nx || y >= ny || z >= nz) return;
+                                         const Parameters p) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int z = blockIdx.z * blockDim.z + threadIdx.z;
 
-    const size_t idx = static_cast<size_t>(z) * (static_cast<size_t>(ny) * nx)
-                     + static_cast<size_t>(y) * nx + x;
-    const double lap = laplacianGlobal<UNIT_SPACING>(mu, x, y, z, nx, ny, nz,
-                                                     invdx2, invdy2, invdz2);
-    cnew[idx] = cold[idx] + dtD * lap;
+    if (x >= p.nx || y >= p.ny || z >= p.nz) {
+        return;
+    }
+
+    const size_t idx = static_cast<size_t>(z) *
+                           (static_cast<size_t>(p.nx) * static_cast<size_t>(p.ny)) +
+                       static_cast<size_t>(y) * static_cast<size_t>(p.nx) +
+                       static_cast<size_t>(x);
+    const double muc = __ldg(&mu[idx]);
+
+    cnew[idx] = __ldg(&cold[idx]) +
+                p.dtD * computeLaplacian(mu, idx, x, y, z, muc, p);
 }
 
 // Initialize concentration field
-void initializeConcentration(std::vector<double>& c, const size_t nx, const size_t ny, const size_t nz) {
-    const size_t vol = nx * ny * nz;
-
-    for (size_t z = 0; z < nz; ++z) {
-        for (size_t y = 0; y < ny; ++y) {
-            for (size_t x = 0; x < nx; ++x) {
-                const size_t idx = idx3(x, y, z, nx, ny);
-                // Generate pseudo-random value in [-1, 1]
-                const size_t linear_id = z * (nx * ny) + y * nx + x;
-                const double pseudo = ((((linear_id + 1) * 1299709) % vol) / static_cast<double>(vol));
-                c[idx] = -1.0 + 2.0 * pseudo;
-            }
-        }
+__global__ void initializeConcentrationKernel(double* __restrict__ c, const size_t vol) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= vol) {
+        return;
     }
+
+    // Generate pseudo-random value in [-1, 1]
+    const double pseudo = static_cast<double>((((idx + 1) * 1299709) % vol)) /
+                          static_cast<double>(vol);
+    c[idx] = -1.0 + 2.0 * pseudo;
 }
 
 bool validateResult(const std::vector<double>& c, [[maybe_unused]] const size_t nx, [[maybe_unused]] const size_t ny, [[maybe_unused]] const size_t nz) {
@@ -151,19 +149,6 @@ bool validateResult(const std::vector<double>& c, [[maybe_unused]] const size_t 
     }
 
     return true;
-}
-
-template <bool UNIT_SPACING>
-void launchStep(double* d_mu, double* d_cnew, const double* d_cold,
-                const dim3& grid, const dim3& block,
-                const int nx, const int ny, const int nz,
-                const double invdx2, const double invdy2, const double invdz2,
-                const double gamma, const double coef_c, const double coef_c0,
-                const double dtD) {
-    computeChemicalPotentialKernel<UNIT_SPACING><<<grid, block>>>(
-        d_mu, d_cold, nx, ny, nz, invdx2, invdy2, invdz2, gamma, coef_c, coef_c0);
-    cahnHilliardUpdateKernel<UNIT_SPACING><<<grid, block>>>(
-        d_cnew, d_cold, d_mu, nx, ny, nz, dtD, invdx2, invdy2, invdz2);
 }
 
 void printUsage(const char* progName) {
@@ -229,83 +214,74 @@ int main(int argc, char** argv) {
     const double gamma = 0.5;
     const double D = 1.0;
 
-    const double invdx2 = 1.0 / (dx * dx);
-    const double invdy2 = 1.0 / (dy * dy);
-    const double invdz2 = 1.0 / (dz * dz);
-    const double dtD = dt * D;
-    const double coef_c = 4.5 * (e_AA + e_BB - 2.0 * e_AB) + 3.0;
-    const double coef_c0 = 4.5 * (e_AA - e_BB);
+    const size_t gridSize = nx * ny * nz;
 
-    size_t gridSize = nx * ny * nz;
-    const size_t bytes = gridSize * sizeof(double);
+    Parameters p;
+    p.nx = static_cast<int>(nx);
+    p.ny = static_cast<int>(ny);
+    p.nz = static_cast<int>(nz);
+    p.invDx2 = 1.0 / (dx * dx);
+    p.invDy2 = 1.0 / (dy * dy);
+    p.invDz2 = 1.0 / (dz * dz);
+    p.gamma = gamma;
+    p.eAA = e_AA;
+    p.eBB = e_BB;
+    p.eAB = e_AB;
+    p.dtD = dt * D;
 
-    // Allocate arrays
-    std::vector<double> cold(gridSize);
-
-    // Initialize concentration field
-    printf("Initializing concentration field...\n");
-    initializeConcentration(cold, nx, ny, nz);
-
-    // Allocate device buffers and upload the initial state before timing so
-    // that the measured region matches the original computation loop.
+    // Allocate arrays on the GPU
     double* d_cold = nullptr;
     double* d_cnew = nullptr;
     double* d_mu = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_cold, bytes));
-    CUDA_CHECK(cudaMalloc(&d_cnew, bytes));
-    CUDA_CHECK(cudaMalloc(&d_mu, bytes));
-    CUDA_CHECK(cudaMemcpy(d_cold, cold.data(), bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&d_cold, gridSize * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_cnew, gridSize * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_mu, gridSize * sizeof(double)));
 
-    const dim3 block(BX, BY, BZ);
-    const dim3 grid((static_cast<unsigned>(nx) + BX - 1) / BX,
-                    (static_cast<unsigned>(ny) + BY - 1) / BY,
-                    (static_cast<unsigned>(nz) + BZ - 1) / BZ);
-
-    const int inx = static_cast<int>(nx);
-    const int iny = static_cast<int>(ny);
-    const int inz = static_cast<int>(nz);
-    const bool unitSpacing = (invdx2 == 1.0 && invdy2 == 1.0 && invdz2 == 1.0);
-
-    // Warm up the device kernels so that module loading and lazy context
-    // initialization are not charged to the timed simulation loop. The warm-up
-    // writes only to the scratch buffer, leaving the initial state untouched.
-    if (unitSpacing) {
-        launchStep<true>(d_mu, d_cnew, d_cold, grid, block, inx, iny, inz,
-                         invdx2, invdy2, invdz2, gamma, coef_c, coef_c0, dtD);
-    } else {
-        launchStep<false>(d_mu, d_cnew, d_cold, grid, block, inx, iny, inz,
-                          invdx2, invdy2, invdz2, gamma, coef_c, coef_c0, dtD);
+    // Initialize concentration field
+    printf("Initializing concentration field...\n");
+    {
+        const int threads = 256;
+        const int blocks = static_cast<int>((gridSize + threads - 1) / threads);
+        initializeConcentrationKernel<<<blocks, threads>>>(d_cold, gridSize);
+        CUDA_CHECK(cudaGetLastError());
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Select a block shape that keeps memory accesses coalesced along x while
+    // still exploiting reuse in y and z when those dimensions are large enough.
+    dim3 block;
+    if (nz >= 8) {
+        block = dim3(16, 8, 8);
+    } else if (nz >= 4) {
+        block = dim3(16, 8, 4);
+    } else if (nz >= 2) {
+        block = dim3(16, 8, 2);
+    } else {
+        block = dim3(32, 8, 1);
+    }
+    const dim3 grid((static_cast<unsigned>(nx) + block.x - 1) / block.x,
+                    (static_cast<unsigned>(ny) + block.y - 1) / block.y,
+                    (static_cast<unsigned>(nz) + block.z - 1) / block.z);
 
     // Run simulation
     printf("Running Cahn-Hilliard simulation...\n");
     auto start = std::chrono::high_resolution_clock::now();
 
-    if (unitSpacing) {
-        for (int t = 0; t < iterations; ++t) {
-            launchStep<true>(d_mu, d_cnew, d_cold, grid, block, inx, iny, inz,
-                             invdx2, invdy2, invdz2, gamma, coef_c, coef_c0, dtD);
-            std::swap(d_cold, d_cnew);
-        }
-    } else {
-        for (int t = 0; t < iterations; ++t) {
-            launchStep<false>(d_mu, d_cnew, d_cold, grid, block, inx, iny, inz,
-                              invdx2, invdy2, invdz2, gamma, coef_c, coef_c0, dtD);
-            std::swap(d_cold, d_cnew);
-        }
+    for (int t = 0; t < iterations; ++t) {
+        // Compute chemical potential
+        computeChemicalPotentialKernel<<<grid, block>>>(d_cold, d_mu, p);
+
+        // Update concentration
+        cahnHilliardUpdateKernel<<<grid, block>>>(d_cnew, d_cold, d_mu, p);
+
+        // Swap buffers
+        std::swap(d_cold, d_cnew);
     }
 
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-    // Copy the final field back for reporting/validation.
-    CUDA_CHECK(cudaMemcpy(cold.data(), d_cold, bytes, cudaMemcpyDeviceToHost));
-
-    CUDA_CHECK(cudaFree(d_cold));
-    CUDA_CHECK(cudaFree(d_cnew));
-    CUDA_CHECK(cudaFree(d_mu));
 
     printf("Computation time: %ld ms\n", duration.count());
 
@@ -314,10 +290,21 @@ int main(int argc, char** argv) {
     double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
     printf("Performance: %.3f MCellUpdates/s\n", mcups);
 
+    std::vector<double> cold;
+    if (printResults || validate) {
+        cold.resize(gridSize);
+        CUDA_CHECK(cudaMemcpy(cold.data(), d_cold, gridSize * sizeof(double),
+                              cudaMemcpyDeviceToHost));
+    }
+
     // Print results for external validation
     if (printResults) {
         print_results(cold, "Concentration");
     }
+
+    CUDA_CHECK(cudaFree(d_mu));
+    CUDA_CHECK(cudaFree(d_cnew));
+    CUDA_CHECK(cudaFree(d_cold));
 
     // Validation
     if (validate) {

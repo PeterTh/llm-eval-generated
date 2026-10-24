@@ -11,5 +11,5 @@ add_executable(qtclustering qtclustering.cpp)
 
 target_compile_options(qtclustering PRIVATE -O3 -march=native -Wall -Wextra)
 
-# Link OpenMP and math library
+# OpenMP provides the shared-memory multicore parallelism; math library for sqrt
 target_link_libraries(qtclustering PRIVATE OpenMP::OpenMP_CXX m)

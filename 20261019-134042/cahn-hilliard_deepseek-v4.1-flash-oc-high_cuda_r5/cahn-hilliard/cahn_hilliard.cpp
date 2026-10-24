@@ -10,148 +10,201 @@
 
 #include "../common/results_output.hpp"
 
-static inline void cudaCheck(cudaError_t err, const char* file, int line) {
+__host__ __device__ inline constexpr size_t idx3(const size_t x, const size_t y, const size_t z, const size_t nx, const size_t ny) noexcept {
+    return z * (nx * ny) + y * nx + x;
+}
+
+namespace {
+
+constexpr int BLOCK_X = 8;
+constexpr int BLOCK_Y = 8;
+constexpr int BLOCK_Z = 8;
+constexpr int BLOCK_THREADS = BLOCK_X * BLOCK_Y * BLOCK_Z;
+
+constexpr int C_TILE_X = BLOCK_X + 4;
+constexpr int C_TILE_Y = BLOCK_Y + 4;
+constexpr int C_TILE_Z = BLOCK_Z + 4;
+constexpr int C_TILE_SIZE = C_TILE_X * C_TILE_Y * C_TILE_Z;
+
+constexpr int MU_TILE_X = BLOCK_X + 2;
+constexpr int MU_TILE_Y = BLOCK_Y + 2;
+constexpr int MU_TILE_Z = BLOCK_Z + 2;
+constexpr int MU_TILE_SIZE = MU_TILE_X * MU_TILE_Y * MU_TILE_Z;
+
+__device__ __forceinline__ int cSharedIndex(const int x, const int y, const int z) noexcept {
+    return (z * C_TILE_Y + y) * C_TILE_X + x;
+}
+
+__device__ __forceinline__ int muSharedIndex(const int x, const int y, const int z) noexcept {
+    return (z * MU_TILE_Y + y) * MU_TILE_X + x;
+}
+
+void checkCuda(cudaError_t err, const char* message) {
     if (err != cudaSuccess) {
-        std::fprintf(stderr, "CUDA error at %s:%d: %s\n", file, line, cudaGetErrorString(err));
-        std::exit(EXIT_FAILURE);
+        fprintf(stderr, "%s: %s\n", message, cudaGetErrorString(err));
+        std::exit(1);
     }
 }
 
-#define CUDA_CHECK(expr) cudaCheck((expr), __FILE__, __LINE__)
-
-#define ZCOARSEN 8
-
-// Compute chemical potential
-__global__ void computeChemicalPotentialKernel(const double* __restrict__ c, double* __restrict__ mu,
-                                               const int nx, const int ny, const int nz,
-                                               const double gamma, const double coeff0, const double coeff1) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= nx || y >= ny) {
-        return;
+__global__ void initializeConcentrationKernel(double* __restrict__ c, const size_t nx, const size_t ny, const size_t nz) {
+    const size_t vol = nx * ny * nz;
+    const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+    for (size_t id = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; id < vol; id += stride) {
+        const size_t linear_id = id;
+        const double pseudo = ((((linear_id + 1) * static_cast<size_t>(1299709)) % vol) / static_cast<double>(vol));
+        c[id] = -1.0 + 2.0 * pseudo;
     }
-    const int z0 = (blockIdx.z * blockDim.z + threadIdx.z) * ZCOARSEN;
+}
 
-    const size_t plane = static_cast<size_t>(nx) * static_cast<size_t>(ny);
-    const size_t base = static_cast<size_t>(y) * nx + x;
-    const size_t offxp = (x + 1 < nx) ? 1 : 0;
-    const size_t offxn = (x > 0) ? 1 : 0;
-    const size_t offyp = (y + 1 < ny) ? static_cast<size_t>(nx) : 0;
-    const size_t offyn = (y > 0) ? static_cast<size_t>(nx) : 0;
+__global__ void __launch_bounds__(BLOCK_THREADS)
+cahnHilliardStepKernel(const double* __restrict__ cold,
+                       double* __restrict__ cnew,
+                       const size_t nx, const size_t ny, const size_t nz,
+                       const double invDx2, const double invDy2, const double invDz2,
+                       const double gamma, const double e_AA, const double e_BB, const double e_AB,
+                       const double dtD) {
+    __shared__ double sc[C_TILE_SIZE];
+    __shared__ double smu[MU_TILE_SIZE];
 
-    #pragma unroll
-    for (int k = 0; k < ZCOARSEN; ++k) {
-        const int z = z0 + k;
-        if (z >= nz) {
-            break;
+    const int tid = static_cast<int>(threadIdx.x) +
+                    static_cast<int>(threadIdx.y) * BLOCK_X +
+                    static_cast<int>(threadIdx.z) * BLOCK_X * BLOCK_Y;
+
+    const long long baseX = static_cast<long long>(blockIdx.x) * BLOCK_X;
+    const long long baseY = static_cast<long long>(blockIdx.y) * BLOCK_Y;
+    const long long baseZ = static_cast<long long>(blockIdx.z) * BLOCK_Z;
+
+    for (int t = tid; t < C_TILE_SIZE; t += BLOCK_THREADS) {
+        const int sx = t % C_TILE_X;
+        const int rem = t / C_TILE_X;
+        const int sy = rem % C_TILE_Y;
+        const int sz = rem / C_TILE_Y;
+
+        long long gx = baseX + sx - 2;
+        long long gy = baseY + sy - 2;
+        long long gz = baseZ + sz - 2;
+        if (gx < 0) gx = 0;
+        else if (gx >= static_cast<long long>(nx)) gx = static_cast<long long>(nx) - 1;
+        if (gy < 0) gy = 0;
+        else if (gy >= static_cast<long long>(ny)) gy = static_cast<long long>(ny) - 1;
+        if (gz < 0) gz = 0;
+        else if (gz >= static_cast<long long>(nz)) gz = static_cast<long long>(nz) - 1;
+
+        sc[t] = cold[idx3(static_cast<size_t>(gx), static_cast<size_t>(gy), static_cast<size_t>(gz), nx, ny)];
+    }
+
+    __syncthreads();
+
+    for (int t = tid; t < MU_TILE_SIZE; t += BLOCK_THREADS) {
+        const int sx = t % MU_TILE_X;
+        const int rem = t / MU_TILE_X;
+        const int sy = rem % MU_TILE_Y;
+        const int sz = rem / MU_TILE_Y;
+
+        const long long gx = baseX + sx - 1;
+        const long long gy = baseY + sy - 1;
+        const long long gz = baseZ + sz - 1;
+
+        if (gx >= 0 && gx < static_cast<long long>(nx) &&
+            gy >= 0 && gy < static_cast<long long>(ny) &&
+            gz >= 0 && gz < static_cast<long long>(nz)) {
+            const int cx = sx + 1;
+            const int cy = sy + 1;
+            const int cz = sz + 1;
+
+            const double cv = sc[cSharedIndex(cx, cy, cz)];
+            const double cxx = (sc[cSharedIndex(cx + 1, cy, cz)] +
+                                sc[cSharedIndex(cx - 1, cy, cz)] -
+                                2.0 * cv) * invDx2;
+            const double cyy = (sc[cSharedIndex(cx, cy + 1, cz)] +
+                                sc[cSharedIndex(cx, cy - 1, cz)] -
+                                2.0 * cv) * invDy2;
+            const double czz = (sc[cSharedIndex(cx, cy, cz + 1)] +
+                                sc[cSharedIndex(cx, cy, cz - 1)] -
+                                2.0 * cv) * invDz2;
+
+            const double t1 = fma(cv + 1.0, e_AA, (cv - 1.0) * e_BB);
+            const double t2 = fma(-(cv + cv), e_AB, t1);
+            const double t3 = fma(4.5, t2, 3.0 * cv);
+            const double t4 = fma(cv * cv, cv, t3);
+            smu[t] = fma(-gamma, cxx + cyy + czz, t4);
+        } else {
+            smu[t] = 0.0;
         }
-        const size_t idx = static_cast<size_t>(z) * plane + base;
-        const size_t offzp = (z + 1 < nz) ? plane : 0;
-        const size_t offzn = (z > 0) ? plane : 0;
+    }
 
-        const double cv = c[idx];
-        const double s = c[idx + offxp] + c[idx - offxn]
-                       + c[idx + offyp] + c[idx - offyn]
-                       + c[idx + offzp] + c[idx - offzn];
+    __syncthreads();
 
-        mu[idx] = (cv * cv * cv + coeff1 * cv + coeff0) - gamma * s;
+    const int lx = static_cast<int>(threadIdx.x);
+    const int ly = static_cast<int>(threadIdx.y);
+    const int lz = static_cast<int>(threadIdx.z);
+
+    const long long gx = baseX + lx;
+    const long long gy = baseY + ly;
+    const long long gz = baseZ + lz;
+
+    if (gx < static_cast<long long>(nx) &&
+        gy < static_cast<long long>(ny) &&
+        gz < static_cast<long long>(nz)) {
+        const long long xm = (gx > 0) ? gx - 1 : 0;
+        const long long xp = (gx + 1 < static_cast<long long>(nx)) ? gx + 1 : static_cast<long long>(nx) - 1;
+        const long long ym = (gy > 0) ? gy - 1 : 0;
+        const long long yp = (gy + 1 < static_cast<long long>(ny)) ? gy + 1 : static_cast<long long>(ny) - 1;
+        const long long zm = (gz > 0) ? gz - 1 : 0;
+        const long long zp = (gz + 1 < static_cast<long long>(nz)) ? gz + 1 : static_cast<long long>(nz) - 1;
+
+        const int ixm = static_cast<int>(xm - baseX) + 1;
+        const int ixp = static_cast<int>(xp - baseX) + 1;
+        const int iym = static_cast<int>(ym - baseY) + 1;
+        const int iyp = static_cast<int>(yp - baseY) + 1;
+        const int izm = static_cast<int>(zm - baseZ) + 1;
+        const int izp = static_cast<int>(zp - baseZ) + 1;
+
+        const int cx = lx + 1;
+        const int cy = ly + 1;
+        const int cz = lz + 1;
+
+        const double muv = smu[muSharedIndex(cx, cy, cz)];
+        const double lap = (smu[muSharedIndex(ixp, cy, cz)] +
+                            smu[muSharedIndex(ixm, cy, cz)] -
+                            2.0 * muv) * invDx2
+                         + (smu[muSharedIndex(cx, iyp, cz)] +
+                            smu[muSharedIndex(cx, iym, cz)] -
+                            2.0 * muv) * invDy2
+                         + (smu[muSharedIndex(cx, cy, izp)] +
+                            smu[muSharedIndex(cx, cy, izm)] -
+                            2.0 * muv) * invDz2;
+
+        const size_t idx = idx3(static_cast<size_t>(gx), static_cast<size_t>(gy), static_cast<size_t>(gz), nx, ny);
+        const double cv = sc[cSharedIndex(lx + 2, ly + 2, lz + 2)];
+        cnew[idx] = fma(dtD, lap, cv);
     }
 }
 
-// Cahn-Hilliard update step
-__global__ void cahnHilliardUpdateKernel(double* __restrict__ c, const double* __restrict__ mu,
-                                         const int nx, const int ny, const int nz,
-                                         const double dtD) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= nx || y >= ny) {
-        return;
-    }
-    const int z0 = (blockIdx.z * blockDim.z + threadIdx.z) * ZCOARSEN;
-
-    const size_t plane = static_cast<size_t>(nx) * static_cast<size_t>(ny);
-    const size_t base = static_cast<size_t>(y) * nx + x;
-    const size_t offxp = (x + 1 < nx) ? 1 : 0;
-    const size_t offxn = (x > 0) ? 1 : 0;
-    const size_t offyp = (y + 1 < ny) ? static_cast<size_t>(nx) : 0;
-    const size_t offyn = (y > 0) ? static_cast<size_t>(nx) : 0;
-
-    #pragma unroll
-    for (int k = 0; k < ZCOARSEN; ++k) {
-        const int z = z0 + k;
-        if (z >= nz) {
-            break;
-        }
-        const size_t idx = static_cast<size_t>(z) * plane + base;
-        const size_t offzp = (z + 1 < nz) ? plane : 0;
-        const size_t offzn = (z > 0) ? plane : 0;
-
-        const double cv = mu[idx];
-        const double s = mu[idx + offxp] + mu[idx - offxn]
-                       + mu[idx + offyp] + mu[idx - offyn]
-                       + mu[idx + offzp] + mu[idx - offzn];
-
-        c[idx] = c[idx] + dtD * (s - 6.0 * cv);
-    }
-}
-
-// Initialize concentration field
-__global__ void initializeConcentrationKernel(double* __restrict__ c,
-                                              const int nx, const int ny, const int nz,
-                                              const unsigned long long vol) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    const int z = blockIdx.z * blockDim.z + threadIdx.z;
-    if (x >= nx || y >= ny || z >= nz) {
-        return;
-    }
-
-    const size_t plane = static_cast<size_t>(nx) * static_cast<size_t>(ny);
-    const size_t idx = static_cast<size_t>(z) * plane + static_cast<size_t>(y) * nx + x;
-    const unsigned long long linear_id = static_cast<unsigned long long>(idx);
-    const double pseudo = static_cast<double>(((linear_id + 1ull) * 1299709ull) % vol) /
-                          static_cast<double>(vol);
-    c[idx] = -1.0 + 2.0 * pseudo;
-}
-
-static inline dim3 makeBlockDim() {
-    return dim3(32, 8, 1);
-}
-
-static inline dim3 makeGridDim(const size_t nx, const size_t ny, const size_t nz) {
-    const dim3 block = makeBlockDim();
-    return dim3(static_cast<unsigned int>((nx + block.x - 1) / block.x),
-                static_cast<unsigned int>((ny + block.y - 1) / block.y),
-                static_cast<unsigned int>((nz + static_cast<size_t>(block.z) * ZCOARSEN - 1) /
-                                          (static_cast<size_t>(block.z) * ZCOARSEN)));
 }
 
 bool validateResult(const std::vector<double>& c, [[maybe_unused]] const size_t nx, [[maybe_unused]] const size_t ny, [[maybe_unused]] const size_t nz) {
-    // Check for NaN or Inf
     for (const auto& val : c) {
         if (std::isnan(val) || std::isinf(val)) {
             printf("Validation failed: found NaN or Inf value\n");
             return false;
         }
     }
-    
-    // Check if values are in reasonable range for concentration field
-    // After Cahn-Hilliard evolution, values should typically remain bounded
+
     double minVal = c[0];
     double maxVal = c[0];
     for (const auto& val : c) {
         minVal = std::min(minVal, val);
         maxVal = std::max(maxVal, val);
     }
-    
+
     printf("Concentration range: [%.6f, %.6f]\n", minVal, maxVal);
-    
-    // Values should generally stay within reasonable bounds
+
     if (maxVal > 10.0 || minVal < -10.0) {
         printf("Validation failed: values out of expected range\n");
         return false;
     }
-    
+
     return true;
 }
 
@@ -174,8 +227,7 @@ int main(int argc, char** argv) {
     int iterations = 20;
     bool validate = false;
     bool printResults = false;
-    
-    // Parse command line arguments
+
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-x") == 0 && i + 1 < argc) {
             nx = atoi(argv[++i]);
@@ -198,16 +250,18 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    
+
     if (ny == 0) ny = nx;
     if (nz == 0) nz = nx;
-    
+
     printf("Cahn-Hilliard Phase Separation Benchmark\n");
     printf("Grid size: %zu x %zu x %zu\n", nx, ny, nz);
     printf("Time steps: %d\n", iterations);
     printf("Validation: %s\n", validate ? "enabled" : "disabled");
-    
-    // Physical parameters
+
+    const double dx = 1.0;
+    const double dy = 1.0;
+    const double dz = 1.0;
     const double dt = 0.01;
     const double e_AA = -(2.0 / 9.0);
     const double e_BB = -(2.0 / 9.0);
@@ -215,83 +269,81 @@ int main(int argc, char** argv) {
     const double gamma = 0.5;
     const double D = 1.0;
 
-    const double coeff0 = 4.5 * (e_AA - e_BB);
-    const double coeff1 = 3.0 + 4.5 * (e_AA + e_BB - 2.0 * e_AB) + 6.0 * gamma;
-    const double dtD = dt * D;
-    
-    size_t gridSize = nx * ny * nz;
-    
-    CUDA_CHECK(cudaSetDevice(0));
+    const size_t gridSize = nx * ny * nz;
+    const size_t bytes = gridSize * sizeof(double);
 
-    double* d_c = nullptr;
-    double* d_mu = nullptr;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_c), gridSize * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_mu), gridSize * sizeof(double)));
+    double* d_cold = nullptr;
+    double* d_cnew = nullptr;
+    checkCuda(cudaMalloc(&d_cold, bytes), "cudaMalloc cold failed");
+    checkCuda(cudaMalloc(&d_cnew, bytes), "cudaMalloc cnew failed");
 
-    const dim3 block = makeBlockDim();
-    const dim3 grid = makeGridDim(nx, ny, nz);
-    const dim3 gridInit(grid.x, grid.y, static_cast<unsigned int>(nz));
-
-    // Initialize concentration field
     printf("Initializing concentration field...\n");
-    initializeConcentrationKernel<<<gridInit, block>>>(d_c,
-                                                   static_cast<int>(nx), static_cast<int>(ny), static_cast<int>(nz),
-                                                   static_cast<unsigned long long>(gridSize));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    
-    // Run simulation
+    const int initThreads = 256;
+    const int initBlocks = static_cast<int>(std::min<size_t>((gridSize + initThreads - 1) / initThreads, 65535));
+    initializeConcentrationKernel<<<initBlocks, initThreads>>>(d_cold, nx, ny, nz);
+    checkCuda(cudaGetLastError(), "initializeConcentrationKernel launch failed");
+    checkCuda(cudaDeviceSynchronize(), "initializeConcentrationKernel execution failed");
+
     printf("Running Cahn-Hilliard simulation...\n");
+
+    const dim3 block(BLOCK_X, BLOCK_Y, BLOCK_Z);
+    const dim3 grid(static_cast<unsigned int>((nx + BLOCK_X - 1) / BLOCK_X),
+                    static_cast<unsigned int>((ny + BLOCK_Y - 1) / BLOCK_Y),
+                    static_cast<unsigned int>((nz + BLOCK_Z - 1) / BLOCK_Z));
+
+    const double invDx2 = 1.0 / (dx * dx);
+    const double invDy2 = 1.0 / (dy * dy);
+    const double invDz2 = 1.0 / (dz * dz);
+    const double dtD = dt * D;
+
     auto start = std::chrono::high_resolution_clock::now();
-    
+
     for (int t = 0; t < iterations; ++t) {
-        // Compute chemical potential
-        computeChemicalPotentialKernel<<<grid, block>>>(d_c, d_mu,
-                                                        static_cast<int>(nx), static_cast<int>(ny), static_cast<int>(nz),
-                                                        gamma, coeff0, coeff1);
-        
-        // Update concentration
-        cahnHilliardUpdateKernel<<<grid, block>>>(d_c, d_mu,
-                                                  static_cast<int>(nx), static_cast<int>(ny), static_cast<int>(nz),
-                                                  dtD);
+        cahnHilliardStepKernel<<<grid, block>>>(d_cold, d_cnew, nx, ny, nz,
+                                                invDx2, invDy2, invDz2,
+                                                gamma, e_AA, e_BB, e_AB, dtD);
+        std::swap(d_cold, d_cnew);
     }
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    
+
+    checkCuda(cudaDeviceSynchronize(), "cahnHilliardStepKernel execution failed");
+
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    
+
     printf("Computation time: %ld ms\n", duration.count());
-    
-    // Calculate performance
+
     double cellUpdates = (double)gridSize * iterations;
     double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
     printf("Performance: %.3f MCellUpdates/s\n", mcups);
 
-    std::vector<double> host_c;
     if (printResults || validate) {
-        host_c.resize(gridSize);
-        CUDA_CHECK(cudaMemcpy(host_c.data(), d_c, gridSize * sizeof(double), cudaMemcpyDeviceToHost));
-    }
-    
-    // Print results for external validation
-    if (printResults) {
-        print_results(host_c, "Concentration");
-    }
-    
-    // Validation
-    if (validate) {
-        printf("Validating result...\n");
-        bool valid = validateResult(host_c, nx, ny, nz);
-        
-        if (valid) {
-            printf("Validation: PASSED\n");
-            return 0;
-        } else {
-            printf("Validation: FAILED\n");
-            return 1;
+        std::vector<double> cold(gridSize);
+        checkCuda(cudaMemcpy(cold.data(), d_cold, bytes, cudaMemcpyDeviceToHost), "cudaMemcpy result failed");
+
+        if (printResults) {
+            print_results(cold, "Concentration");
+        }
+
+        if (validate) {
+            printf("Validating result...\n");
+            bool valid = validateResult(cold, nx, ny, nz);
+
+            if (valid) {
+                printf("Validation: PASSED\n");
+                checkCuda(cudaFree(d_cold), "cudaFree cold failed");
+                checkCuda(cudaFree(d_cnew), "cudaFree cnew failed");
+                return 0;
+            } else {
+                printf("Validation: FAILED\n");
+                checkCuda(cudaFree(d_cold), "cudaFree cold failed");
+                checkCuda(cudaFree(d_cnew), "cudaFree cnew failed");
+                return 1;
+            }
         }
     }
-    
+
+    checkCuda(cudaFree(d_cold), "cudaFree cold failed");
+    checkCuda(cudaFree(d_cnew), "cudaFree cnew failed");
+
     return 0;
 }

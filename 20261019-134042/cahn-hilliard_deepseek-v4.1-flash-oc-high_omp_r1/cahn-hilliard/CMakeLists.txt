@@ -8,8 +8,8 @@ find_package(OpenMP REQUIRED)
 
 add_executable(cahn_hilliard cahn_hilliard.cpp)
 
-# Enable optimizations
+# Enable optimizations and OpenMP
 target_compile_options(cahn_hilliard PRIVATE -O3 -march=native -Wall -Wextra)
 
-# Link OpenMP for shared-memory parallelism and math library
+# Link OpenMP and math library
 target_link_libraries(cahn_hilliard PRIVATE OpenMP::OpenMP_CXX m)

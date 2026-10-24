@@ -4,7 +4,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -13,624 +12,234 @@
 
 #include "../common/results_output.hpp"
 
-// Hybrid MPI + OpenMP + CUDA Cholesky decomposition.
-//
-// Block columns of the matrix are distributed over the MPI ranks (load
-// balanced by block weight) and each rank keeps its block columns on its GPU.
-// The owner of a block column factors its diagonal block on the CPU (a small
-// panel is not efficient on the GPU's FP64 units), solves the panel on the GPU
-// and publishes the finished block column.  On a single node the published
-// block columns travel through an MPI shared-memory window; across nodes they
-// are broadcast.  A one-step lookahead on a high-priority CUDA stream overlaps
-// the next panel factorization with the current trailing updates.  Every rank
-// updates its own trailing block columns with a tuned CUDA GEMM.  OpenMP is
-// used for the host-side matrix assembly, the diagonal block
-// factorizations/inversions and the final validation.
-
-#define CUDA_CHECK(call)                                                          \
-    do {                                                                          \
-        cudaError_t err__ = (call);                                               \
-        if (err__ != cudaSuccess) {                                               \
-            fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(err__), \
-                    __FILE__, __LINE__);                                          \
-            MPI_Abort(MPI_COMM_WORLD, 1);                                         \
-        }                                                                         \
+#define CHOL_CUDA_CHECK(call)                                                   \
+    do {                                                                        \
+        cudaError_t err__ = (call);                                             \
+        if (err__ != cudaSuccess) {                                             \
+            printf("CUDA error %s at %s:%d\n", cudaGetErrorString(err__),       \
+                   __FILE__, __LINE__);                                         \
+            std::exit(1);                                                       \
+        }                                                                       \
     } while (0)
 
-static constexpr int NB = 128;        // block column width
-static constexpr int TM = 64;         // GEMM tile rows
-static constexpr int TN = 64;         // GEMM tile columns
-static constexpr int TK = 16;         // GEMM tile depth
-static constexpr int GTHREADS = 256;  // GEMM threads per block
-
-// ---------------------------------------------------------------------------
-// C(M,N) = alpha * sum_k A(i,k) * B(j,k) + beta * C
-// All matrices are column-major.  A is M x K (lda), B is N x K (ldb) and
-// C is M x N (ldc).  This is the only GEMM shape needed by the algorithm:
-// both the panel solve and the trailing update are products of two matrices
-// stored with the reduction index as column.
-// ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(GTHREADS)
-gemmNTKernel(int M, int N, int K, double alpha,
-             const double* __restrict__ A, int lda,
-             const double* __restrict__ B, int ldb,
-             double beta, double* __restrict__ C, int ldc) {
-    __shared__ double As[TK][TM];
-    __shared__ double Bs[TK][TN];
-
-    const int tid = threadIdx.x;
-    const int tx = tid & 15;
-    const int ty = tid >> 4;
-    const int i0 = blockIdx.x * TM;
-    const int j0 = blockIdx.y * TN;
-
-    double acc[4][4];
-#pragma unroll
-    for (int a = 0; a < 4; ++a)
-#pragma unroll
-        for (int b = 0; b < 4; ++b) acc[a][b] = 0.0;
-
-    for (int k0 = 0; k0 < K; k0 += TK) {
-        // A tile: 4 coalesced double loads per thread
-#pragma unroll
-        for (int q = 0; q < (TM * TK) / GTHREADS; ++q) {
-            const int e = tid + q * GTHREADS;
-            const int i = e % TM;
-            const int k = e / TM;
-            const int gi = i0 + i;
-            const int gk = k0 + k;
-            As[k][i] = (gi < M && gk < K) ? A[(size_t)gi + (size_t)gk * lda] : 0.0;
-        }
-        // B tile
-#pragma unroll
-        for (int q = 0; q < (TN * TK) / GTHREADS; ++q) {
-            const int e = tid + q * GTHREADS;
-            const int j = e % TN;
-            const int k = e / TN;
-            const int gj = j0 + j;
-            const int gk = k0 + k;
-            Bs[k][j] = (gj < N && gk < K) ? B[(size_t)gj + (size_t)gk * ldb] : 0.0;
-        }
-        __syncthreads();
-
-#pragma unroll
-        for (int kk = 0; kk < TK; ++kk) {
-            double ra[4], rb[4];
-#pragma unroll
-            for (int a = 0; a < 4; ++a) ra[a] = As[kk][tx + 16 * a];
-#pragma unroll
-            for (int b = 0; b < 4; ++b) rb[b] = Bs[kk][ty + 16 * b];
-#pragma unroll
-            for (int a = 0; a < 4; ++a)
-#pragma unroll
-                for (int b = 0; b < 4; ++b) acc[a][b] = fma(ra[a], rb[b], acc[a][b]);
-        }
-        __syncthreads();
+struct PinnedBuffer {
+    double* ptr = nullptr;
+    explicit PinnedBuffer(size_t count = 0) { alloc(count); }
+    ~PinnedBuffer() {
+        if (ptr) cudaFreeHost(ptr);
     }
-
-#pragma unroll
-    for (int b = 0; b < 4; ++b) {
-        const int j = j0 + ty + 16 * b;
-        if (j >= N) continue;
-#pragma unroll
-        for (int a = 0; a < 4; ++a) {
-            const int i = i0 + tx + 16 * a;
-            if (i >= M) continue;
-            double* c = &C[(size_t)i + (size_t)j * ldc];
-            *c = (beta == 0.0) ? alpha * acc[a][b] : fma(alpha, acc[a][b], beta * (*c));
-        }
+    void alloc(size_t count) {
+        if (ptr) cudaFreeHost(ptr);
+        ptr = nullptr;
+        const size_t bytes = std::max<size_t>(1, count) * sizeof(double);
+        CHOL_CUDA_CHECK(cudaHostAlloc((void**)&ptr, bytes, cudaHostAllocPortable));
     }
-}
-
-static void gemmNT(cudaStream_t s, int M, int N, int K, double alpha,
-                   const double* A, int lda, const double* B, int ldb,
-                   double beta, double* C, int ldc) {
-    if (M <= 0 || N <= 0 || K <= 0) return;
-    dim3 grid((M + TM - 1) / TM, (N + TN - 1) / TN);
-    gemmNTKernel<<<grid, GTHREADS, 0, s>>>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-__global__ void addDiagonalKernel(double* __restrict__ panel, size_t n,
-                                  int j0, int nbj, double value) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c < nbj) panel[(size_t)c * n + j0 + c] += value;
-}
-
-// ---------------------------------------------------------------------------
-// Host-side 128 x 128 diagonal block factorization and inversion
-// ---------------------------------------------------------------------------
-
-// Factor the lower triangular part of the m x m column-major block in place.
-// Returns the failing diagonal index or -1.
-static int factorDiagonalBlock(double* M, int m) {
-    int j = 0;
-    for (; j + 4 <= m; j += 4) {
-        for (int jj = j; jj < j + 4; ++jj) {
-            double* colj = M + (size_t)jj * m;
-            const double val = colj[jj];
-            if (val <= 0.0) return jj;
-            const double d = sqrt(val);
-            colj[jj] = d;
-            for (int i = jj + 1; i < m; ++i) colj[i] /= d;
-            for (int c = jj + 1; c < j + 4; ++c) {
-                double* colc = M + (size_t)c * m;
-                const double f = colj[c];
-                for (int i = c; i < m; ++i) colc[i] -= colj[i] * f;
-            }
-        }
-        const double* l0 = M + (size_t)j * m;
-        const double* l1 = l0 + m;
-        const double* l2 = l1 + m;
-        const double* l3 = l2 + m;
-        for (int c = j + 4; c < m; ++c) {
-            double* __restrict__ colc = M + (size_t)c * m;
-            const double f0 = l0[c], f1 = l1[c], f2 = l2[c], f3 = l3[c];
-            for (int i = c; i < m; ++i)
-                colc[i] -= (l0[i] * f0 + l1[i] * f1) + (l2[i] * f2 + l3[i] * f3);
-        }
-    }
-    for (; j < m; ++j) {
-        double* colj = M + (size_t)j * m;
-        const double val = colj[j];
-        if (val <= 0.0) return j;
-        const double d = sqrt(val);
-        colj[j] = d;
-        for (int i = j + 1; i < m; ++i) colj[i] /= d;
-        for (int c = j + 1; c < m; ++c) {
-            double* colc = M + (size_t)c * m;
-            const double f = colj[c];
-            for (int i = c; i < m; ++i) colc[i] -= colj[i] * f;
-        }
-    }
-    return -1;
-}
-
-// Inverse of the lower triangular m x m block L (column-major) into Inv,
-// which is an NB x NB column-major buffer (upper part and padding zero).
-static void invertLowerTriangular(const double* L, int m, double* Inv) {
-    std::fill(Inv, Inv + (size_t)NB * NB, 0.0);
-#pragma omp parallel
-    {
-        double x[NB];
-#pragma omp for schedule(static)
-        for (int j = 0; j < m; ++j) {
-            for (int i = 0; i < j; ++i) x[i] = 0.0;
-            x[j] = 1.0 / L[(size_t)j * m + j];
-            for (int i = j + 1; i < m; ++i) {
-                double s = 0.0;
-                for (int k = j; k < i; ++k)
-                    s += L[(size_t)k * m + i] * x[k];
-                x[i] = -s / L[(size_t)i * m + i];
-            }
-            for (int i = j; i < m; ++i) Inv[(size_t)j * NB + i] = x[i];
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Distributed context
-// ---------------------------------------------------------------------------
-struct Dist {
-    int rank = 0;
-    int nprocs = 1;
-    size_t n = 0;
-    int nblk = 0;
-    int nloc = 0;
-
-    std::vector<int> owner;      // block -> rank
-    std::vector<int> localIndex; // block -> local block index on its owner
-    std::vector<int> myBlocks;   // local block index -> global block index
-
-    double* dA = nullptr;       // local block columns, column-major, ld = n
-    double* dPanel = nullptr;   // two block-column buffers, ld = rows
-    double* dInv = nullptr;     // NB x NB inverse of the diagonal factor
-    double* hPanel = nullptr;   // pinned host staging for the block column
-    double* hInv = nullptr;     // pinned host staging for the inverse
-    double* hDiag = nullptr;    // pinned host staging for the diagonal block
-
-    cudaStream_t stream = nullptr;   // trailing updates and panel uploads
-    cudaStream_t streamHi = nullptr; // critical-path lookahead work
-    cudaEvent_t evH2D[2];            // panel buffer ready on the device
-
-    // When all ranks live on one node, finished block columns are published in
-    // an MPI shared-memory window.  Every rank then copies the owner's data
-    // straight to its GPU instead of paying for a large MPI_Bcast.
-    bool useShm = false;
-    MPI_Comm nodeComm = MPI_COMM_NULL;
-    int nodeSize = 1;
-    int nodeRank = 0;
-    MPI_Win win = MPI_WIN_NULL;
-    std::vector<double*> shmSlots; // world rank -> published block column
-
-    double* panel(int lj) const { return dA + (size_t)lj * NB * n; }
-    double* panelBuf(int b) const { return dPanel + (size_t)b * n * NB; }
-
-    void setupOwnership() {
-        nblk = (int)((n + NB - 1) / NB);
-        owner.assign(nblk, 0);
-        localIndex.assign(nblk, 0);
-        myBlocks.clear();
-
-        // Greedy load-balanced assignment: the trailing update weight of block
-        // column k is roughly (n - k*NB)^2.  Assign the largest blocks first to
-        // the least loaded rank.  This keeps ranks balanced although the lower
-        // triangle has non-uniform block weights.
-        std::vector<std::pair<long long, int>> order;
-        order.reserve(nblk);
-        for (int k = 0; k < nblk; ++k) {
-            const long long rows = (long long)n - (long long)k * NB;
-            order.push_back({rows * rows, k});
-        }
-        std::sort(order.begin(), order.end(),
-                  [](const std::pair<long long, int>& a,
-                     const std::pair<long long, int>& b) {
-                      if (a.first != b.first) return a.first > b.first;
-                      return a.second < b.second;
-                  });
-        std::vector<long long> load(nprocs, 0);
-        for (const auto& w : order) {
-            int best = 0;
-            for (int r = 1; r < nprocs; ++r)
-                if (load[r] < load[best]) best = r;
-            owner[w.second] = best;
-            load[best] += w.first;
-        }
-        std::vector<int> counter(nprocs, 0);
-        for (int k = 0; k < nblk; ++k) {
-            const int r = owner[k];
-            localIndex[k] = counter[r]++;
-        }
-        nloc = counter[rank];
-        for (int k = 0; k < nblk; ++k)
-            if (owner[k] == rank) myBlocks.push_back(k);
-    }
-
-    void allocateWork() {
-        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        int loPrio = 0, hiPrio = 0;
-        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&loPrio, &hiPrio));
-        CUDA_CHECK(cudaStreamCreateWithPriority(&streamHi, cudaStreamNonBlocking,
-                                                hiPrio));
-        CUDA_CHECK(cudaEventCreateWithFlags(&evH2D[0], cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&evH2D[1], cudaEventDisableTiming));
-
-        const size_t panelCap = std::max<size_t>(1, 2 * n * (size_t)NB);
-        CUDA_CHECK(cudaMalloc(&dPanel, panelCap * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&dInv, (size_t)NB * NB * sizeof(double)));
-        CUDA_CHECK(cudaMallocHost(&hPanel, panelCap * sizeof(double)));
-        CUDA_CHECK(cudaMallocHost(&hInv, (size_t)NB * NB * sizeof(double)));
-        CUDA_CHECK(cudaMallocHost(&hDiag, (size_t)NB * NB * sizeof(double)));
-
-        MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank,
-                            MPI_INFO_NULL, &nodeComm);
-        MPI_Comm_size(nodeComm, &nodeSize);
-        MPI_Comm_rank(nodeComm, &nodeRank);
-        if (nodeSize == nprocs) {
-            useShm = true;
-            double* base = nullptr;
-            const size_t slotBytes =
-                std::max<size_t>(1, n * (size_t)NB) * sizeof(double);
-            MPI_Win_allocate_shared((MPI_Aint)slotBytes, sizeof(double),
-                                    MPI_INFO_NULL, MPI_COMM_WORLD, &base, &win);
-            shmSlots.resize(nprocs);
-            for (int r = 0; r < nprocs; ++r) {
-                MPI_Aint sz = 0;
-                int disp = 0;
-                MPI_Win_shared_query(win, r, &sz, &disp, &shmSlots[r]);
-                if (cudaHostRegister(shmSlots[r], (size_t)sz,
-                                     cudaHostRegisterPortable) != cudaSuccess)
-                    cudaGetLastError();
-            }
-        }
-    }
-
-    void freeWork() {
-        if (useShm) {
-            for (double* p : shmSlots)
-                if (cudaHostUnregister(p) != cudaSuccess) cudaGetLastError();
-            MPI_Win_free(&win);
-        }
-        if (nodeComm != MPI_COMM_NULL) MPI_Comm_free(&nodeComm);
-        CUDA_CHECK(cudaFree(dPanel));
-        CUDA_CHECK(cudaFree(dInv));
-        CUDA_CHECK(cudaFreeHost(hPanel));
-        CUDA_CHECK(cudaFreeHost(hInv));
-        CUDA_CHECK(cudaFreeHost(hDiag));
-        CUDA_CHECK(cudaEventDestroy(evH2D[0]));
-        CUDA_CHECK(cudaEventDestroy(evH2D[1]));
-        CUDA_CHECK(cudaStreamDestroy(streamHi));
-        CUDA_CHECK(cudaStreamDestroy(stream));
-    }
+    double* data() { return ptr; }
 };
 
-// Generate the same symmetric positive definite matrix as the reference code.
-// Every rank generates the complete B (the random stream has to be identical),
-// transposes it into the column-major layout, and then computes only its own
-// block columns of A = B * B^T on the GPU.  OpenMP performs the transpose.
-static void generatePositiveDefiniteMatrix(Dist& D) {
-    const size_t n = D.n;
-    const size_t nn = n * n;
+__global__ void diagFactorKernel(double* A, size_t ld, size_t b, int* fail,
+                                 unsigned long long* failIdx, size_t kb) {
+    __shared__ int sFail;
+    if (threadIdx.x == 0) sFail = 0;
+    __syncthreads();
 
-    std::vector<double> B(nn);
+    for (size_t j = 0; j < b; ++j) {
+        if (threadIdx.x == 0) {
+            double sum = 0.0;
+            for (size_t k = 0; k < j; ++k) {
+                const double v = A[j * ld + k];
+                sum += v * v;
+            }
+            const double val = A[j * ld + j] - sum;
+            if (val <= 0.0) {
+                sFail = 1;
+                *fail = 1;
+                *failIdx = (unsigned long long)(kb + j);
+                A[j * ld + j] = 0.0;
+            } else {
+                A[j * ld + j] = sqrt(val);
+            }
+        }
+        __syncthreads();
+        if (sFail) return;
+
+        const double d = A[j * ld + j];
+        for (size_t i = j + 1 + threadIdx.x; i < b; i += blockDim.x) {
+            double sum = 0.0;
+            for (size_t k = 0; k < j; ++k) {
+                sum += A[i * ld + k] * A[j * ld + k];
+            }
+            A[i * ld + j] = (A[i * ld + j] - sum) / d;
+        }
+        __syncthreads();
+    }
+
+    for (size_t idx = threadIdx.x; idx < b * b; idx += blockDim.x) {
+        const size_t r = idx / b;
+        const size_t c = idx % b;
+        if (c > r) A[r * ld + c] = 0.0;
+    }
+}
+
+__global__ void trsmKernel(double* A, size_t ld, const double* L11, size_t b,
+                           size_t startRow, size_t lrows, size_t kb) {
+    constexpr int ROWS_PER_BLOCK = 16;
+    extern __shared__ double sx[];
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const size_t row =
+        startRow + (size_t)blockIdx.x * ROWS_PER_BLOCK + (size_t)warp;
+    if (row >= lrows) return;
+
+    double* x = sx + (size_t)warp * b;
+    double* a = A + row * ld + kb;
+    for (size_t j = 0; j < b; ++j) {
+        const double* Lj = L11 + j * b;
+        double part = 0.0;
+        for (size_t t = (size_t)lane; t < j; t += 32) {
+            part += Lj[t] * x[t];
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            part += __shfl_down_sync(0xffffffffu, part, off);
+        }
+        if (lane == 0) {
+            const double v = (a[j] - part) / Lj[j];
+            x[j] = v;
+            a[j] = v;
+        }
+        __syncwarp();
+    }
+}
+
+__global__ void updateKernel(double* A, size_t ld, const double* panelAll,
+                             size_t b, size_t kb, size_t trailingStart,
+                             const size_t* rowGlobal,
+                             const int* blockPackedStart, size_t NB,
+                             size_t rowStartLocal, size_t lrows, size_t n) {
+    constexpr int TILE = 32;
+    constexpr int BK = 32;
+    __shared__ double As[TILE][BK + 1];
+    __shared__ double Bs[TILE][BK + 1];
+
+    const size_t colBase = trailingStart + (size_t)blockIdx.x * TILE;
+    const size_t rowLocalBase = rowStartLocal + (size_t)blockIdx.y * TILE;
+
+    if (colBase >= n) return;
+    const size_t lastIdx = (rowLocalBase + (size_t)TILE < lrows) ? (rowLocalBase + (size_t)TILE) : lrows;
+    const size_t gRowMax = rowGlobal[lastIdx - 1];
+    if (colBase > gRowMax) return;
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const size_t r = rowLocalBase + (size_t)ty;
+    const size_t c = colBase + (size_t)tx;
+    const size_t gRow = (r < lrows) ? rowGlobal[r] : 0;
+    const bool valid = (r < lrows) && (c < n) && (c <= gRow);
+    double acc = valid ? A[r * ld + c] : 0.0;
+
+    for (size_t kk = 0; kk < b; kk += BK) {
+        const size_t kidx = kk + (size_t)tx;
+        As[ty][tx] =
+            (r < lrows && kidx < b) ? A[r * ld + kb + kidx] : 0.0;
+        const size_t cRow = colBase + (size_t)ty;
+        size_t bidx = 0;
+        if (cRow < n) {
+            const size_t bcol = cRow / NB;
+            const size_t packedRow =
+                (size_t)blockPackedStart[bcol] + (cRow - bcol * NB);
+            bidx = packedRow * b + kidx;
+        }
+        Bs[ty][tx] =
+            (cRow < n && kidx < b) ? panelAll[bidx] : 0.0;
+        __syncthreads();
+#pragma unroll
+        for (int k2 = 0; k2 < BK; ++k2) {
+            if (kk + (size_t)k2 < b) {
+                acc -= As[ty][k2] * Bs[tx][k2];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid) A[r * ld + c] = acc;
+}
+
+__global__ void gemmKernel(const double* X, const double* Y, double* C,
+                           size_t ldx, size_t ldy, size_t ldc,
+                           const size_t* rowGlobalX, size_t M, size_t N,
+                           size_t K) {
+    constexpr int TILE = 32;
+    constexpr int BK = 32;
+    __shared__ double As[TILE][BK + 1];
+    __shared__ double Bs[TILE][BK + 1];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const size_t r = (size_t)blockIdx.y * TILE + (size_t)ty;
+    const size_t c = (size_t)blockIdx.x * TILE + (size_t)tx;
+    if (r >= M && c >= N) return;
+
+    double acc = 0.0;
+    for (size_t kk = 0; kk < K; kk += BK) {
+        const size_t kidx = kk + (size_t)tx;
+        const size_t xRow =
+            (r < M) ? (rowGlobalX ? rowGlobalX[r] : r) : 0;
+        As[ty][tx] = (r < M && kidx < K) ? X[xRow * ldx + kidx] : 0.0;
+        const size_t cRow = (size_t)blockIdx.x * TILE + (size_t)ty;
+        Bs[ty][tx] =
+            (cRow < N && kidx < K) ? Y[cRow * ldy + kidx] : 0.0;
+        __syncthreads();
+#pragma unroll
+        for (int k2 = 0; k2 < BK; ++k2) {
+            if (kk + (size_t)k2 < K) {
+                acc += As[ty][k2] * Bs[tx][k2];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (r < M && c < N) C[r * ldc + c] = acc;
+}
+
+__global__ void addDiagKernel(double* C, size_t ld, size_t rows,
+                              const size_t* rowGlobal, double v) {
+    const size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < rows) C[r * ld + rowGlobal[r]] += v;
+}
+
+static size_t blockRows(const size_t n, const size_t NB, const size_t b) {
+    const size_t gb = b * NB;
+    return std::min(NB, n - gb);
+}
+
+static void generatePositiveDefiniteMatrixLocal(std::vector<double>& A_local,
+                                                const size_t n,
+                                                const size_t lrows,
+                                                double* dA, double* dB,
+                                                const size_t* dRowGlobal) {
+    std::vector<double> B(n * n);
     unsigned int seed = 42;
-    for (size_t i = 0; i < nn; ++i)
+    for (size_t i = 0; i < n * n; ++i) {
         B[i] = (rand_r(&seed) / (double)RAND_MAX) - 0.5;
-
-    std::vector<double> Bcm(nn);
-    const int BS = 32;
-    const int ni = (int)n;
-#pragma omp parallel for collapse(2) schedule(static)
-    for (int ii = 0; ii < ni; ii += BS) {
-        for (int kk = 0; kk < ni; kk += BS) {
-            const int iEnd = std::min(ii + BS, ni);
-            const int kEnd = std::min(kk + BS, ni);
-            for (int i = ii; i < iEnd; ++i)
-                for (int k = kk; k < kEnd; ++k)
-                    Bcm[(size_t)k * n + i] = B[(size_t)i * n + k];
-        }
-    }
-    B.clear();
-    B.shrink_to_fit();
-
-    double* dB = nullptr;
-    CUDA_CHECK(cudaMalloc(&dB, std::max<size_t>(1, nn) * sizeof(double)));
-    CUDA_CHECK(cudaMemcpyAsync(dB, Bcm.data(), nn * sizeof(double),
-                               cudaMemcpyHostToDevice, D.stream));
-    Bcm.clear();
-    Bcm.shrink_to_fit();
-
-    for (int lj = 0; lj < D.nloc; ++lj) {
-        const int k = D.myBlocks[lj];
-        const int j0 = k * NB;
-        const int nbj = (int)std::min<size_t>(NB, n - (size_t)j0);
-        gemmNT(D.stream, (int)n, nbj, (int)n, 1.0, dB, (int)n, dB + j0, (int)n,
-               0.0, D.panel(lj), (int)n);
-        addDiagonalKernel<<<(nbj + 127) / 128, 128, 0, D.stream>>>(
-            D.panel(lj), n, j0, nbj, (double)n);
-        CUDA_CHECK(cudaGetLastError());
-    }
-    CUDA_CHECK(cudaStreamSynchronize(D.stream));
-    CUDA_CHECK(cudaFree(dB));
-}
-
-// Save one finished block column (column-major, ld = rows) into the column-major
-// result buffer on rank 0.  Each column is a single contiguous copy, which is
-// much cheaper than transposing every panel on the critical path.
-static void storeBlock(const Dist& D, std::vector<double>& resultCol, int k,
-                       const double* src) {
-    const size_t n = D.n;
-    const size_t k0 = (size_t)k * NB;
-    const int rows = (int)(n - k0);
-    const int nbk = std::min<int>(NB, rows);
-#pragma omp parallel for schedule(static)
-    for (int c = 0; c < nbk; ++c) {
-        const size_t j = k0 + (size_t)c;
-        std::memcpy(&resultCol[j * n + k0], src + (size_t)c * rows,
-                    (size_t)rows * sizeof(double));
-    }
-}
-
-// Convert the column-major lower factor into the row-major result layout and
-// zero the upper triangle.  Tiled to keep both source and destination accesses
-// cache friendly.
-static void transposeResult(const Dist& D, const std::vector<double>& resultCol,
-                            std::vector<double>& A) {
-    const int n = (int)D.n;
-    const int B = 32;
-#pragma omp parallel for collapse(2) schedule(static)
-    for (int ii = 0; ii < n; ii += B) {
-        for (int jj = 0; jj < n; jj += B) {
-            const int iEnd = std::min(ii + B, n);
-            const int jEnd = std::min(jj + B, n);
-            for (int i = ii; i < iEnd; ++i) {
-                double* dst = &A[(size_t)i * n];
-                for (int j = jj; j < jEnd; ++j)
-                    dst[j] = (i >= j) ? resultCol[(size_t)j * n + i] : 0.0;
-            }
-        }
-    }
-}
-
-// Returns true on success.  On rank 0, A receives the complete row-major factor
-// (upper triangular part zero) exactly like the sequential implementation.
-static bool choleskyDecomposition(Dist& D, std::vector<double>& A,
-                                  std::vector<double>& resultCol,
-                                  bool assembleResult) {
-    const int n = (int)D.n;
-    const int me = D.rank;
-    cudaStream_t s = D.stream;
-    cudaStream_t hi = D.streamHi;
-    int globalFailure = -1;
-
-    if (D.nblk == 0) return true;
-
-    // Owner-only: factor and publish block column k.  Runs on the high-priority
-    // stream so that it can overlap with the trailing updates of the previous
-    // block column.  The output goes to the device buffer with parity k & 1.
-    auto preparePanel = [&](int k) -> int {
-        const int k0 = k * NB;
-        const int rows = n - k0;
-        const int nbk = std::min(NB, rows);
-        const int b = k & 1;
-        double* base = D.panel(D.localIndex[k]);
-
-        CUDA_CHECK(cudaMemcpy2DAsync(D.hDiag, (size_t)nbk * sizeof(double),
-                                     base + k0, (size_t)n * sizeof(double),
-                                     (size_t)nbk * sizeof(double), nbk,
-                                     cudaMemcpyDeviceToHost, hi));
-        CUDA_CHECK(cudaStreamSynchronize(hi));
-
-        const int f = factorDiagonalBlock(D.hDiag, nbk);
-        if (f >= 0) return k0 + f;
-
-        invertLowerTriangular(D.hDiag, nbk, D.hInv);
-        CUDA_CHECK(cudaMemcpyAsync(D.dInv, D.hInv,
-                                   (size_t)NB * NB * sizeof(double),
-                                   cudaMemcpyHostToDevice, hi));
-        // L_ik = A_ik * Inv^T for the rows below the diagonal block.
-        gemmNT(hi, rows - nbk, nbk, nbk, 1.0, base + k0 + nbk, n, D.dInv,
-               NB, 0.0, D.panelBuf(b) + nbk, rows);
-        // The diagonal block of the finished block column.
-        CUDA_CHECK(cudaMemcpy2DAsync(D.panelBuf(b), (size_t)rows * sizeof(double),
-                                     D.hDiag, (size_t)nbk * sizeof(double),
-                                     (size_t)nbk * sizeof(double), nbk,
-                                     cudaMemcpyHostToDevice, hi));
-        // Publish the complete block column for the other ranks.
-        double* publish = D.useShm ? D.shmSlots[me] : D.hPanel;
-        CUDA_CHECK(cudaMemcpyAsync(publish, D.panelBuf(b),
-                                   (size_t)rows * nbk * sizeof(double),
-                                   cudaMemcpyDeviceToHost, hi));
-        CUDA_CHECK(cudaStreamSynchronize(hi));
-        if (D.useShm) MPI_Win_sync(D.win);
-        return -1;
-    };
-
-    // Publish block column 0 before entering the pipeline.
-    int localFailure = -1;
-    if (me == D.owner[0]) localFailure = preparePanel(0);
-    MPI_Allreduce(&localFailure, &globalFailure, 1, MPI_INT, MPI_MAX,
-                  MPI_COMM_WORLD);
-    if (globalFailure >= 0) {
-        if (me == 0)
-            printf("Error: Matrix is not positive definite at diagonal element %d\n",
-                   globalFailure);
-        return false;
-    }
-    if (D.useShm) {
-        MPI_Barrier(MPI_COMM_WORLD);
-        MPI_Win_sync(D.win);
-    } else {
-        MPI_Bcast(D.hPanel, n * std::min<int>(NB, n), MPI_DOUBLE, D.owner[0],
-                  MPI_COMM_WORLD);
-    }
-    const double* published = D.useShm ? D.shmSlots[D.owner[0]] : D.hPanel;
-
-    for (int k = 0; k < D.nblk; ++k) {
-        const int k0 = k * NB;
-        const int rows = n - k0;
-        const int nbk = std::min(NB, rows);
-        const int b = k & 1;
-        const int next = k + 1;
-        const bool haveNext = next < D.nblk;
-        const int nextRoot = haveNext ? D.owner[next] : -1;
-
-        // Upload the current block column on the normal stream.  The previous
-        // parity buffer is written by the lookahead on the high-priority stream.
-        CUDA_CHECK(cudaMemcpyAsync(D.panelBuf(b), published,
-                                   (size_t)rows * nbk * sizeof(double),
-                                   cudaMemcpyHostToDevice, s));
-        CUDA_CHECK(cudaEventRecord(D.evH2D[b], s));
-
-        if (me == 0 && assembleResult) storeBlock(D, resultCol, k, published);
-
-        // Lookahead owner updates and factors the next diagonal block while the
-        // other ranks (and its own remaining block columns) process panel k.
-        if (haveNext && me == nextRoot) {
-            const int nk0 = next * NB;
-            const int nrows = n - nk0;
-            const int nnbk = std::min(NB, nrows);
-            const int lj = D.localIndex[next];
-            const double* p = D.panelBuf(b) + (nk0 - k0);
-            CUDA_CHECK(cudaStreamWaitEvent(hi, D.evH2D[b], 0));
-            gemmNT(hi, n - nk0, nnbk, nbk, -1.0, p, rows, p, rows, 1.0,
-                   D.panel(lj) + nk0, n);
-        }
-
-        // Trailing updates for block columns j > k.  The block column needed by
-        // the lookahead owner is handled on the high-priority stream instead.
-        for (int lj = 0; lj < D.nloc; ++lj) {
-            const int jblk = D.myBlocks[lj];
-            if (jblk <= k) continue;
-            if (haveNext && jblk == next && me == nextRoot) continue;
-            const int j0 = jblk * NB;
-            const int nbj = std::min<int>(NB, n - j0);
-            const double* p = D.panelBuf(b) + (j0 - k0);
-            gemmNT(s, n - j0, nbj, nbk, -1.0, p, rows, p, rows, 1.0,
-                   D.panel(lj) + j0, n);
-        }
-
-        // The shared slot (or host staging buffer) may be reused only after the
-        // upload has consumed it.
-        CUDA_CHECK(cudaEventSynchronize(D.evH2D[b]));
-        if (D.useShm) MPI_Barrier(MPI_COMM_WORLD);
-
-        if (!haveNext) break;
-
-        localFailure = -1;
-        if (me == nextRoot) localFailure = preparePanel(next);
-        MPI_Allreduce(&localFailure, &globalFailure, 1, MPI_INT, MPI_MAX,
-                      MPI_COMM_WORLD);
-        if (globalFailure >= 0) break;
-
-        if (D.useShm) {
-            MPI_Barrier(MPI_COMM_WORLD);
-            MPI_Win_sync(D.win);
-            published = D.shmSlots[nextRoot];
-        } else {
-            const int nrows = n - next * NB;
-            const int nnbk = std::min(NB, nrows);
-            MPI_Bcast(D.hPanel, nrows * nnbk, MPI_DOUBLE, nextRoot,
-                      MPI_COMM_WORLD);
-            published = D.hPanel;
-        }
     }
 
-    CUDA_CHECK(cudaStreamSynchronize(s));
-    CUDA_CHECK(cudaStreamSynchronize(hi));
+    CHOL_CUDA_CHECK(
+        cudaMemcpy(dB, B.data(), n * n * sizeof(double), cudaMemcpyHostToDevice));
 
-    if (me == 0 && assembleResult && globalFailure < 0)
-        transposeResult(D, resultCol, A);
+    if (lrows > 0) {
+        dim3 block(32, 32);
+        dim3 grid((unsigned)((n + 31) / 32), (unsigned)((lrows + 31) / 32));
+        gemmKernel<<<grid, block>>>(dB, dB, dA, n, n, n, dRowGlobal, lrows, n, n);
+        CHOL_CUDA_CHECK(cudaGetLastError());
 
-    if (globalFailure >= 0 && me == 0)
-        printf("Error: Matrix is not positive definite at diagonal element %d\n",
-               globalFailure);
-    return globalFailure < 0;
-}
+        const unsigned blocks = (unsigned)((lrows + 255) / 256);
+        addDiagKernel<<<blocks, 256>>>(dA, n, lrows, dRowGlobal, (double)n);
+        CHOL_CUDA_CHECK(cudaGetLastError());
 
-// ---------------------------------------------------------------------------
-// Validation (rank 0, OpenMP).  The original matrix is gathered block column by
-// block column from the distributed GPU copies.
-// ---------------------------------------------------------------------------
-static void assembleOriginal(Dist& D, const double* dAorig,
-                             std::vector<double>& Aorig) {
-    const size_t n = D.n;
-    const size_t perBlock = (size_t)NB * n;
-    const size_t count = (size_t)D.nloc * perBlock;
-    std::vector<double> buf(std::max<size_t>(1, count));
-    if (count)
-        CUDA_CHECK(cudaMemcpy(buf.data(), dAorig, count * sizeof(double),
-                              cudaMemcpyDeviceToHost));
-
-    auto addBlocks = [&](int r, const double* data) {
-        for (int k = 0; k < D.nblk; ++k) {
-            if (D.owner[k] != r) continue;
-            const int j0 = k * NB;
-            const int nbj = (int)std::min<size_t>(NB, n - (size_t)j0);
-            const double* blk = data + (size_t)D.localIndex[k] * perBlock;
-            for (int c = 0; c < nbj; ++c) {
-                const size_t j = (size_t)j0 + c;
-                const double* col = blk + (size_t)c * n;
-                for (size_t i = 0; i < n; ++i) Aorig[i * n + j] = col[i];
-            }
-        }
-    };
-
-    if (D.rank == 0) {
-        addBlocks(0, buf.data());
-        for (int r = 1; r < D.nprocs; ++r) {
-            int nlocR = 0;
-            for (int k = 0; k < D.nblk; ++k)
-                if (D.owner[k] == r) ++nlocR;
-            const size_t cnt = (size_t)nlocR * perBlock;
-            std::vector<double> rbuf(cnt);
-            if (cnt)
-                MPI_Recv(rbuf.data(), (int)cnt, MPI_DOUBLE, r, 7781,
-                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            if (cnt) addBlocks(r, rbuf.data());
-        }
-    } else if (count) {
-        MPI_Send(buf.data(), (int)count, MPI_DOUBLE, 0, 7781, MPI_COMM_WORLD);
+        CHOL_CUDA_CHECK(cudaMemcpy(A_local.data(), dA,
+                                   lrows * n * sizeof(double),
+                                   cudaMemcpyDeviceToHost));
     }
 }
 
@@ -639,27 +248,31 @@ static bool validateCholesky(const std::vector<double>& L,
                              const size_t n) {
     std::vector<double> reconstructed(n * n);
 
-#pragma omp parallel for schedule(static)
-    for (long long ii = 0; ii < (long long)n; ++ii) {
-        const size_t i = (size_t)ii;
-        const double* Li = &L[i * n];
-        double* Ri = &reconstructed[i * n];
-        for (size_t j = 0; j < n; ++j) {
-            const double* Lj = &L[j * n];
-            double sum = 0.0;
-            for (size_t k = 0; k < n; ++k) sum += Li[k] * Lj[k];
-            Ri[j] = sum;
-        }
-    }
+    double* dL = nullptr;
+    double* dR = nullptr;
+    CHOL_CUDA_CHECK(cudaMalloc(&dL, n * n * sizeof(double)));
+    CHOL_CUDA_CHECK(cudaMalloc(&dR, n * n * sizeof(double)));
+    CHOL_CUDA_CHECK(cudaMemcpy(dL, L.data(), n * n * sizeof(double),
+                               cudaMemcpyHostToDevice));
+    dim3 block(32, 32);
+    dim3 grid((unsigned)((n + 31) / 32), (unsigned)((n + 31) / 32));
+    gemmKernel<<<grid, block>>>(dL, dL, dR, n, n, n, nullptr, n, n, n);
+    CHOL_CUDA_CHECK(cudaGetLastError());
+    CHOL_CUDA_CHECK(cudaMemcpy(reconstructed.data(), dR,
+                               n * n * sizeof(double),
+                               cudaMemcpyDeviceToHost));
+    CHOL_CUDA_CHECK(cudaFree(dL));
+    CHOL_CUDA_CHECK(cudaFree(dR));
 
     double maxError = 0.0;
     double relError = 0.0;
+
 #pragma omp parallel for schedule(static) reduction(max : maxError) \
     reduction(max : relError)
-    for (long long ii = 0; ii < (long long)(n * n); ++ii) {
-        const double error = fabs(reconstructed[(size_t)ii] - A_orig[(size_t)ii]);
+    for (size_t i = 0; i < n * n; ++i) {
+        const double error = fabs(reconstructed[i] - A_orig[i]);
         maxError = std::max(maxError, error);
-        const double rel = error / (fabs(A_orig[(size_t)ii]) + 1e-10);
+        const double rel = error / (fabs(A_orig[i]) + 1e-10);
         relError = std::max(relError, rel);
     }
 
@@ -670,10 +283,194 @@ static bool validateCholesky(const std::vector<double>& L,
         printf("Validation failed: relative error too large\n");
         return false;
     }
+
     return true;
 }
 
-void printUsage(const char* progName) {
+static std::vector<double> gatherMatrix(const std::vector<double>& A_local,
+                                        const size_t n, const size_t NB,
+                                        const size_t m, const int rank,
+                                        const int size, MPI_Comm comm) {
+    std::vector<int> counts(size), displs(size);
+    int total = 0;
+    for (int r = 0; r < size; ++r) {
+        size_t rows = 0;
+        for (size_t b = (size_t)r; b < m; b += (size_t)size) {
+            rows += blockRows(n, NB, b);
+        }
+        counts[r] = (int)(rows * n);
+        displs[r] = total;
+        total += counts[r];
+    }
+
+    std::vector<double> packed;
+    if (rank == 0) packed.resize((size_t)total);
+    MPI_Gatherv(A_local.data(), (int)(A_local.size()), MPI_DOUBLE,
+                packed.data(), counts.data(), displs.data(), MPI_DOUBLE, 0,
+                comm);
+
+    std::vector<double> full;
+    if (rank == 0) {
+        full.assign(n * n, 0.0);
+#pragma omp parallel for schedule(static)
+        for (int r = 0; r < size; ++r) {
+            size_t off = (size_t)displs[r];
+            for (size_t b = (size_t)r; b < m; b += (size_t)size) {
+                const size_t gb = b * NB;
+                const size_t rows = blockRows(n, NB, b);
+                std::memcpy(&full[gb * n], &packed[off],
+                            rows * n * sizeof(double));
+                off += rows * n;
+            }
+        }
+    }
+    return full;
+}
+
+static bool choleskyDistributed(
+    double* dA, const size_t n, const size_t NB, const size_t m,
+    const int rank, const int size, MPI_Comm comm,
+    const std::vector<size_t>& blocks, const std::vector<size_t>& offsets,
+    const size_t* dRowGlobal, double* panelLocal, double* panelPacked,
+    size_t packedStride, int* dBlockPackedStart, double* dPanelAll,
+    double* dL11, int* dFail, unsigned long long* dFailIdx) {
+    const size_t lrows = offsets.back();
+    const size_t nOwn = blocks.size();
+    std::vector<double> L11Host(NB * NB);
+    bool ok = true;
+
+    for (size_t k = 0; k < m; ++k) {
+        const size_t kb = k * NB;
+        const size_t b = std::min(NB, n - kb);
+        const size_t trailingStart = kb + b;
+        const int owner = (int)(k % (size_t)size);
+        const size_t ownerIdx = k / (size_t)size;
+
+        int localFail = 0;
+        unsigned long long localFailIdx = 0;
+
+        if (rank == owner) {
+            const size_t diagLocalRow = offsets[ownerIdx];
+            CHOL_CUDA_CHECK(cudaMemset(dFail, 0, sizeof(int)));
+            diagFactorKernel<<<1, 256>>>(dA + diagLocalRow * n + kb, n, b,
+                                         dFail, dFailIdx, kb);
+            CHOL_CUDA_CHECK(cudaGetLastError());
+            CHOL_CUDA_CHECK(
+                cudaMemcpy(&localFail, dFail, sizeof(int), cudaMemcpyDeviceToHost));
+            if (localFail) {
+                CHOL_CUDA_CHECK(cudaMemcpy(&localFailIdx, dFailIdx,
+                                           sizeof(unsigned long long),
+                                           cudaMemcpyDeviceToHost));
+            }
+            CHOL_CUDA_CHECK(cudaMemcpy2D(
+                L11Host.data(), b * sizeof(double),
+                dA + diagLocalRow * n + kb, n * sizeof(double),
+                b * sizeof(double), b, cudaMemcpyDeviceToHost));
+        }
+
+        MPI_Bcast(L11Host.data(), (int)(b * b), MPI_DOUBLE, owner, comm);
+
+        int globalFail = 0;
+        unsigned long long globalFailIdx = 0;
+        MPI_Allreduce(&localFail, &globalFail, 1, MPI_INT, MPI_MAX, comm);
+        MPI_Allreduce(&localFailIdx, &globalFailIdx, 1, MPI_UNSIGNED_LONG_LONG,
+                      MPI_MAX, comm);
+        if (globalFail) {
+            if (rank == 0) {
+                printf("Error: Matrix is not positive definite at diagonal "
+                       "element %llu\n",
+                       globalFailIdx);
+            }
+            ok = false;
+            break;
+        }
+
+        CHOL_CUDA_CHECK(
+            cudaMemcpy(dL11, L11Host.data(), b * b * sizeof(double),
+                       cudaMemcpyHostToDevice));
+
+        size_t firstGT = 0;
+        while (firstGT < nOwn && blocks[firstGT] <= k) ++firstGT;
+
+        if (firstGT < nOwn) {
+            const size_t startLocal = offsets[firstGT];
+            const size_t nrows = lrows - startLocal;
+            constexpr int rowsPerBlock = 16;
+            const int threads = rowsPerBlock * 32;
+            const int grid = (int)((nrows + rowsPerBlock - 1) / rowsPerBlock);
+            const size_t shmem = (size_t)rowsPerBlock * b * sizeof(double);
+            trsmKernel<<<grid, threads, shmem>>>(dA, n, dL11, b, startLocal,
+                                                 lrows, kb);
+            CHOL_CUDA_CHECK(cudaGetLastError());
+        }
+
+        size_t firstGE = 0;
+        while (firstGE < nOwn && blocks[firstGE] < k) ++firstGE;
+
+        double* packedBuf = panelPacked + (k & 1) * packedStride;
+        std::vector<int> blockPackedStart(m, 0);
+        std::vector<size_t> rankRows(size, 0);
+        size_t maxRows = 0;
+        for (int r = 0; r < size; ++r) {
+            size_t rows = 0;
+            for (size_t bb = (size_t)r; bb < m; bb += (size_t)size) {
+                if (bb >= k) rows += blockRows(n, NB, bb);
+            }
+            rankRows[r] = rows;
+            maxRows = std::max(maxRows, rows);
+        }
+        for (int r = 0; r < size; ++r) {
+            size_t localCum = 0;
+            for (size_t bb = (size_t)r; bb < m; bb += (size_t)size) {
+                if (bb < k) continue;
+                blockPackedStart[bb] =
+                    (int)((size_t)r * maxRows + localCum);
+                localCum += blockRows(n, NB, bb);
+            }
+        }
+
+        size_t packedRows = 0;
+        if (firstGE < nOwn) {
+            const size_t startLocal = offsets[firstGE];
+            packedRows = lrows - startLocal;
+            CHOL_CUDA_CHECK(cudaMemcpy2D(
+                panelLocal, b * sizeof(double),
+                dA + startLocal * n + kb, n * sizeof(double),
+                b * sizeof(double), packedRows, cudaMemcpyDeviceToHost));
+        }
+        std::fill(panelLocal + packedRows * b, panelLocal + maxRows * b, 0.0);
+
+        MPI_Allgather(panelLocal, (int)(maxRows * b), MPI_DOUBLE,
+                      packedBuf, (int)(maxRows * b), MPI_DOUBLE, comm);
+
+        const size_t paddedTotal = (size_t)size * maxRows * b;
+        CHOL_CUDA_CHECK(
+            cudaMemcpy(dBlockPackedStart, blockPackedStart.data(),
+                       m * sizeof(int), cudaMemcpyHostToDevice));
+        CHOL_CUDA_CHECK(cudaMemcpyAsync(dPanelAll, packedBuf,
+                                        paddedTotal * sizeof(double),
+                                        cudaMemcpyHostToDevice, 0));
+
+        if (firstGT < nOwn) {
+            const size_t rowStartLocal = offsets[firstGT];
+            const size_t nrows = lrows - rowStartLocal;
+            const size_t ncols = n - trailingStart;
+            dim3 block(32, 32);
+            dim3 grid((unsigned)((ncols + 31) / 32),
+                      (unsigned)((nrows + 31) / 32));
+            updateKernel<<<grid, block>>>(dA, n, dPanelAll, b, kb,
+                                          trailingStart, dRowGlobal,
+                                          dBlockPackedStart, NB,
+                                          rowStartLocal, lrows, n);
+            CHOL_CUDA_CHECK(cudaGetLastError());
+        }
+    }
+
+    CHOL_CUDA_CHECK(cudaDeviceSynchronize());
+    return ok;
+}
+
+static void printUsage(const char* progName) {
     printf("Usage: %s [options]\n", progName);
     printf("Options:\n");
     printf("  -n <num>     Matrix size (default: 512)\n");
@@ -683,13 +480,29 @@ void printUsage(const char* progName) {
 }
 
 int main(int argc, char** argv) {
-    int provided = 0;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+    MPI_Init(&argc, &argv);
 
-    Dist D;
-    MPI_Comm_rank(MPI_COMM_WORLD, &D.rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &D.nprocs);
-    const bool root = D.rank == 0;
+    int rank = 0, size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int localRank = 0, localSize = 1;
+    MPI_Comm localComm;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0,
+                        MPI_INFO_NULL, &localComm);
+    MPI_Comm_rank(localComm, &localRank);
+    MPI_Comm_size(localComm, &localSize);
+
+    int deviceCount = 0;
+    cudaGetDeviceCount(&deviceCount);
+    if (deviceCount > 0) {
+        CHOL_CUDA_CHECK(cudaSetDevice(localRank % deviceCount));
+    }
+
+    int maxThreads = omp_get_max_threads();
+    int procs = omp_get_num_procs();
+    int suggested = std::max(1, procs / std::max(1, localSize));
+    omp_set_num_threads(std::min(maxThreads, suggested));
 
     size_t n = 512;
     bool validate = false;
@@ -703,11 +516,11 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-r") == 0) {
             printResults = true;
         } else if (strcmp(argv[i], "-h") == 0) {
-            if (root) printUsage(argv[0]);
+            if (rank == 0) printUsage(argv[0]);
             MPI_Finalize();
             return 0;
         } else {
-            if (root) {
+            if (rank == 0) {
                 printf("Unknown option: %s\n", argv[i]);
                 printUsage(argv[0]);
             }
@@ -716,111 +529,166 @@ int main(int argc, char** argv) {
         }
     }
 
-    // One GPU per rank (round-robin over the node-local ranks).
-    {
-        MPI_Comm local = MPI_COMM_NULL;
-        MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, D.rank,
-                            MPI_INFO_NULL, &local);
-        int localRank = 0;
-        MPI_Comm_rank(local, &localRank);
-        MPI_Comm_free(&local);
-        int ndev = 0;
-        CUDA_CHECK(cudaGetDeviceCount(&ndev));
-        if (ndev == 0) {
-            if (root) fprintf(stderr, "No CUDA device found\n");
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-        CUDA_CHECK(cudaSetDevice(localRank % ndev));
-    }
-
-    if (root) {
-        printf("Cholesky Decomposition Benchmark\n");
-        printf("Matrix size: %zu x %zu\n", n, n);
-        printf("Validation: %s\n", validate ? "enabled" : "disabled");
-    }
-
-    D.n = n;
-    D.setupOwnership();
-
-    CUDA_CHECK(cudaMalloc(&D.dA,
-                          std::max<size_t>(1, n * (size_t)D.nloc * NB) *
-                              sizeof(double)));
-    std::vector<double> A;
-    if (root) A.resize(n * n);
-    const bool assembleResult = printResults || validate;
-    std::vector<double> resultCol;
-    if (root && assembleResult) resultCol.resize(n * n);
-    D.allocateWork();
-
-    if (root) printf("Generating positive definite matrix...\n");
-    generatePositiveDefiniteMatrix(D);
-
-    double* dAorig = nullptr;
-    if (validate) {
-        const size_t bytes = std::max<size_t>(1, n * (size_t)D.nloc * NB) *
-                             sizeof(double);
-        CUDA_CHECK(cudaMalloc(&dAorig, bytes));
-        CUDA_CHECK(cudaMemcpyAsync(dAorig, D.dA, bytes,
-                                   cudaMemcpyDeviceToDevice, D.stream));
-        CUDA_CHECK(cudaStreamSynchronize(D.stream));
-    }
-
-    if (root) printf("Computing Cholesky decomposition...\n");
-    CUDA_CHECK(cudaStreamSynchronize(D.stream));
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    auto start = std::chrono::high_resolution_clock::now();
-    bool success = choleskyDecomposition(D, A, resultCol, assembleResult);
-    auto end = std::chrono::high_resolution_clock::now();
-    const double localMs =
-        std::chrono::duration<double, std::milli>(end - start).count();
-    double maxMs = 0.0;
-    MPI_Allreduce(&localMs, &maxMs, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-
-    D.freeWork();
-    CUDA_CHECK(cudaFree(D.dA));
-    D.dA = nullptr;
-
-    if (!success) {
-        if (root) printf("Cholesky decomposition failed\n");
-        if (dAorig) CUDA_CHECK(cudaFree(dAorig));
+    if (n == 0) {
+        if (rank == 0) printf("Matrix size must be positive\n");
         MPI_Finalize();
         return 1;
     }
 
-    int rc = 0;
-    if (root) {
-        const long ms = (long)llround(maxMs);
-        printf("Computation time: %ld ms\n", ms);
+    const size_t NB = (n < 512) ? 64 : 128;
+    const size_t m = (n + NB - 1) / NB;
 
-        const double ops = (double)n * n * n / 3.0;
-        const double gflops = ops / (maxMs / 1000.0) / 1e9;
-        printf("Performance: %.3f GFLOPS\n", gflops);
+    std::vector<size_t> blocks, offsets;
+    for (size_t b = (size_t)rank; b < m; b += (size_t)size) {
+        blocks.push_back(b);
+    }
+    offsets.resize(blocks.size() + 1);
+    offsets[0] = 0;
+    for (size_t j = 0; j < blocks.size(); ++j) {
+        offsets[j + 1] = offsets[j] + blockRows(n, NB, blocks[j]);
+    }
+    const size_t lrows = offsets.back();
 
-        if (printResults) print_results(A, "CholeskyL");
+    std::vector<size_t> rowGlobal(lrows);
+    for (size_t j = 0; j < blocks.size(); ++j) {
+        const size_t gb = blocks[j] * NB;
+        const size_t rows = blockRows(n, NB, blocks[j]);
+        for (size_t i = 0; i < rows; ++i) {
+            rowGlobal[offsets[j] + i] = gb + i;
+        }
     }
 
-    if (validate) {
-        std::vector<double> A_orig;
-        if (root) A_orig.resize(n * n);
-        assembleOriginal(D, dAorig, A_orig);
-        CUDA_CHECK(cudaFree(dAorig));
-        dAorig = nullptr;
+    if (rank == 0) {
+        printf("Cholesky Decomposition Benchmark\n");
+        printf("Matrix size: %zu x %zu\n", n, n);
+        printf("Validation: %s\n", validate ? "enabled" : "disabled");
+        printf("Generating positive definite matrix...\n");
+    }
 
-        if (root) {
+    std::vector<double> A_local(lrows * n);
+
+    double* dA = nullptr;
+    double* dB = nullptr;
+    size_t* dRowGlobal = nullptr;
+    const size_t dASize = std::max<size_t>(1, lrows * n);
+    CHOL_CUDA_CHECK(cudaMalloc(&dA, dASize * sizeof(double)));
+    CHOL_CUDA_CHECK(cudaMalloc(&dB, n * n * sizeof(double)));
+    CHOL_CUDA_CHECK(cudaMalloc(&dRowGlobal, std::max<size_t>(1, lrows) * sizeof(size_t)));
+    if (lrows > 0) {
+        CHOL_CUDA_CHECK(cudaMemcpy(dRowGlobal, rowGlobal.data(),
+                                   lrows * sizeof(size_t),
+                                   cudaMemcpyHostToDevice));
+    }
+
+    generatePositiveDefiniteMatrixLocal(A_local, n, lrows, dA, dB, dRowGlobal);
+    CHOL_CUDA_CHECK(cudaFree(dB));
+    dB = nullptr;
+
+    std::vector<double> A_orig;
+    if (validate) {
+        A_orig = gatherMatrix(A_local, n, NB, m, rank, size, MPI_COMM_WORLD);
+    }
+
+    double* dL11 = nullptr;
+    double* dPanelAll = nullptr;
+    int* dFail = nullptr;
+    unsigned long long* dFailIdx = nullptr;
+    const size_t panelCapRows = ((m + (size_t)size - 1) / (size_t)size) * NB;
+    const size_t panelCapElems = panelCapRows * (size_t)size * NB;
+    CHOL_CUDA_CHECK(cudaMalloc(&dL11, NB * NB * sizeof(double)));
+    CHOL_CUDA_CHECK(cudaMalloc(&dPanelAll, panelCapElems * sizeof(double)));
+    CHOL_CUDA_CHECK(cudaMalloc(&dFail, sizeof(int)));
+    CHOL_CUDA_CHECK(cudaMalloc(&dFailIdx, sizeof(unsigned long long)));
+
+    PinnedBuffer panelLocal(std::max<size_t>(1, panelCapRows * NB));
+    PinnedBuffer panelPacked(std::max<size_t>(1, 2 * panelCapElems));
+    int* dBlockPackedStart = nullptr;
+    CHOL_CUDA_CHECK(cudaMalloc(&dBlockPackedStart,
+                               std::max<size_t>(1, m) * sizeof(int)));
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (rank == 0) printf("Computing Cholesky decomposition...\n");
+
+    auto start = std::chrono::high_resolution_clock::now();
+    const bool success = choleskyDistributed(
+        dA, n, NB, m, rank, size, MPI_COMM_WORLD, blocks, offsets, dRowGlobal,
+        panelLocal.data(), panelPacked.data(), panelCapElems,
+        dBlockPackedStart, dPanelAll, dL11, dFail, dFailIdx);
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+    if (!success) {
+        if (rank == 0) printf("Cholesky decomposition failed\n");
+        cudaFree(dA);
+        cudaFree(dRowGlobal);
+        cudaFree(dBlockPackedStart);
+        cudaFree(dL11);
+        cudaFree(dPanelAll);
+        cudaFree(dFail);
+        cudaFree(dFailIdx);
+        MPI_Comm_free(&localComm);
+        MPI_Finalize();
+        return 1;
+    }
+
+    if (lrows > 0) {
+        CHOL_CUDA_CHECK(cudaMemcpy(A_local.data(), dA,
+                                   lrows * n * sizeof(double),
+                                   cudaMemcpyDeviceToHost));
+    }
+
+    std::vector<double> A_full =
+        gatherMatrix(A_local, n, NB, m, rank, size, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+#pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                A_full[i * n + j] = 0.0;
+            }
+        }
+
+        printf("Computation time: %ld ms\n", duration.count());
+        const double ops = (double)n * n * n / 3.0;
+        const double gflops = ops / (duration.count() / 1000.0) / 1e9;
+        printf("Performance: %.3f GFLOPS\n", gflops);
+
+        if (printResults) {
+            print_results(A_full, "CholeskyL");
+        }
+
+        if (validate) {
             printf("Validating result...\n");
-            const bool valid = validateCholesky(A, A_orig, n);
+            const bool valid = validateCholesky(A_full, A_orig, n);
             if (valid) {
                 printf("Validation: PASSED\n");
             } else {
                 printf("Validation: FAILED\n");
-                rc = 1;
             }
+
+            cudaFree(dA);
+            cudaFree(dRowGlobal);
+            cudaFree(dBlockPackedStart);
+            cudaFree(dL11);
+            cudaFree(dPanelAll);
+            cudaFree(dFail);
+            cudaFree(dFailIdx);
+            MPI_Comm_free(&localComm);
+            MPI_Finalize();
+            return valid ? 0 : 1;
         }
-    } else if (dAorig) {
-        CUDA_CHECK(cudaFree(dAorig));
     }
 
+    cudaFree(dA);
+    cudaFree(dRowGlobal);
+    cudaFree(dBlockPackedStart);
+    cudaFree(dL11);
+    cudaFree(dPanelAll);
+    cudaFree(dFail);
+    cudaFree(dFailIdx);
+    MPI_Comm_free(&localComm);
     MPI_Finalize();
-    return rc;
+    return 0;
 }

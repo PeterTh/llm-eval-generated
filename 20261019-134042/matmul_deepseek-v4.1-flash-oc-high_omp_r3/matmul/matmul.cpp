@@ -1,4 +1,3 @@
-#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -16,120 +15,64 @@ constexpr double getPseudoRndValue(const size_t N, const size_t i, const size_t 
 }
 
 void initMatrix(std::vector<double>& mat, const size_t N) {
-    double* __restrict data = mat.data();
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < N; ++i) {
-        double* __restrict row = data + i * N;
         for (size_t j = 0; j < N; ++j) {
-            row[j] = getPseudoRndValue(N, i, j);
+            mat[i * N + j] = getPseudoRndValue(N, i, j);
         }
     }
 }
 
-// Cache-blocked, register-tiled, shared-memory parallel matrix multiplication.
-//
-// The output is partitioned into square blocks that are distributed over the
-// available OpenMP threads.  Inside a block the work is done by a small
-// register micro-kernel (MR rows x NR columns) so that every value of B is
-// reused in registers for MR different rows instead of being re-read from
-// memory.  The k dimension is additionally split into KC chunks so the panel
-// of B used by a block stays cache resident and is reused by all row
-// micro-tiles of that block.
-//
-// The block size is derived from the number of threads, which gives enough
-// independent blocks for good load balance and parallel scalability while
-// keeping the blocks large enough to amortise memory traffic.
 void matrixMultiply(const std::vector<double>& A, const std::vector<double>& B, 
                     std::vector<double>& C, const size_t N) {
-    const double* __restrict a = A.data();
-    const double* __restrict b = B.data();
-    double* __restrict c = C.data();
+    if (N == 0) return;
 
-    const size_t maxThreads = static_cast<size_t>(omp_get_max_threads());
-    const size_t side = static_cast<size_t>(
-        std::ceil(std::sqrt(static_cast<double>(4 * maxThreads))));
-    size_t block = std::min<size_t>(64, std::max<size_t>(1, N / std::max<size_t>(1, side)));
-    if (block >= 32) {
-        block = (block / 32) * 32;
+    const size_t threads = static_cast<size_t>(omp_get_max_threads());
+
+    size_t targetRows;
+    if (N <= 1024) {
+        targetRows = 2;
+    } else {
+        targetRows = 65536 / N;
+        if (targetRows > 16) targetRows = 16;
     }
-    block = std::max<size_t>(1, std::min(block, N));
-    const size_t numBlocks = (N + block - 1) / block;
+    if (targetRows < 1) targetRows = 1;
 
-    constexpr size_t MR = 8;    // rows per register micro-tile
-    constexpr size_t NR = 4;    // columns per register micro-tile
-    constexpr size_t KC = 320;  // k-chunk size (cache blocking of B)
+    size_t rowsPerBlock = N / (2 * threads);
+    if (rowsPerBlock < 1) rowsPerBlock = 1;
+    if (rowsPerBlock > targetRows) rowsPerBlock = targetRows;
 
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (size_t bi = 0; bi < numBlocks; ++bi) {
-        for (size_t bj = 0; bj < numBlocks; ++bj) {
-            const size_t i0 = bi * block;
-            const size_t j0 = bj * block;
-            const size_t iEnd = std::min(i0 + block, N);
-            const size_t jEnd = std::min(j0 + block, N);
-            const size_t iFull = i0 + ((iEnd - i0) / MR) * MR;
-            const size_t jFull = j0 + ((jEnd - j0) / NR) * NR;
+    #pragma omp parallel for schedule(static)
+    for (size_t i0 = 0; i0 < N; i0 += rowsPerBlock) {
+        const size_t iEnd = (i0 + rowsPerBlock < N) ? i0 + rowsPerBlock : N;
 
-            for (size_t kk = 0; kk < N; kk += KC) {
-                const size_t kEnd = std::min(kk + KC, N);
+        for (size_t i = i0; i < iEnd; ++i) {
+            double* c = &C[i * N];
+            for (size_t j = 0; j < N; ++j) {
+                c[j] = 0.0;
+            }
+        }
 
-                for (size_t jj = j0; jj < jFull; jj += NR) {
-                    for (size_t ii = i0; ii < iFull; ii += MR) {
-                        double acc[MR][NR] = {};
-
-                        for (size_t k = kk; k < kEnd; ++k) {
-                            const double* __restrict bk = b + k * N + jj;
-                            double bv[NR];
-                            #pragma omp simd
-                            for (size_t q = 0; q < NR; ++q) {
-                                bv[q] = bk[q];
-                            }
-                            #pragma GCC unroll 8
-                            for (size_t r = 0; r < MR; ++r) {
-                                const double av = a[(ii + r) * N + k];
-                                #pragma omp simd
-                                for (size_t q = 0; q < NR; ++q) {
-                                    acc[r][q] += av * bv[q];
-                                }
-                            }
-                        }
-
-                        for (size_t r = 0; r < MR; ++r) {
-                            double* __restrict cr = c + (ii + r) * N + jj;
-                            if (kk == 0) {
-                                #pragma omp simd
-                                for (size_t q = 0; q < NR; ++q) {
-                                    cr[q] = acc[r][q];
-                                }
-                            } else {
-                                #pragma omp simd
-                                for (size_t q = 0; q < NR; ++q) {
-                                    cr[q] += acc[r][q];
-                                }
-                            }
-                        }
-                    }
+        const size_t kPairEnd = N & ~static_cast<size_t>(1);
+        for (size_t k = 0; k < kPairEnd; ++k) {
+            const double* b = &B[k * N];
+            for (size_t i = i0; i < iEnd; ++i) {
+                const double a = A[i * N + k];
+                double* c = &C[i * N];
+                for (size_t j = 0; j < N; ++j) {
+                    c[j] += a * b[j];
                 }
             }
+        }
 
-            // Remainder columns (and the last partial column micro-tile).
-            for (size_t i = i0; i < iFull; ++i) {
-                for (size_t j = jFull; j < jEnd; ++j) {
-                    double sum = 0.0;
-                    for (size_t k = 0; k < N; ++k) {
-                        sum += a[i * N + k] * b[k * N + j];
-                    }
-                    c[i * N + j] = sum;
-                }
-            }
-
-            // Remainder rows (including the bottom-right corner).
-            for (size_t i = iFull; i < iEnd; ++i) {
-                for (size_t j = j0; j < jEnd; ++j) {
-                    double sum = 0.0;
-                    for (size_t k = 0; k < N; ++k) {
-                        sum += a[i * N + k] * b[k * N + j];
-                    }
-                    c[i * N + j] = sum;
+        if (N & 1) {
+            const size_t k = N - 1;
+            const double* b = &B[k * N];
+            for (size_t i = i0; i < iEnd; ++i) {
+                const double a = A[i * N + k];
+                double* c = &C[i * N];
+                for (size_t j = 0; j < N; ++j) {
+                    c[j] = std::fma(a, b[j], c[j]);
                 }
             }
         }
@@ -201,6 +144,13 @@ int main(int argc, char** argv) {
     printf("Matrix Multiplication Benchmark\n");
     printf("Matrix size: %zu x %zu\n", N, N);
     printf("Validation: %s\n", validate ? "enabled" : "disabled");
+
+    const int requestedThreads = omp_get_max_threads();
+    size_t workThreads = N / 8;
+    if (workThreads < 1) workThreads = 1;
+    if (workThreads < static_cast<size_t>(requestedThreads)) {
+        omp_set_num_threads(static_cast<int>(workThreads));
+    }
     
     // Allocate matrices
     std::vector<double> A(N * N);

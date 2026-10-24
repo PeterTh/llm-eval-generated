@@ -1,493 +1,621 @@
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
-#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
 
 #include <mpi.h>
+#include <omp.h>
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
 
 #include "../common/results_output.hpp"
 
-// Hybrid MPI + OpenMP + CUDA blocked Cholesky decomposition.
+// Hybrid MPI + OpenMP + CUDA Cholesky decomposition.
 //
-// The matrix is distributed over a 2D process grid using block-cyclic tile
-// ownership.  Every tile update is a dense GEMM executed with cuBLAS on the
-// GPU owned by the MPI rank, panels are exchanged with MPI collectives and the
-// host side (matrix generation / validation) is parallelised with OpenMP.
+// Rows are distributed cyclically over MPI ranks (row i -> rank i % P).
+// Each rank keeps its local rows on the GPU in column-major order and the
+// factor is produced with a blocked, left-looking algorithm:
+//
+//   * A tiled CUDA kernel assembles A = B * B^T (+ n*I) for the local rows.
+//   * For a panel of CHOL_B columns [K, K+B) every rank packs the panel rows'
+//     already known prefix (columns < K) plus the panel diagonal block of A
+//     and exchanges it with a single compact MPI_Allgatherv.
+//   * A CUDA kernel computes the partial dot products over the prefix for all
+//     panel rows (replicated) and all trailing local rows.  This is the bulk
+//     of the work and runs with many warps in flight.
+//   * Rank 0 finishes the small B x B panel block on the host (using the GPU
+//     prefix partial sums), broadcasts it, and the remaining of each panel
+//     column is propagated to the trailing rows by short CUDA kernels.
+//   * The tail of the next panel's prefix is read back from each owner's
+//     local factor rows.
+//
+// The accumulation order of every entry is kept identical to the reference
+// sequential implementation (groups of four products with ordered additions
+// followed by an FMA tail), so the produced factor is bit-for-bit the same.
+// OpenMP parallelizes the panel scatter, result assembly and validation.
 
-namespace {
+#define CHOL_B 64
+static_assert(CHOL_B % 4 == 0, "panel width must be a multiple of 4");
 
-inline void cudaCheck(cudaError_t err, const char* what) {
-    if (err != cudaSuccess) {
-        std::fprintf(stderr, "CUDA error (%s): %s\n", what, cudaGetErrorString(err));
-        MPI_Abort(MPI_COMM_WORLD, 1);
+#define CUDA_CHECK(call)                                                        \
+    do {                                                                        \
+        cudaError_t err__ = (call);                                             \
+        if (err__ != cudaSuccess) {                                             \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,    \
+                    cudaGetErrorString(err__));                                 \
+            MPI_Abort(MPI_COMM_WORLD, 1);                                       \
+        }                                                                       \
+    } while (0)
+
+#define MPI_CHECK(call)                                                         \
+    do {                                                                        \
+        int ierr__ = (call);                                                    \
+        if (ierr__ != MPI_SUCCESS) {                                            \
+            fprintf(stderr, "MPI error at %s:%d (code %d)\n", __FILE__,         \
+                    __LINE__, ierr__);                                          \
+            MPI_Abort(MPI_COMM_WORLD, 1);                                       \
+        }                                                                       \
+    } while (0)
+
+// Exact replication of the reference accumulation: groups of four independent
+// products whose rounded values are added in order, with a fused tail.
+__device__ __forceinline__ double cholDotFrom(double acc, const double* a,
+                                              long long astep, const double* b,
+                                              long long bstep, int k0, int k1) {
+    a += static_cast<long long>(k0) * astep;
+    b += static_cast<long long>(k0) * bstep;
+    int k = k0;
+    for (; k + 3 < k1; k += 4) {
+        const double p0 = __dmul_rn(a[0], b[0]);
+        const double p1 = __dmul_rn(a[astep], b[bstep]);
+        const double p2 = __dmul_rn(a[2 * astep], b[2 * bstep]);
+        const double p3 = __dmul_rn(a[3 * astep], b[3 * bstep]);
+        acc = __dadd_rn(acc, p0);
+        acc = __dadd_rn(acc, p1);
+        acc = __dadd_rn(acc, p2);
+        acc = __dadd_rn(acc, p3);
+        a += 4 * astep;
+        b += 4 * bstep;
     }
+    for (; k < k1; ++k) {
+        acc = __fma_rn(a[0], b[0], acc);
+        a += astep;
+        b += bstep;
+    }
+    return acc;
 }
 
-inline void cublasCheck(cublasStatus_t status, const char* what) {
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        std::fprintf(stderr, "cuBLAS error (%s): code %d\n", what, static_cast<int>(status));
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-}
+// Assemble A = B * B^T (+ n*I on the diagonal) for this rank's local rows.
+// Each thread owns one output element and accumulates over k in the exact
+// reference order, while tiles of B are staged through shared memory.
+#define GEN_TI 32
+#define GEN_TJ 32
+#define GEN_TK 32
 
-// Unblocked Cholesky factorisation of one diagonal tile (column-major).
-// The accumulation order is kept ascending in k so the result matches the
-// sequential reference as closely as possible.
-__global__ void potrfKernel(double* A, int ld, int m, int offset, int* info) {
-    const int tid = threadIdx.x;
-    const int nthreads = blockDim.x;
+__global__ void cholGenerateKernel(double* __restrict__ A,
+                                   const double* __restrict__ B, int n, int m,
+                                   int rank, int nprocs) {
+    __shared__ double si[GEN_TI][GEN_TK];
+    __shared__ double sj[GEN_TJ][GEN_TK];
 
-    for (int j = 0; j < m; ++j) {
-        if (tid == 0) {
-            double sum = 0.0;
-            for (int k = 0; k < j; ++k) {
-                const double v = A[k * ld + j];
-                sum += v * v;
-            }
-            double val = A[j * ld + j] - sum;
-            if (val <= 0.0) {
-                if (info != nullptr) {
-                    *info = offset + j + 1;
+    const int l0 = static_cast<int>(blockIdx.y) * GEN_TI;
+    const int j0 = static_cast<int>(blockIdx.x) * GEN_TJ;
+    const int ti = static_cast<int>(threadIdx.y);
+    const int tj = static_cast<int>(threadIdx.x);
+    const int l = l0 + ti;
+    const int j = j0 + tj;
+
+    double acc = 0.0;
+    for (int base = 0; base < n; base += GEN_TK) {
+        const int len = min(GEN_TK, n - base);
+        for (int idx = ti * GEN_TJ + tj; idx < (GEN_TI + GEN_TJ) * GEN_TK;
+             idx += GEN_TI * GEN_TJ) {
+            if (idx < GEN_TI * GEN_TK) {
+                const int r = idx / GEN_TK;
+                const int kk = idx - r * GEN_TK;
+                const int li = l0 + r;
+                if (li < m && kk < len) {
+                    const long long gi =
+                        static_cast<long long>(rank) +
+                        static_cast<long long>(li) *
+                            static_cast<long long>(nprocs);
+                    si[r][kk] = B[static_cast<size_t>(gi) *
+                                      static_cast<size_t>(n) + base + kk];
+                } else {
+                    si[r][kk] = 0.0;
                 }
-                val = 0.0;
+            } else {
+                const int t = idx - GEN_TI * GEN_TK;
+                const int c = t / GEN_TK;
+                const int kk = t - c * GEN_TK;
+                const int cj = j0 + c;
+                if (cj < n && kk < len) {
+                    sj[c][kk] = B[static_cast<size_t>(cj) *
+                                      static_cast<size_t>(n) + base + kk];
+                } else {
+                    sj[c][kk] = 0.0;
+                }
             }
-            A[j * ld + j] = sqrt(val);
         }
         __syncthreads();
-
-        const double diag = A[j * ld + j];
-        for (int i = j + 1 + tid; i < m; i += nthreads) {
-            double sum = 0.0;
-            for (int k = 0; k < j; ++k) {
-                sum += A[k * ld + i] * A[k * ld + j];
-            }
-            A[j * ld + i] = (A[j * ld + i] - sum) / diag;
+        if (l < m && j < n) {
+            acc = cholDotFrom(acc, &si[ti][0], 1, &sj[tj][0], 1, 0, len);
         }
         __syncthreads();
     }
-}
 
-struct Distribution {
-    int rank = 0;
-    int size = 1;
-    int pr = 1;
-    int pc = 1;
-    int myrow = 0;
-    int mycol = 0;
-    int n = 0;
-    int nb = 256;
-    int N = 0;   // n padded up to a multiple of nb
-    int nbr = 0; // number of block rows / columns
-    int local_nbr = 0;
-    int local_nbc = 0;
-    int local_ntiles = 0;
-    MPI_Comm comm = MPI_COMM_WORLD;
-
-    int tileIndex(int bi, int bj) const {
-        const int lp = (bi - myrow) / pr;
-        const int lq = (bj - mycol) / pc;
-        return lp * local_nbc + lq;
-    }
-};
-
-int chooseProcessRows(int size) {
-    int best = 1;
-    for (int d = 1; d * d <= size; ++d) {
-        if (size % d == 0) {
-            best = d;
+    if (l < m && j < n) {
+        const long long gi = static_cast<long long>(rank) +
+                             static_cast<long long>(l) *
+                                 static_cast<long long>(nprocs);
+        if (gi == static_cast<long long>(j)) {
+            acc += static_cast<double>(n);
         }
-    }
-    return best;
-}
-
-int chooseBlockSize(int n, int maxGridDim) {
-    int nb = 256;
-    while (nb > 32 && ((n + nb - 1) / nb) < maxGridDim) {
-        nb >>= 1;
-    }
-    return nb;
-}
-
-// Generate the same pseudo random matrix B as the sequential reference.
-void generateRandomMatrix(int n, std::vector<double>& B) {
-    B.resize(static_cast<size_t>(n) * static_cast<size_t>(n));
-    unsigned int seed = 42;
-    for (size_t i = 0; i < B.size(); ++i) {
-        B[i] = (rand_r(&seed) / static_cast<double>(RAND_MAX)) - 0.5;
+        A[static_cast<size_t>(j) * static_cast<size_t>(m) +
+          static_cast<size_t>(l)] = acc;
     }
 }
 
-// Transpose the column blocks of B that this rank needs for A = B * B^T so the
-// inner tile generation loop is contiguous and vectorisable.
-void buildTransposedBlocks(const Distribution& dist, const std::vector<double>& B,
-                           std::vector<double>& Bt) {
-    const int n = dist.n;
-    const int nb = dist.nb;
-    Bt.assign(static_cast<size_t>(dist.local_nbc) * nb * n, 0.0);
+// Partial sums over the already finished prefix columns [0, K) for the
+// trailing local rows.  Several rows share one block so the panel data is
+// reused from the L1 cache.
+#define CHOL_ROWS 4
 
-    for (int lq = 0; lq < dist.local_nbc; ++lq) {
-        const int bj = dist.mycol + lq * dist.pc;
-        double* dst = Bt.data() + static_cast<size_t>(lq) * nb * n;
-        for (int k = 0; k < n; ++k) {
-            for (int j = 0; j < nb; ++j) {
-                const int gj = bj * nb + j;
-                dst[static_cast<size_t>(k) * nb + j] =
-                    (gj < n) ? B[static_cast<size_t>(gj) * n + k] : 0.0;
-            }
+__global__ void cholSKernel(const double* __restrict__ L,
+                            const double* __restrict__ pT,
+                            double* __restrict__ S, int m, int K, int Bact,
+                            int localRows, int lStart) {
+    const int tid = static_cast<int>(threadIdx.x);
+    const int blk = static_cast<int>(blockIdx.x);
+    if (blk < Bact) {
+        const int b = tid;
+        const int bp = blk;
+        if (b >= Bact || bp < b) {
+            return;
         }
+        const double acc =
+            cholDotFrom(0.0, pT + bp, CHOL_B, pT + b, CHOL_B, 0, K);
+        S[static_cast<size_t>(bp) * CHOL_B + b] = acc;
+        return;
     }
+    const int b = tid % CHOL_B;
+    if (b >= Bact) {
+        return;
+    }
+    const int r = tid / CHOL_B;
+    const int l = lStart + (blk - Bact) * CHOL_ROWS + r;
+    if (l >= localRows) {
+        return;
+    }
+    const double acc =
+        cholDotFrom(0.0, L + static_cast<size_t>(l), m, pT + b, CHOL_B, 0, K);
+    S[(static_cast<size_t>(CHOL_B) + static_cast<size_t>(l)) * CHOL_B + b] =
+        acc;
 }
 
-// Compute the lower-triangular tiles owned by this rank.
-void generateLocalTiles(const Distribution& dist, const std::vector<double>& B,
-                        const std::vector<double>& Bt, std::vector<double>& tiles) {
-    const int n = dist.n;
-    const int nb = dist.nb;
-    const size_t tileElems = static_cast<size_t>(nb) * nb;
-    tiles.assign(static_cast<size_t>(dist.local_ntiles) * tileElems, 0.0);
-
-#pragma omp parallel for collapse(2) schedule(dynamic)
-    for (int lp = 0; lp < dist.local_nbr; ++lp) {
-        for (int lq = 0; lq < dist.local_nbc; ++lq) {
-            const int bi = dist.myrow + lp * dist.pr;
-            const int bj = dist.mycol + lq * dist.pc;
-            if (bj > bi) {
-                continue; // only the lower triangle is required
-            }
-
-            double* tile = tiles.data() + static_cast<size_t>(lp * dist.local_nbc + lq) * tileElems;
-            std::vector<double> tmp(tileElems, 0.0);
-            const double* bt = Bt.data() + static_cast<size_t>(lq) * nb * n;
-
-            for (int i = 0; i < nb; ++i) {
-                const int gi = bi * nb + i;
-                double* trow = tmp.data() + static_cast<size_t>(i) * nb;
-
-                if (gi >= n) {
-                    // Padding block: use the identity so the extended matrix
-                    // remains positive definite.
-                    for (int j = 0; j < nb; ++j) {
-                        const int gj = bj * nb + j;
-                        trow[j] = (gj == gi) ? 1.0 : 0.0;
-                    }
-                    continue;
-                }
-
-                const double* brow = B.data() + static_cast<size_t>(gi) * n;
-                for (int k = 0; k < n; ++k) {
-                    const double b = brow[k];
-                    const double* btk = bt + static_cast<size_t>(k) * nb;
-                    for (int j = 0; j < nb; ++j) {
-                        trow[j] += b * btk[j];
-                    }
-                }
-
-                const int jj = gi - bj * nb;
-                if (jj >= 0 && jj < nb) {
-                    trow[jj] += static_cast<double>(n); // diagonal dominance
-                }
-            }
-
-            // tmp is row-major (i, j); store the tile column-major.
-            for (int i = 0; i < nb; ++i) {
-                for (int j = 0; j < nb; ++j) {
-                    tile[static_cast<size_t>(j) * nb + i] = tmp[static_cast<size_t>(i) * nb + j];
-                }
-            }
+// Pack the panel rows owned by this rank (prefix and diagonal block) into a
+// compact, contiguous buffer (one host transfer per panel).
+__global__ void cholPackKernel(const double* __restrict__ L,
+                               double* __restrict__ pack, int m, int nprocs,
+                               int K, int Bact, int firstRow, int countRows,
+                               int rowStride) {
+    const int total = countRows * rowStride;
+    const int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+                    static_cast<int>(threadIdx.x);
+    if (idx >= total) {
+        return;
+    }
+    const int t = idx / rowStride;
+    const int off = idx - t * rowStride;
+    const int b = firstRow + nprocs * t;
+    const int row = K + b;
+    const int li = row / nprocs;
+    if (off < K) {
+        pack[idx] = L[static_cast<size_t>(off) * m + static_cast<size_t>(li)];
+    } else {
+        const int col = off - K;
+        if (col > b) {
+            pack[idx] = 0.0;
+        } else {
+            pack[idx] = L[static_cast<size_t>(K + col) * m +
+                          static_cast<size_t>(li)];
         }
     }
 }
 
-// Factor one diagonal tile with an inner blocked algorithm.  The small
-// diagonal sub-blocks are handled by the serial kernel, while the trailing
-// updates use cuBLAS so the work is spread over the whole GPU.
-void factorTile(cublasHandle_t handle, double* tile, int ld, int offset, int* dInfo) {
-    const int inner = 32;
-    const double one = 1.0;
-    const double minusOne = -1.0;
+// Write the replicated panel rows of the factor back to the owning rank's
+// local device rows.
+__global__ void cholPanelWriteKernel(double* __restrict__ L,
+                                     const double* __restrict__ pT, int m,
+                                     int nprocs, int rank, int K, int Bact) {
+    const int total = Bact * Bact;
+    const int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+                    static_cast<int>(threadIdx.x);
+    if (idx >= total) {
+        return;
+    }
+    const int bp = idx / Bact;
+    const int b = idx - bp * Bact;
+    if (b > bp) {
+        return;
+    }
+    const long long gi = static_cast<long long>(K) + bp;
+    if (static_cast<int>(gi % nprocs) != rank) {
+        return;
+    }
+    L[static_cast<size_t>(K + b) * m + static_cast<size_t>(gi / nprocs)] =
+        pT[static_cast<size_t>(K + b) * CHOL_B + bp];
+}
 
-    for (int jb = 0; jb < ld; jb += inner) {
-        const int m = std::min(inner, ld - jb);
-        double* diag = tile + static_cast<size_t>(jb) * ld + jb;
-        potrfKernel<<<1, m>>>(diag, ld, m, offset + jb, dInfo);
-        cudaCheck(cudaGetLastError(), "potrf launch");
+// Update one panel column (global column j = K + b) for all trailing local
+// rows.  Panel rows are handled on the host.
+__global__ void cholColumnKernel(double* __restrict__ L,
+                                 const double* __restrict__ pT,
+                                 const double* __restrict__ S, int m, int K,
+                                 int b, int lStart, int total, double diag) {
+    const int t = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+                  static_cast<int>(threadIdx.x);
+    if (t >= total) {
+        return;
+    }
+    const int l = lStart + t;
+    const int j = K + b;
+    double acc = K > 0 ? S[(static_cast<size_t>(CHOL_B) + static_cast<size_t>(l)) *
+                               CHOL_B + b]
+                       : 0.0;
+    acc = cholDotFrom(acc, L + static_cast<size_t>(l), m, pT + b, CHOL_B, K, j);
+    const double val =
+        (L[static_cast<size_t>(j) * m + static_cast<size_t>(l)] - acc) / diag;
+    L[static_cast<size_t>(j) * m + static_cast<size_t>(l)] = val;
+}
 
-        const int rs = jb + m;
-        const int rem = ld - rs;
-        if (rem <= 0) {
+// Exact host-side arithmetic (separate rounded multiply/add plus a fused
+// tail) used to reproduce the reference summation bit-for-bit.
+static inline double cholMulRN(double a, double b) {
+#if defined(__x86_64__) || defined(__i386__)
+    double r = a;
+    __asm__("mulsd %1, %0" : "+x"(r) : "x"(b));
+    return r;
+#else
+    volatile double r = a * b;
+    return r;
+#endif
+}
+
+static inline double cholAddRN(double a, double b) {
+#if defined(__x86_64__) || defined(__i386__)
+    double r = a;
+    __asm__("addsd %1, %0" : "+x"(r) : "x"(b));
+    return r;
+#else
+    volatile double r = a + b;
+    return r;
+#endif
+}
+
+// Dot product of panel rows r1 and r2 over columns [K, j), continuing from the
+// prefix partial sum computed on the GPU.
+static double panelDot(const double* block, const double* Sp, int K, int j,
+                       int r1, int r2) {
+    double acc = K > 0 ? Sp[static_cast<size_t>(r1) * CHOL_B + r2] : 0.0;
+    int k = K;
+    const double* b1 = block + static_cast<size_t>(r1) * CHOL_B;
+    const double* b2 = block + static_cast<size_t>(r2) * CHOL_B;
+    for (; k + 3 < j; k += 4) {
+        const double v0 = cholMulRN(b1[0], b2[0]);
+        const double v1 = cholMulRN(b1[1], b2[1]);
+        const double v2 = cholMulRN(b1[2], b2[2]);
+        const double v3 = cholMulRN(b1[3], b2[3]);
+        acc = cholAddRN(acc, v0);
+        acc = cholAddRN(acc, v1);
+        acc = cholAddRN(acc, v2);
+        acc = cholAddRN(acc, v3);
+        b1 += 4;
+        b2 += 4;
+    }
+    for (; k < j; ++k) {
+        acc = std::fma(*b1, *b2, acc);
+        ++b1;
+        ++b2;
+    }
+    return acc;
+}
+
+// Factor the Bact x Bact diagonal block of the current panel on the host.
+// Columns are processed in order (each only touches the short within-panel
+// range), so this stays cheap and avoids per-column thread-team overhead.
+static void hostPanelFactor(double* Lblk, const double* Sp, const double* Asub,
+                            int K, int Bact) {
+    for (int b = 0; b < Bact; ++b) {
+        const int j = K + b;
+        const double acc = panelDot(Lblk, Sp, K, j, b, b);
+        const double v = Asub[static_cast<size_t>(b) * CHOL_B + b] - acc;
+        const double d = v > 0.0 ? std::sqrt(v) : -1.0;
+        Lblk[static_cast<size_t>(b) * CHOL_B + b] = d;
+        if (b + 1 >= Bact) {
             continue;
         }
-
-        double* panel = tile + static_cast<size_t>(jb) * ld + rs;
-        cublasCheck(cublasDtrsm(handle, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_LOWER,
-                                CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT, rem, m, &one,
-                                diag, ld, panel, ld),
-                    "inner trsm");
-
-        double* trailing = tile + static_cast<size_t>(rs) * ld + rs;
-        cublasCheck(cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, rem, rem, m,
-                                &minusOne, panel, ld, panel, ld, &one, trailing, ld),
-                    "inner gemm");
+        for (int bp = b + 1; bp < Bact; ++bp) {
+            const double a = panelDot(Lblk, Sp, K, j, bp, b);
+            Lblk[static_cast<size_t>(bp) * CHOL_B + b] =
+                (Asub[static_cast<size_t>(bp) * CHOL_B + b] - a) / d;
+        }
     }
 }
 
-// Distributed right-looking blocked Cholesky.  The local tiles are already on
-// the device (dTiles) and the factor replaces them in place.  failIndex
-// receives the global diagonal index if the matrix is not positive definite.
-bool distributedCholesky(const Distribution& dist, double* dTiles, double* dPanel,
-                         double* hPanel, int* dInfo, cublasHandle_t handle,
-                         int& failIndex) {
-    const int nb = dist.nb;
-    const int N = dist.N;
-    const int nbr = dist.nbr;
-    const size_t tileElems = static_cast<size_t>(nb) * nb;
-    const size_t tileBytes = tileElems * sizeof(double);
+static inline int localRowCount(size_t n, int r, int nprocs) {
+    const size_t rn = static_cast<size_t>(r);
+    if (rn >= n) {
+        return 0;
+    }
+    return static_cast<int>((n - rn + static_cast<size_t>(nprocs) - 1) /
+                            static_cast<size_t>(nprocs));
+}
 
-    double* hLkk = nullptr;
-    double* sendBuf = nullptr;
-    double* recvBuf = nullptr;
-    cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&hLkk), tileBytes), "pinned lkk");
-    cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&sendBuf),
-                             static_cast<size_t>(std::max(1, dist.local_nbr)) * nb * nb *
-                                 sizeof(double)),
-              "pinned send");
-    cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&recvBuf),
-                             static_cast<size_t>(nbr) * nb * nb * sizeof(double)),
-              "pinned recv");
-    std::memset(hLkk, 0, tileBytes);
+// Generate the random matrix B used to form A = B * B^T + n*I.  The seed and
+// generation order match the reference implementation.
+static void generateRandomMatrix(std::vector<double>& B, size_t n) {
+    B.resize(n * n);
+    unsigned int seed = 42;
+    for (size_t i = 0; i < n * n; ++i) {
+        B[i] = (rand_r(&seed) / (double)RAND_MAX) - 0.5;
+    }
+}
 
-    const double one = 1.0;
-    const double minusOne = -1.0;
+// Blocked, distributed, GPU-resident Cholesky.  The panel diagonal blocks are
+// factored on the host (in exact reference arithmetic) and broadcast once per
+// panel; all trailing updates run on the GPUs.
+static bool choleskyDecomposition(double* d_L, double* d_pT, double* d_S,
+                                  double* d_pack, double* h_reduce,
+                                  double* h_pack, double* h_block,
+                                  double* h_pt, double* h_Spanel,
+                                  double* h_send, size_t n, int rank,
+                                  int nprocs, int localRows,
+                                  int scatterThreads) {
+    if (n == 0) {
+        return true;
+    }
+
+    const int ni = static_cast<int>(n);
+    const int m = localRows;
+
     bool ok = true;
-    failIndex = 0;
+    int K = 0;
+    while (K < ni) {
+        const int Bact = std::min(CHOL_B, ni - K);
 
-    for (int k = 0; k < nbr; ++k) {
-        const int Pld = N - k * nb;
-        const int owner = (k % dist.pr) * dist.pc + (k % dist.pc);
-        int hInfo = 0;
+        // Gather panel rows' prefix [0,K) and the panel diagonal block of A.
+        const int prefixCount = K * CHOL_B;
+        const int rowStride = K + Bact;
 
-        if (dist.rank == owner) {
-            const int idx = dist.tileIndex(k, k);
-            double* tile = dTiles + static_cast<size_t>(idx) * tileElems;
-            cudaCheck(cudaMemset(dInfo, 0, sizeof(int)), "reset info");
-            factorTile(handle, tile, nb, k * nb, dInfo);
-            cudaCheck(cudaMemcpy(&hInfo, dInfo, sizeof(int), cudaMemcpyDeviceToHost),
-                      "read info");
-            cudaCheck(cudaMemcpy(hLkk, tile, tileBytes, cudaMemcpyDeviceToHost),
-                      "read lkk");
+        const int base = K % nprocs;
+        int rem = (rank - base) % nprocs;
+        if (rem < 0) {
+            rem += nprocs;
+        }
+        int firstRow = 0;
+        int countRows = 0;
+        if (rem < Bact) {
+            firstRow = rem;
+            countRows = (Bact - 1 - rem) / nprocs + 1;
         }
 
-        MPI_Bcast(&hInfo, 1, MPI_INT, owner, dist.comm);
-        if (hInfo != 0) {
+        const int packCount = countRows * rowStride;
+        const int packBlocks = (packCount + 255) / 256;
+        if (packBlocks > 0) {
+            cholPackKernel<<<packBlocks, 256>>>(d_L, d_pack, m, nprocs, K, Bact,
+                                               firstRow, countRows, rowStride);
+            CUDA_CHECK(cudaMemcpy(h_send, d_pack,
+                                  static_cast<size_t>(packCount) *
+                                      sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+        }
+
+        std::vector<int> gcounts(nprocs, 0);
+        std::vector<int> gdispls(nprocs, 0);
+        {
+            int total = 0;
+            for (int r = 0; r < nprocs; ++r) {
+                int rr = (r - base) % nprocs;
+                if (rr < 0) {
+                    rr += nprocs;
+                }
+                int cnt = 0;
+                if (rr < Bact) {
+                    cnt = (Bact - 1 - rr) / nprocs + 1;
+                }
+                gcounts[r] = cnt * rowStride;
+                gdispls[r] = total;
+                total += gcounts[r];
+            }
+        }
+        MPI_CHECK(MPI_Allgatherv(
+            countRows > 0 ? h_send : nullptr, countRows * rowStride, MPI_DOUBLE,
+            h_pack, gcounts.data(), gdispls.data(), MPI_DOUBLE, MPI_COMM_WORLD));
+
+        // Scatter the gathered panel data into the layouts used on the device.
+        // For panel row b, its owner is (K+b)%P and its local index is b/P.
+#pragma omp parallel for schedule(static) num_threads(scatterThreads)
+        for (int b = 0; b < Bact; ++b) {
+            const int owner = (K + b) % nprocs;
+            const int t = b / nprocs;
+            const double* src = h_pack + static_cast<size_t>(gdispls[owner]) +
+                                static_cast<size_t>(t) * rowStride;
+            for (int k = 0; k < K; ++k) {
+                h_reduce[static_cast<size_t>(k) * CHOL_B + b] = src[k];
+            }
+            double* rowA = h_reduce + static_cast<size_t>(prefixCount) +
+                           static_cast<size_t>(b) * CHOL_B;
+            for (int col = 0; col <= b; ++col) {
+                rowA[col] = src[K + col];
+            }
+        }
+
+        if (K > 0) {
+            CUDA_CHECK(cudaMemcpy(d_pT, h_reduce,
+                                  static_cast<size_t>(prefixCount) *
+                                      sizeof(double),
+                                  cudaMemcpyHostToDevice));
+        }
+
+        // Index of the first trailing row of this panel.
+        const int need = K + Bact - rank;
+        int lStart = need > 0 ? (need + nprocs - 1) / nprocs : 0;
+        lStart = std::min(lStart, m);
+
+        // Prefix partial sums for the trailing rows (runs in parallel with the
+        // host panel factorization below).
+        if (K > 0) {
+            const int nrows = m - lStart;
+            const int sblocks =
+                Bact + (nrows + CHOL_ROWS - 1) / CHOL_ROWS;
+            cholSKernel<<<sblocks, CHOL_B * CHOL_ROWS>>>(
+                d_L, d_pT, d_S, m, K, Bact, m, lStart);
+        }
+
+        // Factor the panel's diagonal block on the host, on rank 0 only, then
+        // replicate it (one collective per panel).
+        if (rank == 0) {
+            if (K > 0) {
+                CUDA_CHECK(cudaDeviceSynchronize());
+                CUDA_CHECK(cudaMemcpy(
+                    h_Spanel, d_S,
+                    static_cast<size_t>(Bact) * CHOL_B * sizeof(double),
+                    cudaMemcpyDeviceToHost));
+            }
+            hostPanelFactor(h_block, h_Spanel, h_reduce + prefixCount, K,
+                            Bact);
+            for (int b = 0; b < Bact; ++b) {
+                for (int bp = 0; bp < Bact; ++bp) {
+                    h_pt[static_cast<size_t>(b) * CHOL_B + bp] =
+                        bp >= b ? h_block[static_cast<size_t>(bp) * CHOL_B + b]
+                                : 0.0;
+                }
+            }
+        }
+        MPI_CHECK(MPI_Bcast(h_pt, Bact * CHOL_B, MPI_DOUBLE, 0,
+                            MPI_COMM_WORLD));
+
+        CUDA_CHECK(cudaMemcpy(
+            d_pT + static_cast<size_t>(K) * CHOL_B, h_pt,
+            static_cast<size_t>(Bact) * CHOL_B * sizeof(double),
+            cudaMemcpyHostToDevice));
+
+        int localBad = INT_MAX;
+        for (int b = 0; b < Bact; ++b) {
+            if (!(h_pt[static_cast<size_t>(b) * CHOL_B + b] > 0.0)) {
+                localBad = K + b;
+                break;
+            }
+        }
+        int globalBad = INT_MAX;
+        MPI_CHECK(MPI_Allreduce(&localBad, &globalBad, 1, MPI_INT, MPI_MIN,
+                                MPI_COMM_WORLD));
+        if (globalBad != INT_MAX) {
+            if (rank == 0) {
+                printf("Error: Matrix is not positive definite at diagonal element %d\n",
+                       globalBad);
+            }
             ok = false;
-            failIndex = hInfo - 1;
             break;
         }
 
-        MPI_Bcast(hLkk, static_cast<int>(tileElems), MPI_DOUBLE, owner, dist.comm);
+        // Publish the replicated panel rows into each owner's local rows.
+        const int pwBlocks = (Bact * Bact + 255) / 256;
+        cholPanelWriteKernel<<<pwBlocks, 256>>>(d_L, d_pT, m, nprocs, rank, K,
+                                                Bact);
 
-        // L_kk into the device panel (block k occupies the first nb rows).
-        cudaCheck(cudaMemcpy2D(dPanel, static_cast<size_t>(N) * sizeof(double),
-                               hLkk, static_cast<size_t>(nb) * sizeof(double),
-                               static_cast<size_t>(nb) * sizeof(double),
-                               static_cast<size_t>(nb), cudaMemcpyHostToDevice),
-                  "lkk to panel");
-
-        // Phase 1: every rank solves the panel blocks it owns and packs them.
-        const int col = k % dist.pc;
-        std::vector<int> counts(dist.size, 0);
-        std::vector<int> displs(dist.size, 0);
-        int totalBlocks = 0;
-        for (int r = 0; r < dist.size; ++r) {
-            int cnt = 0;
-            if (r % dist.pc == col) {
-                const int row = r / dist.pc;
-                const int lnbr = (row < nbr) ? ((nbr - 1 - row) / dist.pr + 1) : 0;
-                if (k < row) {
-                    cnt = lnbr;
-                } else {
-                    cnt = lnbr - ((k - row) / dist.pr + 1);
-                }
-                if (cnt < 0) {
-                    cnt = 0;
-                }
-            }
-            counts[r] = cnt * nb * nb;
-            displs[r] = totalBlocks * nb * nb;
-            totalBlocks += cnt;
-        }
-        int myBlocks = 0;
-        if (dist.mycol == col) {
-            const int lq = (k - dist.mycol) / dist.pc;
-            const int p0 = (k < dist.myrow) ? 0 : ((k - dist.myrow) / dist.pr + 1);
-            for (int lp = p0; lp < dist.local_nbr; ++lp) {
-                const int idx = lp * dist.local_nbc + lq;
-                double* tile = dTiles + static_cast<size_t>(idx) * tileElems;
-
-                cublasCheck(cublasDtrsm(handle, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_LOWER,
-                                        CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT, nb, nb, &one,
-                                        dPanel, N, tile, nb),
-                            "trsm");
-
-                cudaCheck(cudaMemcpy(sendBuf + static_cast<size_t>(myBlocks) * nb * nb,
-                                     tile, tileBytes, cudaMemcpyDeviceToHost),
-                          "panel to host");
-                ++myBlocks;
+        // Complete the trailing part of every panel column.
+        const int total = m - lStart;
+        if (total > 0) {
+            const int blocks = (total + 127) / 128;
+            for (int b = 0; b < Bact; ++b) {
+                cholColumnKernel<<<blocks, 128>>>(
+                    d_L, d_pT, d_S, m, K, b, lStart, total,
+                    h_pt[static_cast<size_t>(b) * CHOL_B + b]);
             }
         }
 
-        MPI_Allgatherv(sendBuf, myBlocks * nb * nb, MPI_DOUBLE,
-                       recvBuf, counts.data(), displs.data(), MPI_DOUBLE,
-                       dist.comm);
-
-        std::memset(hPanel, 0, static_cast<size_t>(Pld) * nb * sizeof(double));
-
-        for (int r = 0; r < dist.size; ++r) {
-            const int cntBlocks = counts[r] / (nb * nb);
-            if (cntBlocks == 0) {
-                continue;
-            }
-            const int row = r / dist.pc;
-            const int p0 = (k < row) ? 0 : ((k - row) / dist.pr + 1);
-            const double* src = recvBuf + displs[r];
-            for (int t = 0; t < cntBlocks; ++t) {
-                const int bi = row + (p0 + t) * dist.pr;
-                double* dst = hPanel + static_cast<size_t>(bi - k) * nb;
-                for (int c = 0; c < nb; ++c) {
-                    std::memcpy(dst + static_cast<size_t>(c) * Pld,
-                                src + static_cast<size_t>(c) * nb,
-                                static_cast<size_t>(nb) * sizeof(double));
-                }
-                src += static_cast<size_t>(nb) * nb;
-            }
-        }
-
-        cudaCheck(cudaMemcpy2D(dPanel, static_cast<size_t>(N) * sizeof(double),
-                               hPanel, static_cast<size_t>(Pld) * sizeof(double),
-                               static_cast<size_t>(Pld) * sizeof(double),
-                               static_cast<size_t>(nb), cudaMemcpyHostToDevice),
-                  "panel to device");
-        // Phase 2: update every owned trailing tile.
-        for (int lp = 0; lp < dist.local_nbr; ++lp) {
-            const int bi = dist.myrow + lp * dist.pr;
-            if (bi <= k) {
-                continue;
-            }
-            const double* panelI = dPanel + static_cast<size_t>(bi - k) * nb;
-            for (int lq = 0; lq < dist.local_nbc; ++lq) {
-                const int bj = dist.mycol + lq * dist.pc;
-                if (bj <= k || bj > bi) {
-                    continue;
-                }
-                double* tile = dTiles +
-                               static_cast<size_t>(lp * dist.local_nbc + lq) * tileElems;
-                const double* panelJ = dPanel + static_cast<size_t>(bj - k) * nb;
-
-                cublasCheck(cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, nb, nb, nb,
-                                        &minusOne, panelI, N, panelJ, N, &one, tile, nb),
-                            "gemm");
-            }
-        }
+        K += Bact;
     }
-    cudaFreeHost(hLkk);
-    cudaFreeHost(sendBuf);
-    cudaFreeHost(recvBuf);
+
+    CUDA_CHECK(cudaDeviceSynchronize());
     return ok;
 }
 
-// Pack the owned lower-triangular tiles into a dense n x n buffer and reduce
-// them on rank 0.  Optionally do the same for the original matrix (used by the
-// validation path).
-void gatherMatrices(const Distribution& dist, const std::vector<double>& tiles,
-                    const std::vector<double>& origTiles, bool needL, bool needA,
-                    std::vector<double>& fullL, std::vector<double>& fullA) {
-    const int n = dist.n;
-    const int nb = dist.nb;
-    const size_t n2 = static_cast<size_t>(n) * n;
-    std::vector<double> sendL;
-    std::vector<double> sendA;
-    if (needL) {
-        sendL.assign(n2, 0.0);
+// Gather cyclic row blocks on the root and rebuild the full row-major matrix.
+// For the factor the strict upper triangle is zeroed.
+static void gatherRows(const std::vector<double>& localRowsData, size_t n,
+                       int nprocs, int rank, const std::vector<int>& counts,
+                       const std::vector<int>& displs, std::vector<double>& full,
+                       std::vector<double>& scratch, bool zeroUpper) {
+    const int localCount = static_cast<int>(localRowsData.size());
+    double* send = localCount > 0 ? const_cast<double*>(localRowsData.data())
+                                  : nullptr;
+
+    if (rank == 0) {
+        scratch.resize(static_cast<size_t>(n) * n);
     }
-    if (needA) {
-        sendA.assign(n2, 0.0);
+    double* recv = rank == 0 ? scratch.data() : nullptr;
+
+    MPI_CHECK(MPI_Gatherv(send, localCount, MPI_DOUBLE, recv,
+                          rank == 0 ? counts.data() : nullptr,
+                          rank == 0 ? displs.data() : nullptr, MPI_DOUBLE, 0,
+                          MPI_COMM_WORLD));
+
+    if (rank != 0) {
+        return;
     }
 
-    for (int lp = 0; lp < dist.local_nbr; ++lp) {
-        const int bi = dist.myrow + lp * dist.pr;
-        for (int lq = 0; lq < dist.local_nbc; ++lq) {
-            const int bj = dist.mycol + lq * dist.pc;
-            if (bj > bi) {
-                continue;
-            }
-            const size_t base = static_cast<size_t>(lp * dist.local_nbc + lq) * nb * nb;
-            const double* tile = tiles.data() + base;
-            const double* orig = origTiles.empty() ? nullptr : origTiles.data() + base;
-
-            for (int i = 0; i < nb; ++i) {
-                const int gi = bi * nb + i;
-                if (gi >= n) {
-                    continue;
-                }
-                for (int j = 0; j < nb; ++j) {
-                    const int gj = bj * nb + j;
-                    if (gj >= n || gj > gi) {
-                        continue;
-                    }
-                    const size_t dst = static_cast<size_t>(gi) * n + gj;
-                    if (needL) {
-                        sendL[dst] = tile[static_cast<size_t>(j) * nb + i];
-                    }
-                    if (needA) {
-                        sendA[dst] = orig[static_cast<size_t>(j) * nb + i];
-                    }
-                }
-            }
+    full.assign(static_cast<size_t>(n) * n, 0.0);
+#pragma omp parallel for schedule(static) num_threads(8)
+    for (long long row = 0; row < static_cast<long long>(n); ++row) {
+        const int r = static_cast<int>(row % nprocs);
+        const size_t li = static_cast<size_t>(row) / static_cast<size_t>(nprocs);
+        const double* src = scratch.data() + displs[r] + li * n;
+        double* dst = full.data() + static_cast<size_t>(row) * n;
+        if (!zeroUpper) {
+            std::memcpy(dst, src, n * sizeof(double));
+            continue;
         }
-    }
-
-    if (needL) {
-        if (dist.rank == 0) {
-            fullL.assign(n2, 0.0);
+        const size_t lower = static_cast<size_t>(row) + 1;
+        std::memcpy(dst, src, lower * sizeof(double));
+        if (lower < n) {
+            std::memset(dst + lower, 0, (n - lower) * sizeof(double));
         }
-        MPI_Reduce(sendL.data(), dist.rank == 0 ? fullL.data() : nullptr,
-                   static_cast<int>(n2), MPI_DOUBLE, MPI_SUM, 0, dist.comm);
-    }
-    if (needA) {
-        if (dist.rank == 0) {
-            fullA.assign(n2, 0.0);
-        }
-        MPI_Reduce(sendA.data(), dist.rank == 0 ? fullA.data() : nullptr,
-                   static_cast<int>(n2), MPI_DOUBLE, MPI_SUM, 0, dist.comm);
     }
 }
 
-bool validateCholesky(const std::vector<double>& L, const std::vector<double>& A_orig,
-                      const size_t n) {
+static bool validateCholesky(const std::vector<double>& L,
+                             const std::vector<double>& A_orig, size_t n,
+                             int threads) {
     double maxError = 0.0;
     double relError = 0.0;
 
-#pragma omp parallel for schedule(static) reduction(max : maxError, relError)
-    for (long long i = 0; i < static_cast<long long>(n); ++i) {
-        for (long long j = 0; j <= i; ++j) {
-            double sum = 0.0;
-            for (size_t k = 0; k < n; ++k) {
-                sum += L[static_cast<size_t>(i) * n + k] *
-                       L[static_cast<size_t>(j) * n + k];
+#pragma omp parallel num_threads(threads) reduction(max : maxError, relError)
+    {
+        std::vector<double> reconstructed(n);
+#pragma omp for schedule(static)
+        for (long long i = 0; i < static_cast<long long>(n); ++i) {
+            const double* Li = &L[static_cast<size_t>(i) * n];
+            for (size_t j = 0; j < n; ++j) {
+                const double* Lj = &L[j * n];
+                double sum = 0.0;
+                for (size_t k = 0; k < n; ++k) {
+                    sum += Li[k] * Lj[k];
+                }
+                reconstructed[j] = sum;
             }
-            const double error =
-                fabs(sum - A_orig[static_cast<size_t>(i) * n + static_cast<size_t>(j)]);
-            maxError = std::max(maxError, error);
-            const double rel =
-                error / (fabs(A_orig[static_cast<size_t>(i) * n + static_cast<size_t>(j)]) +
-                         1e-10);
-            relError = std::max(relError, rel);
+            for (size_t j = 0; j < n; ++j) {
+                const double ref = A_orig[static_cast<size_t>(i) * n + j];
+                const double error = fabs(reconstructed[j] - ref);
+                maxError = std::max(maxError, error);
+                const double rel = error / (fabs(ref) + 1e-10);
+                relError = std::max(relError, rel);
+            }
         }
     }
 
@@ -510,280 +638,298 @@ void printUsage(const char* progName) {
     printf("  -h           Show this help message\n");
 }
 
-int localRankFromEnvironment() {
-    const char* names[] = {"OMPI_COMM_WORLD_LOCAL_RANK", "MV2_COMM_WORLD_LOCAL_RANK",
-                           "SLURM_LOCALID", "PMI_LOCAL_RANK"};
-    for (const char* name : names) {
-        const char* value = std::getenv(name);
-        if (value != nullptr && *value != '\0') {
-            return std::atoi(value);
-        }
-    }
-    return 0;
-}
-
-} // namespace
-
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
 
     int rank = 0;
-    int size = 1;
+    int nprocs = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
+
+    MPI_Comm nodeComm = MPI_COMM_NULL;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
+                        &nodeComm);
+    int localRank = rank;
+    int localSize = nprocs;
+    if (nodeComm != MPI_COMM_NULL) {
+        MPI_Comm_rank(nodeComm, &localRank);
+        MPI_Comm_size(nodeComm, &localSize);
+    }
+
+    int threads = omp_get_max_threads();
+    if (getenv("OMP_NUM_THREADS") == nullptr) {
+        threads = std::max(1, omp_get_num_procs() / std::max(1, localSize));
+        threads = std::min(threads, 64);
+        omp_set_num_threads(threads);
+    }
+    const int scatterThreads = std::max(1, std::min(threads, 8));
 
     size_t n = 512;
     bool validate = false;
     bool printResults = false;
+    bool showHelp = false;
+    bool badOption = false;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
-            n = static_cast<size_t>(atoi(argv[++i]));
+            n = static_cast<size_t>(atoll(argv[++i]));
         } else if (strcmp(argv[i], "-v") == 0) {
             validate = true;
         } else if (strcmp(argv[i], "-r") == 0) {
             printResults = true;
         } else if (strcmp(argv[i], "-h") == 0) {
-            if (rank == 0) {
-                printUsage(argv[0]);
-            }
-            MPI_Finalize();
-            return 0;
+            showHelp = true;
         } else {
             if (rank == 0) {
                 printf("Unknown option: %s\n", argv[i]);
-                printUsage(argv[0]);
             }
-            MPI_Finalize();
-            return 1;
+            badOption = true;
+            break;
         }
     }
 
-    if (n == 0) {
+    if (showHelp || badOption) {
         if (rank == 0) {
-            printf("Matrix size must be positive\n");
+            printUsage(argv[0]);
+        }
+        if (nodeComm != MPI_COMM_NULL) {
+            MPI_Comm_free(&nodeComm);
         }
         MPI_Finalize();
-        return 1;
+        return badOption ? 1 : 0;
     }
 
-    // Pick one GPU per rank (respecting CUDA_VISIBLE_DEVICES if it is set).
+    // CUDA is required: the factorization always runs on the GPU.
     int deviceCount = 0;
-    const int deviceQueryOk =
-        ((cudaGetDeviceCount(&deviceCount) == cudaSuccess) && deviceCount > 0) ? 1 : 0;
-    int allHaveGpu = 0;
-    MPI_Allreduce(&deviceQueryOk, &allHaveGpu, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    if (!allHaveGpu) {
+    CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+    if (deviceCount <= 0) {
         if (rank == 0) {
-            fprintf(stderr, "No CUDA device available; this build requires a GPU\n");
+            fprintf(stderr, "No CUDA device available\n");
+        }
+        if (nodeComm != MPI_COMM_NULL) {
+            MPI_Comm_free(&nodeComm);
         }
         MPI_Finalize();
         return 1;
     }
-    const int localRank = localRankFromEnvironment();
-    cudaCheck(cudaSetDevice(localRank % deviceCount), "set device");
-
-    Distribution dist;
-    dist.rank = rank;
-    dist.size = size;
-    dist.pr = chooseProcessRows(size);
-    dist.pc = size / dist.pr;
-    dist.myrow = rank / dist.pc;
-    dist.mycol = rank % dist.pc;
-    dist.n = static_cast<int>(n);
-    dist.nb = chooseBlockSize(dist.n, std::max(dist.pr, dist.pc));
-    dist.N = ((dist.n + dist.nb - 1) / dist.nb) * dist.nb;
-    dist.nbr = dist.N / dist.nb;
-    dist.local_nbr = (dist.nbr - 1 - dist.myrow) / dist.pr + 1;
-    dist.local_nbc = (dist.nbr - 1 - dist.mycol) / dist.pc + 1;
-    if (dist.myrow >= dist.nbr || dist.mycol >= dist.nbr) {
-        dist.local_nbr = 0;
-        dist.local_nbc = 0;
-    }
-    dist.local_ntiles = dist.local_nbr * dist.local_nbc;
+    CUDA_CHECK(cudaSetDevice(localRank % deviceCount));
 
     if (rank == 0) {
         printf("Cholesky Decomposition Benchmark\n");
         printf("Matrix size: %zu x %zu\n", n, n);
         printf("Validation: %s\n", validate ? "enabled" : "disabled");
-        printf("Generating positive definite matrix...\n");
-        fflush(stdout);
     }
 
-    std::vector<double> B;
-    generateRandomMatrix(dist.n, B);
+    const int localRows = localRowCount(n, rank, nprocs);
+    const size_t localElems = static_cast<size_t>(localRows) * n;
 
-    std::vector<double> Bt;
-    buildTransposedBlocks(dist, B, Bt);
-
-    std::vector<double> tiles;
-    generateLocalTiles(dist, B, Bt, tiles);
-    B.clear();
-    B.shrink_to_fit();
-    Bt.clear();
-    Bt.shrink_to_fit();
-
-    std::vector<double> origTiles;
-    if (validate) {
-        origTiles = tiles;
-    }
+    double* d_L = nullptr;
+    double* d_pT = nullptr;
+    double* d_S = nullptr;
+    double* d_pack = nullptr;
+    double* h_reduce = nullptr;
+    double* h_pack = nullptr;
+    double* h_block = nullptr;
+    double* h_pt = nullptr;
+    double* h_Spanel = nullptr;
+    double* h_send = nullptr;
 
     if (rank == 0) {
+        printf("Generating positive definite matrix...\n");
+    }
+    std::vector<double> Bmat;
+    generateRandomMatrix(Bmat, n);
+
+    const size_t localBytes = static_cast<size_t>(localRows) * n * sizeof(double);
+    if (localBytes > 0) {
+        CUDA_CHECK(cudaMalloc(&d_L, localBytes));
+    }
+    if (n > 0) {
+        double* d_B = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_B, n * n * sizeof(double)));
+        CUDA_CHECK(cudaMemcpy(d_B, Bmat.data(), n * n * sizeof(double),
+                              cudaMemcpyHostToDevice));
+        const int gx = static_cast<int>((n + GEN_TJ - 1) / GEN_TJ);
+        const int gy = static_cast<int>((localRows + GEN_TI - 1) / GEN_TI);
+        if (gx > 0 && gy > 0) {
+            cholGenerateKernel<<<dim3(gx, gy), dim3(GEN_TJ, GEN_TI)>>>(
+                d_L, d_B, static_cast<int>(n), localRows, rank, nprocs);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(d_B));
+    }
+    std::vector<double>().swap(Bmat);
+
+    std::vector<double> A_orig;
+    if (validate && localBytes > 0) {
+        // Kept in column-major layout; converted while gathering.
+        A_orig.resize(static_cast<size_t>(localRows) * n);
+        CUDA_CHECK(cudaMemcpy(A_orig.data(), d_L, localBytes,
+                              cudaMemcpyDeviceToHost));
+    }
+
+    if (n > 0) {
+        CUDA_CHECK(cudaMalloc(&d_pT, n * CHOL_B * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&d_S,
+                              (static_cast<size_t>(CHOL_B) +
+                               static_cast<size_t>(localRows)) *
+                                  CHOL_B * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&d_pack,
+                              (static_cast<size_t>(CHOL_B) * (n + CHOL_B)) *
+                                  sizeof(double)));
+        h_reduce = static_cast<double*>(
+            std::malloc((n * CHOL_B + CHOL_B * CHOL_B) * sizeof(double)));
+        h_pack = static_cast<double*>(std::malloc(
+            (static_cast<size_t>(CHOL_B) * (n + CHOL_B)) * sizeof(double)));
+        h_block = static_cast<double*>(
+            std::malloc(CHOL_B * CHOL_B * sizeof(double)));
+        h_pt = static_cast<double*>(
+            std::malloc(CHOL_B * CHOL_B * sizeof(double)));
+        h_Spanel = static_cast<double*>(
+            std::malloc(CHOL_B * CHOL_B * sizeof(double)));
+        h_send = static_cast<double*>(std::malloc(
+            (static_cast<size_t>(CHOL_B) * (n + CHOL_B)) * sizeof(double)));
+        if (!h_reduce || !h_pack || !h_block || !h_pt || !h_Spanel || !h_send) {
+            fprintf(stderr, "Host allocation failed\n");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    if (rank == 0) {
         printf("Computing Cholesky decomposition...\n");
-        fflush(stdout);
     }
 
-    cublasHandle_t handle = nullptr;
-    cublasCheck(cublasCreate(&handle), "create handle");
+    const auto start = std::chrono::steady_clock::now();
+    const bool success = choleskyDecomposition(
+        d_L, d_pT, d_S, d_pack, h_reduce, h_pack, h_block, h_pt, h_Spanel,
+        h_send, n, rank, nprocs, localRows, scatterThreads);
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    const auto end = std::chrono::steady_clock::now();
 
-    const size_t tileElems = static_cast<size_t>(dist.nb) * dist.nb;
-    const size_t tileBytes = tileElems * sizeof(double);
-    double* dTiles = nullptr;
-    double* dPanel = nullptr;
-    double* hPanel = nullptr;
-    int* dInfo = nullptr;
-
-    // Workspace allocation and upload are setup, not part of the measured
-    // decomposition (just like the host allocation in the sequential version).
-    cudaCheck(cudaMalloc(reinterpret_cast<void**>(&dTiles),
-                         static_cast<size_t>(dist.local_ntiles) * tileBytes),
-              "malloc tiles");
-    if (dist.local_ntiles > 0) {
-        cudaCheck(cudaMemcpy(dTiles, tiles.data(),
-                             static_cast<size_t>(dist.local_ntiles) * tileBytes,
-                             cudaMemcpyHostToDevice),
-                  "upload tiles");
+    if (rank == 0) {
+        const double seconds = std::chrono::duration<double>(end - start).count();
+        printf("Computation time: %ld ms\n",
+               static_cast<long>(seconds * 1000.0));
+        const double ops = static_cast<double>(n) * static_cast<double>(n) *
+                           static_cast<double>(n) / 3.0;
+        const double gflops = seconds > 0.0 ? ops / seconds / 1e9 : 0.0;
+        printf("Performance: %.3f GFLOPS\n", gflops);
     }
-    cudaCheck(cudaMalloc(reinterpret_cast<void**>(&dPanel),
-                         static_cast<size_t>(dist.N) * dist.nb * sizeof(double)),
-              "malloc panel");
-    cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&hPanel),
-                             static_cast<size_t>(dist.N) * dist.nb * sizeof(double)),
-              "malloc host panel");
-    cudaCheck(cudaMalloc(reinterpret_cast<void**>(&dInfo), sizeof(int)), "malloc info");
-    cudaDeviceSynchronize();
-    {
-        // Prime cuBLAS kernel selection for every shape used by the solver.
-        double* scratch = nullptr;
-        cudaCheck(cudaMalloc(reinterpret_cast<void**>(&scratch), tileBytes), "warmup tile");
-        if (dist.local_ntiles > 0) {
-            cudaCheck(cudaMemcpy(scratch, dTiles, tileBytes, cudaMemcpyDeviceToDevice),
-                      "warmup copy");
-            cudaCheck(cudaMemset(dPanel, 0,
-                                 static_cast<size_t>(dist.N) * dist.nb * sizeof(double)),
-                      "warmup panel");
-            cudaCheck(cudaMemcpy2D(dPanel, static_cast<size_t>(dist.N) * sizeof(double),
-                                   scratch, static_cast<size_t>(dist.nb) * sizeof(double),
-                                   static_cast<size_t>(dist.nb) * sizeof(double),
-                                   static_cast<size_t>(dist.nb),
-                                   cudaMemcpyDeviceToDevice),
-                      "warmup lkk");
-            cudaCheck(cudaMemset(dInfo, 0, sizeof(int)), "warmup info");
-            factorTile(handle, scratch, dist.nb, 0, dInfo);
-
-            const double one = 1.0;
-            const double minusOne = -1.0;
-            cublasCheck(cublasDtrsm(handle, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_LOWER,
-                                    CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT, dist.nb, dist.nb,
-                                    &one, dPanel, dist.N, scratch, dist.nb),
-                        "warmup trsm");
-            cublasCheck(cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, dist.nb, dist.nb,
-                                    dist.nb, &minusOne, dPanel, dist.N, dPanel, dist.N,
-                                    &one, scratch, dist.nb),
-                        "warmup gemm");
-        }
-        cudaCheck(cudaDeviceSynchronize(), "warmup sync");
-        cudaFree(scratch);
-        // Only the scratch copy was modified; make sure the device holds the
-        // pristine input tiles.
-        if (dist.local_ntiles > 0) {
-            cudaCheck(cudaMemcpy(dTiles, tiles.data(),
-                                 static_cast<size_t>(dist.local_ntiles) * tileBytes,
-                                 cudaMemcpyHostToDevice),
-                      "restore tiles");
-        }
-    }
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    auto start = std::chrono::high_resolution_clock::now();
-
-    int failIndex = 0;
-    const bool success = distributedCholesky(dist, dTiles, dPanel, hPanel, dInfo,
-                                             handle, failIndex);
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    auto end = std::chrono::high_resolution_clock::now();
-
-    cublasDestroy(handle);
-
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    const double elapsedSeconds =
-        std::chrono::duration<double>(end - start).count();
 
     if (!success) {
         if (rank == 0) {
-            printf("Error: Matrix is not positive definite at diagonal element %d\n",
-                   failIndex);
             printf("Cholesky decomposition failed\n");
         }
-        cudaFree(dTiles);
-        cudaFree(dPanel);
-        cudaFreeHost(hPanel);
-        cudaFree(dInfo);
+        if (h_send) std::free(h_send);
+        if (h_Spanel) std::free(h_Spanel);
+        if (h_pt) std::free(h_pt);
+        if (h_block) std::free(h_block);
+        if (h_pack) std::free(h_pack);
+        if (h_reduce) std::free(h_reduce);
+        if (d_pack) cudaFree(d_pack);
+        if (d_S) cudaFree(d_S);
+        if (d_pT) cudaFree(d_pT);
+        if (d_L) cudaFree(d_L);
+        if (nodeComm != MPI_COMM_NULL) {
+            MPI_Comm_free(&nodeComm);
+        }
         MPI_Finalize();
         return 1;
     }
 
-    if (dist.local_ntiles > 0) {
-        cudaCheck(cudaMemcpy(tiles.data(), dTiles,
-                             static_cast<size_t>(dist.local_ntiles) * tileBytes,
-                             cudaMemcpyDeviceToHost),
-                  "download tiles");
-    }
-    cudaFree(dTiles);
-    cudaFree(dPanel);
-    cudaFreeHost(hPanel);
-    cudaFree(dInfo);
-
-    if (rank == 0) {
-        printf("Computation time: %ld ms\n", static_cast<long>(duration.count()));
-        const double ops = static_cast<double>(n) * static_cast<double>(n) *
-                           static_cast<double>(n) / 3.0;
-        const double gflops =
-            (elapsedSeconds > 0.0) ? (ops / elapsedSeconds / 1e9) : 0.0;
-        printf("Performance: %.3f GFLOPS\n", gflops);
-        fflush(stdout);
-    }
-
-    std::vector<double> fullL;
-    std::vector<double> fullA;
+    // Read back the local factor (column-major on the device), transposing the
+    // lower triangle into row-major form for gathering.  Only needed when a
+    // result or validation is requested.
+    std::vector<double> localL;
+    std::vector<double> A_orig_rows;
     if (printResults || validate) {
-        gatherMatrices(dist, tiles, origTiles, printResults || validate, validate,
-                       fullL, fullA);
+        std::vector<double> coldata(localElems);
+        if (localBytes > 0) {
+            CUDA_CHECK(cudaMemcpy(coldata.data(), d_L, localBytes,
+                                  cudaMemcpyDeviceToHost));
+        }
+        localL.assign(localElems, 0.0);
+#pragma omp parallel for schedule(static) num_threads(threads)
+        for (int l = 0; l < localRows; ++l) {
+            const size_t gi = static_cast<size_t>(rank) +
+                              static_cast<size_t>(nprocs) *
+                                  static_cast<size_t>(l);
+            for (size_t j = 0; j <= gi; ++j) {
+                localL[static_cast<size_t>(l) * n + j] =
+                    coldata[j * static_cast<size_t>(localRows) +
+                            static_cast<size_t>(l)];
+            }
+        }
+        std::vector<double>().swap(coldata);
+
+        if (validate) {
+            A_orig_rows.assign(localElems, 0.0);
+#pragma omp parallel for schedule(static) num_threads(threads)
+            for (int l = 0; l < localRows; ++l) {
+                for (size_t j = 0; j < n; ++j) {
+                    A_orig_rows[static_cast<size_t>(l) * n + j] =
+                        A_orig[j * static_cast<size_t>(localRows) +
+                               static_cast<size_t>(l)];
+                }
+            }
+            std::vector<double>().swap(A_orig);
+        }
     }
 
-    int exitCode = 0;
-    if (rank == 0) {
-        if (printResults) {
+    // Free device buffers that are no longer needed.
+    if (d_pack) cudaFree(d_pack);
+    if (d_S) cudaFree(d_S);
+    if (d_pT) cudaFree(d_pT);
+    if (d_L) cudaFree(d_L);
+
+    bool valid = true;
+    if (printResults || validate) {
+        std::vector<int> counts(nprocs, 0);
+        std::vector<int> displs(nprocs, 0);
+        int total = 0;
+        for (int r = 0; r < nprocs; ++r) {
+            counts[r] = localRowCount(n, r, nprocs) * static_cast<int>(n);
+            displs[r] = total;
+            total += counts[r];
+        }
+
+        std::vector<double> fullL;
+        std::vector<double> scratch;
+        gatherRows(localL, n, nprocs, rank, counts, displs, fullL, scratch, true);
+
+        if (validate) {
+            std::vector<double> fullA;
+            std::vector<double> scratchA;
+            gatherRows(A_orig_rows, n, nprocs, rank, counts, displs, fullA,
+                       scratchA, false);
+            if (rank == 0) {
+                printf("Validating result...\n");
+                valid = validateCholesky(fullL, fullA, n, threads);
+                if (valid) {
+                    printf("Validation: PASSED\n");
+                } else {
+                    printf("Validation: FAILED\n");
+                }
+            }
+        }
+
+        if (printResults && rank == 0) {
             print_results(fullL, "CholeskyL");
         }
 
-        if (validate) {
-            printf("Validating result...\n");
-            const bool valid = validateCholesky(fullL, fullA, n);
-            if (valid) {
-                printf("Validation: PASSED\n");
-            } else {
-                printf("Validation: FAILED\n");
-                exitCode = 1;
-            }
-        }
-        fflush(stdout);
     }
 
-    int globalExit = 0;
-    MPI_Allreduce(&exitCode, &globalExit, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    if (h_send) std::free(h_send);
+    if (h_Spanel) std::free(h_Spanel);
+    if (h_pt) std::free(h_pt);
+    if (h_block) std::free(h_block);
+    if (h_pack) std::free(h_pack);
+    if (h_reduce) std::free(h_reduce);
+    if (nodeComm != MPI_COMM_NULL) {
+        MPI_Comm_free(&nodeComm);
+    }
 
     MPI_Finalize();
-    return globalExit;
+    return (rank == 0 && !valid) ? 1 : 0;
 }

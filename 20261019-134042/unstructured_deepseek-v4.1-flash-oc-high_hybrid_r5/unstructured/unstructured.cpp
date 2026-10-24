@@ -9,8 +9,8 @@
 #include <vector>
 
 #include <mpi.h>
-#include <cuda_runtime.h>
 #include <omp.h>
+#include <cuda_runtime.h>
 
 #include "../common/results_output.hpp"
 
@@ -41,467 +41,339 @@ struct ElementDynamic {
     val_t total_flux;
 };
 
-// World state
-struct World {
-    std::vector<Material> materials;
-    std::vector<ElementStatic> elements_static;
-    std::vector<ElementDynamic> elements_dynamic;
-    std::vector<ElementDynamic> elements_dynamic_swap;
-};
-
 // Material type IDs
 constexpr idx_t DEFAULT_MAT_ID = 0;
 constexpr idx_t INFLOW_MAT_ID = 1;
 constexpr idx_t OUTFLOW_MAT_ID = 2;
 
-static void cudaCheck(cudaError_t err, const char* what) {
-    if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error in %s: %s\n", what, cudaGetErrorString(err));
+constexpr uint64_t HASH_MULT_ENERGY = 0x9e3779b97f4a7c15ULL;
+constexpr uint64_t HASH_MULT_FLUX = 0xbf58476d1ce4e5b9ULL;
+
+constexpr int TAG_X_TOP = 1001;
+constexpr int TAG_X_BOTTOM = 1002;
+constexpr int TAG_Y_LEFT = 1003;
+constexpr int TAG_Y_RIGHT = 1004;
+
+constexpr int CUDA_THREADS = 256;
+
+static void checkMpi(int rc, const char* what) {
+    if (rc != MPI_SUCCESS) {
+        char err[MPI_MAX_ERROR_STRING];
+        int len = 0;
+        MPI_Error_string(rc, err, &len);
+        fprintf(stderr, "MPI error in %s: %s\n", what, err);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 }
 
-// Define the material set for the 2D square mesh.  The regular mesh
-// connectivity is represented analytically by the GPU kernels, so no
-// per-element connectivity copy needs to be materialized on the host.
-void buildSquare2D(World& world, const int n_elems_root) {
-    (void)n_elems_root;
-
-    world.materials.emplace_back(Material{0.8, 0.0});    // Default material
-    world.materials.emplace_back(Material{0.8, 0.5});    // Inflow material
-    world.materials.emplace_back(Material{0.8, -0.5});   // Outflow material
-}
-
-// Compute one element of the regular 2D mesh.  Retaining the original
-// connection order (+row, -row, +column, -column) keeps the floating-point
-// result identical to the reference implementation.
-__device__ __forceinline__ void updateGridElement(
-        const double* __restrict__ energy,
-        double* __restrict__ energy_next,
-        double* __restrict__ flux,
-        int n,
-        int first_row,
-        int local_row,
-        int column,
-        double transfer_coeff,
-        double inflow_flow,
-        double outflow_flow) {
-    const int global_row = first_row + local_row;
-    const size_t index = static_cast<size_t>(local_row + 1) * n + column;
-    const double self_energy = energy[index];
-    double total_flux;
-
-    if ((global_row == 0 && column == 0) ||
-        (global_row == n - 1 && column == n - 1)) {
-        total_flux = inflow_flow;
-    } else if ((global_row == 0 && column == n - 1) ||
-               (global_row == n - 1 && column == 0)) {
-        total_flux = outflow_flow;
-    } else {
-        total_flux = 0.0;
-    }
-
-    if (global_row + 1 < n) {
-        total_flux += (energy[index + n] - self_energy) *
-                      transfer_coeff * 1.0 * 0.25;
-    }
-    if (global_row > 0) {
-        total_flux += (energy[index - n] - self_energy) *
-                      transfer_coeff * 1.0 * 0.25;
-    }
-    if (column + 1 < n) {
-        total_flux += (energy[index + 1] - self_energy) *
-                      transfer_coeff * 1.0 * 0.25;
-    }
-    if (column > 0) {
-        total_flux += (energy[index - 1] - self_energy) *
-                      transfer_coeff * 1.0 * 0.25;
-    }
-
-    energy_next[index] = self_energy + total_flux;
-    const size_t flux_index = static_cast<size_t>(local_row) * n + column;
-    flux[flux_index] = flux[flux_index] + fabs(total_flux);
-}
-
-__global__ void gridRowsKernel(
-        const double* __restrict__ energy,
-        double* __restrict__ energy_next,
-        double* __restrict__ flux,
-        int n,
-        int first_row,
-        int first_local_row,
-        int row_count,
-        double transfer_coeff,
-        double inflow_flow,
-        double outflow_flow) {
-    const int column = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row_offset = blockIdx.y;
-    if (column < n && row_offset < row_count) {
-        updateGridElement(energy, energy_next, flux, n, first_row,
-                          first_local_row + row_offset, column,
-                          transfer_coeff, inflow_flow, outflow_flow);
+static void checkCuda(cudaError_t rc, const char* what) {
+    if (rc != cudaSuccess) {
+        fprintf(stderr, "CUDA error in %s: %s\n", what, cudaGetErrorString(rc));
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 }
 
-__global__ void gridBoundaryKernel(
-        const double* __restrict__ energy,
-        double* __restrict__ energy_next,
-        double* __restrict__ flux,
-        int n,
-        int first_row,
-        int local_rows,
-        double transfer_coeff,
-        double inflow_flow,
-        double outflow_flow) {
-    const int column = blockIdx.x * blockDim.x + threadIdx.x;
-    if (column >= n) {
+struct LocalMesh {
+    MPI_Comm cart = MPI_COMM_NULL;
+    int N = 0;
+    int xs = 0, ys = 0;
+    int lx = 0, ly = 0;
+    int stride = 0;
+    int total = 0;
+    int xm = MPI_PROC_NULL, xp = MPI_PROC_NULL;
+    int ym = MPI_PROC_NULL, yp = MPI_PROC_NULL;
+
+    double* d_energy = nullptr;
+    double* d_energy_swap = nullptr;
+    double* d_flux = nullptr;
+    double* d_flux_swap = nullptr;
+    double* d_columns = nullptr;
+    int* d_material = nullptr;
+    Material* d_materials = nullptr;
+
+    double* h_send = nullptr;
+    double* h_recv = nullptr;
+
+    cudaStream_t stream = nullptr;
+};
+
+__global__ void computeFluxKernel(const double* __restrict__ energy_in,
+                                  const double* __restrict__ flux_in,
+                                  double* __restrict__ energy_out,
+                                  double* __restrict__ flux_out,
+                                  const int* __restrict__ material_idx,
+                                  const Material* __restrict__ materials,
+                                  int local_nx, int local_ny, int stride,
+                                  int xs, int ys, int N) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = local_nx * local_ny;
+    if (t >= total) {
         return;
     }
-    const int local_row = blockIdx.y == 0 ? 0 : local_rows - 1;
-    updateGridElement(energy, energy_next, flux, n, first_row, local_row,
-                      column, transfer_coeff, inflow_flow, outflow_flow);
+
+    const int lx = t / local_ny;
+    const int ly = t - lx * local_ny;
+    const int L = lx + 1;
+    const int C = ly + 1;
+    const int gx = xs + lx;
+    const int gy = ys + ly;
+    const int li = L * stride + C;
+
+    const Material mat = materials[material_idx[t]];
+    const double transfer_coeff = mat.transfer_coeff;
+    const double e = energy_in[li];
+
+    double total_flux = mat.external_flow;
+
+    if (gx + 1 < N) {
+        total_flux += (energy_in[li + stride] - e) * transfer_coeff * 1.0 * 0.25;
+    }
+    if (gx - 1 >= 0) {
+        total_flux += (energy_in[li - stride] - e) * transfer_coeff * 1.0 * 0.25;
+    }
+    if (gy + 1 < N) {
+        total_flux += (energy_in[li + 1] - e) * transfer_coeff * 1.0 * 0.25;
+    }
+    if (gy - 1 >= 0) {
+        total_flux += (energy_in[li - 1] - e) * transfer_coeff * 1.0 * 0.25;
+    }
+
+    energy_out[li] = e + total_flux;
+    flux_out[li] = flux_in[li] + fabs(total_flux);
 }
 
-// Run simulation for n_iters iterations using MPI row decomposition, OpenMP
-// for host-side setup, and CUDA for the per-element flux computation.
-double runSimulation(World& world, const int n_elems_root, const int n_iters) {
-    int mpi_rank = 0;
-    int mpi_size = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
-
-    const int n = n_elems_root;
-    const uint64_t n_elems = static_cast<uint64_t>(n) * static_cast<uint64_t>(n);
-
-    // Material properties are the only mesh data needed by the analytic grid
-    // kernel.  Broadcast them and release the replicated mesh on rank 0.
-    std::vector<Material> materials(3);
-    if (mpi_rank == 0) {
-        materials = world.materials;
+__global__ void packColumnsKernel(const double* __restrict__ energy,
+                                  double* __restrict__ columns,
+                                  int lx, int ly, int stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= lx) {
+        return;
     }
-    MPI_Bcast(materials.data(), static_cast<int>(materials.size() *
-              sizeof(Material)), MPI_BYTE, 0, MPI_COMM_WORLD);
+    const size_t row = static_cast<size_t>(i + 1) * stride;
+    columns[i] = energy[row + 1];
+    columns[lx + i] = energy[row + ly];
+}
 
-    const double transfer_coeff = materials[DEFAULT_MAT_ID].transfer_coeff;
-    const double inflow_flow = materials[INFLOW_MAT_ID].external_flow;
-    const double outflow_flow = materials[OUTFLOW_MAT_ID].external_flow;
-
-    if (mpi_rank == 0) {
-        std::vector<ElementStatic>().swap(world.elements_static);
-        std::vector<ElementDynamic>().swap(world.elements_dynamic);
-        std::vector<ElementDynamic>().swap(world.elements_dynamic_swap);
+__global__ void unpackColumnsKernel(double* __restrict__ energy,
+                                    const double* __restrict__ columns,
+                                    int lx, int ly, int stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= lx) {
+        return;
     }
+    const size_t row = static_cast<size_t>(i + 1) * stride;
+    energy[row] = columns[i];
+    energy[row + ly + 1] = columns[lx + i];
+}
 
-    // Balanced row partition.  A rank owns [first_row, first_row + local_rows).
-    const int rows_per_rank = n / mpi_size;
-    const int remainder = n % mpi_size;
-    const int local_rows = rows_per_rank +
-                           (mpi_rank < remainder ? 1 : 0);
-    const int first_row = mpi_rank * rows_per_rank +
-                          std::min(mpi_rank, remainder);
-    const size_t local_n = static_cast<size_t>(local_rows) * n;
-
-    std::vector<int> counts(static_cast<size_t>(mpi_size));
-    std::vector<int> displs(static_cast<size_t>(mpi_size));
-    for (int r = 0; r < mpi_size; ++r) {
-        const int rows = rows_per_rank + (r < remainder ? 1 : 0);
-        const int first = r * rows_per_rank + std::min(r, remainder);
-        counts[r] = rows * n;
-        displs[r] = first * n;
+static void exchangeHalos(LocalMesh& mesh, double* energy, cudaStream_t stream) {
+    const int lx = mesh.lx;
+    const int ly = mesh.ly;
+    if (lx == 0 || ly == 0) {
+        return;
     }
 
-    // Two energy buffers with one ghost row above and below the local block.
-    const size_t padded_energy =
-        (static_cast<size_t>(local_rows) + 2) * static_cast<size_t>(n);
-    const size_t alloc_energy = std::max<size_t>(padded_energy, 1);
-    const size_t alloc_local = std::max<size_t>(local_n, 1);
-
-    double* d_energy[2] = {nullptr, nullptr};
-    cudaCheck(cudaMalloc(reinterpret_cast<void**>(&d_energy[0]),
-                         alloc_energy * sizeof(double)), "cudaMalloc energy 0");
-    cudaCheck(cudaMalloc(reinterpret_cast<void**>(&d_energy[1]),
-                         alloc_energy * sizeof(double)), "cudaMalloc energy 1");
-    cudaCheck(cudaMemset(d_energy[0], 0, alloc_energy * sizeof(double)),
-              "cudaMemset energy 0");
-    cudaCheck(cudaMemset(d_energy[1], 0, alloc_energy * sizeof(double)),
-              "cudaMemset energy 1");
-
-    double* d_flux = nullptr;
-    cudaCheck(cudaMalloc(reinterpret_cast<void**>(&d_flux),
-                         alloc_local * sizeof(double)), "cudaMalloc flux");
-    cudaCheck(cudaMemset(d_flux, 0, alloc_local * sizeof(double)),
-              "cudaMemset flux");
-
-    cudaStream_t compute_stream = nullptr;
-    cudaStream_t comm_stream = nullptr;
-    cudaCheck(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking),
-              "cudaStreamCreate compute");
-    cudaCheck(cudaStreamCreateWithFlags(&comm_stream, cudaStreamNonBlocking),
-              "cudaStreamCreate comm");
-    cudaEvent_t update_complete = nullptr;
-    cudaEvent_t halos_ready = nullptr;
-    cudaCheck(cudaEventCreateWithFlags(&update_complete, cudaEventDisableTiming),
-              "cudaEventCreate update");
-    cudaCheck(cudaEventCreateWithFlags(&halos_ready, cudaEventDisableTiming),
-              "cudaEventCreate halos");
-    cudaCheck(cudaEventRecord(update_complete, compute_stream),
-              "cudaEventRecord initial");
-
-    constexpr int threads_per_block = 256;
-    const dim3 block(threads_per_block, 1);
-    const dim3 column_blocks((n + threads_per_block - 1) / threads_per_block);
-    const size_t row_bytes = static_cast<size_t>(n) * sizeof(double);
-
-    const int previous_rank =
-        mpi_rank == 0 ? MPI_PROC_NULL : mpi_rank - 1;
-    const int next_rank =
-        mpi_rank + 1 == mpi_size ? MPI_PROC_NULL : mpi_rank + 1;
-    constexpr int tag_top = 0;
-    constexpr int tag_bottom = 1;
-
-    // Pinned staging buffers for the two halo rows.  Only O(n) data crosses
-    // the PCIe link per iteration, independent of the local row count.
-    double* h_send_previous = nullptr;
-    double* h_send_next = nullptr;
-    double* h_receive_previous = nullptr;
-    double* h_receive_next = nullptr;
-    if (mpi_size > 1) {
-        cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&h_send_previous),
-                                 row_bytes), "host alloc send_previous");
-        cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&h_send_next),
-                                 row_bytes), "host alloc send_next");
-        cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&h_receive_previous),
-                                 row_bytes), "host alloc receive_previous");
-        cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&h_receive_next),
-                                 row_bytes), "host alloc receive_next");
+    const bool have_x = (mesh.xm != MPI_PROC_NULL) || (mesh.xp != MPI_PROC_NULL);
+    const bool have_y = (mesh.ym != MPI_PROC_NULL) || (mesh.yp != MPI_PROC_NULL);
+    if (!have_x && !have_y) {
+        return;
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    const auto loop_start = std::chrono::high_resolution_clock::now();
+    const size_t stride = static_cast<size_t>(mesh.stride);
+    const size_t elem = sizeof(double);
+    double* send = mesh.h_send;
+    double* recv = mesh.h_recv;
 
-    int current = 0;
+    const size_t send_top = 0;
+    const size_t send_bottom = send_top + ly;
+    const size_t send_left = send_bottom + ly;
+    const size_t send_right = send_left + lx;
+
+    const size_t recv_top = 0;
+    const size_t recv_bottom = recv_top + ly;
+    const size_t recv_left = recv_bottom + ly;
+    const size_t recv_right = recv_left + lx;
+
+    const int column_blocks = (lx + CUDA_THREADS - 1) / CUDA_THREADS;
+
+    if (have_x) {
+        checkCuda(cudaMemcpyAsync(send + send_top,
+                                  energy + stride + 1,
+                                  static_cast<size_t>(ly) * elem,
+                                  cudaMemcpyDeviceToHost, stream),
+                  "copy top row D2H");
+        checkCuda(cudaMemcpyAsync(send + send_bottom,
+                                  energy + static_cast<size_t>(lx) * stride + 1,
+                                  static_cast<size_t>(ly) * elem,
+                                  cudaMemcpyDeviceToHost, stream),
+                  "copy bottom row D2H");
+    }
+    if (have_y) {
+        packColumnsKernel<<<column_blocks, CUDA_THREADS, 0, stream>>>(
+            energy, mesh.d_columns, lx, ly, mesh.stride);
+        checkCuda(cudaGetLastError(), "packColumnsKernel launch");
+        checkCuda(cudaMemcpyAsync(send + send_left, mesh.d_columns,
+                                  static_cast<size_t>(2 * lx) * elem,
+                                  cudaMemcpyDeviceToHost, stream),
+                  "copy columns D2H");
+    }
+    checkCuda(cudaStreamSynchronize(stream), "sync boundary D2H");
+
+    if (have_x) {
+        checkMpi(MPI_Sendrecv(send + send_top, ly, MPI_DOUBLE, mesh.xm, TAG_X_TOP,
+                              recv + recv_bottom, ly, MPI_DOUBLE, mesh.xp, TAG_X_TOP,
+                              mesh.cart, MPI_STATUS_IGNORE),
+                 "MPI_Sendrecv x top");
+        checkMpi(MPI_Sendrecv(send + send_bottom, ly, MPI_DOUBLE, mesh.xp, TAG_X_BOTTOM,
+                              recv + recv_top, ly, MPI_DOUBLE, mesh.xm, TAG_X_BOTTOM,
+                              mesh.cart, MPI_STATUS_IGNORE),
+                 "MPI_Sendrecv x bottom");
+    }
+    if (have_y) {
+        checkMpi(MPI_Sendrecv(send + send_left, lx, MPI_DOUBLE, mesh.ym, TAG_Y_LEFT,
+                              recv + recv_right, lx, MPI_DOUBLE, mesh.yp, TAG_Y_LEFT,
+                              mesh.cart, MPI_STATUS_IGNORE),
+                 "MPI_Sendrecv y left");
+        checkMpi(MPI_Sendrecv(send + send_right, lx, MPI_DOUBLE, mesh.yp, TAG_Y_RIGHT,
+                              recv + recv_left, lx, MPI_DOUBLE, mesh.ym, TAG_Y_RIGHT,
+                              mesh.cart, MPI_STATUS_IGNORE),
+                 "MPI_Sendrecv y right");
+    }
+
+    if (have_x) {
+        checkCuda(cudaMemcpyAsync(energy + 1,
+                                  recv + recv_top,
+                                  static_cast<size_t>(ly) * elem,
+                                  cudaMemcpyHostToDevice, stream),
+                  "copy top ghost H2D");
+        checkCuda(cudaMemcpyAsync(energy + static_cast<size_t>(lx + 1) * stride + 1,
+                                  recv + recv_bottom,
+                                  static_cast<size_t>(ly) * elem,
+                                  cudaMemcpyHostToDevice, stream),
+                  "copy bottom ghost H2D");
+    }
+    if (have_y) {
+        checkCuda(cudaMemcpyAsync(mesh.d_columns, recv + recv_left,
+                                  static_cast<size_t>(2 * lx) * elem,
+                                  cudaMemcpyHostToDevice, stream),
+                  "copy columns H2D");
+        unpackColumnsKernel<<<column_blocks, CUDA_THREADS, 0, stream>>>(
+            energy, mesh.d_columns, lx, ly, mesh.stride);
+        checkCuda(cudaGetLastError(), "unpackColumnsKernel launch");
+    }
+}
+
+// Run simulation for n_iters iterations
+static void runSimulation(LocalMesh& mesh, const int n_iters) {
+    double* energy = mesh.d_energy;
+    double* energy_swap = mesh.d_energy_swap;
+    double* flux = mesh.d_flux;
+    double* flux_swap = mesh.d_flux_swap;
+
+    const int blocks = (mesh.total + CUDA_THREADS - 1) / CUDA_THREADS;
+
     for (int iter = 0; iter < n_iters; ++iter) {
-        const int next = 1 - current;
-        double* current_energy = d_energy[current];
-        double* next_energy = d_energy[next];
-
-        if (mpi_size == 1) {
-            if (local_rows > 0) {
-                const dim3 grid(column_blocks.x, local_rows);
-                gridRowsKernel<<<grid, block, 0, compute_stream>>>(
-                    current_energy, next_energy, d_flux, n, first_row, 0,
-                    local_rows, transfer_coeff, inflow_flow, outflow_flow);
-                cudaCheck(cudaGetLastError(), "gridRowsKernel launch");
-            }
-            cudaCheck(cudaEventRecord(update_complete, compute_stream),
-                      "record update complete");
-            current = next;
-            continue;
+        if (mesh.total > 0) {
+            computeFluxKernel<<<blocks, CUDA_THREADS, 0, mesh.stream>>>(
+                energy, flux, energy_swap, flux_swap,
+                mesh.d_material, mesh.d_materials,
+                mesh.lx, mesh.ly, mesh.stride, mesh.xs, mesh.ys, mesh.N);
+            checkCuda(cudaGetLastError(), "computeFluxKernel launch");
         }
 
-        MPI_Request requests[4];
-        int request_count = 0;
-
-        // Receive the current-time halo rows into the ghost rows of the
-        // current buffer.  Interior rows are independent of these halos.
-        if (previous_rank != MPI_PROC_NULL) {
-            MPI_Irecv(h_receive_previous, n, MPI_DOUBLE, previous_rank,
-                      tag_bottom, MPI_COMM_WORLD,
-                      &requests[request_count++]);
-        }
-        if (next_rank != MPI_PROC_NULL) {
-            MPI_Irecv(h_receive_next, n, MPI_DOUBLE, next_rank, tag_top,
-                      MPI_COMM_WORLD, &requests[request_count++]);
+        if (iter + 1 < n_iters) {
+            exchangeHalos(mesh, energy_swap, mesh.stream);
         }
 
-        cudaCheck(cudaStreamWaitEvent(comm_stream, update_complete, 0),
-                  "comm wait update");
-        if (previous_rank != MPI_PROC_NULL) {
-            cudaCheck(cudaMemcpyAsync(h_send_previous, current_energy + n,
-                                      row_bytes, cudaMemcpyDeviceToHost,
-                                      comm_stream), "download top row");
-        }
-        if (next_rank != MPI_PROC_NULL) {
-            cudaCheck(cudaMemcpyAsync(
-                          h_send_next,
-                          current_energy + static_cast<size_t>(local_rows) * n,
-                          row_bytes, cudaMemcpyDeviceToHost, comm_stream),
-                      "download bottom row");
-        }
-
-        // Interior rows overlap the halo copies and the MPI exchange.
-        if (local_rows > 2) {
-            const dim3 grid(column_blocks.x, local_rows - 2);
-            gridRowsKernel<<<grid, block, 0, compute_stream>>>(
-                current_energy, next_energy, d_flux, n, first_row, 1,
-                local_rows - 2, transfer_coeff, inflow_flow, outflow_flow);
-            cudaCheck(cudaGetLastError(), "gridRowsKernel launch interior");
-        }
-
-        cudaCheck(cudaStreamSynchronize(comm_stream), "halo download synchronize");
-        if (previous_rank != MPI_PROC_NULL) {
-            MPI_Isend(h_send_previous, n, MPI_DOUBLE, previous_rank, tag_top,
-                      MPI_COMM_WORLD, &requests[request_count++]);
-        }
-        if (next_rank != MPI_PROC_NULL) {
-            MPI_Isend(h_send_next, n, MPI_DOUBLE, next_rank, tag_bottom,
-                      MPI_COMM_WORLD, &requests[request_count++]);
-        }
-        MPI_Waitall(request_count, requests, MPI_STATUS_IGNORE);
-
-        if (previous_rank != MPI_PROC_NULL) {
-            cudaCheck(cudaMemcpyAsync(current_energy, h_receive_previous,
-                                      row_bytes, cudaMemcpyHostToDevice,
-                                      comm_stream), "upload top ghost row");
-        }
-        if (next_rank != MPI_PROC_NULL) {
-            cudaCheck(cudaMemcpyAsync(
-                          current_energy +
-                              static_cast<size_t>(local_rows + 1) * n,
-                          h_receive_next, row_bytes, cudaMemcpyHostToDevice,
-                          comm_stream), "upload bottom ghost row");
-        }
-        cudaCheck(cudaEventRecord(halos_ready, comm_stream),
-                  "record halos ready");
-        cudaCheck(cudaStreamWaitEvent(compute_stream, halos_ready, 0),
-                  "compute wait halos");
-
-        if (local_rows > 0) {
-            const unsigned int boundary_rows = local_rows == 1 ? 1U : 2U;
-            const dim3 boundary_grid(column_blocks.x, boundary_rows);
-            gridBoundaryKernel<<<boundary_grid, block, 0, compute_stream>>>(
-                current_energy, next_energy, d_flux, n, first_row, local_rows,
-                transfer_coeff, inflow_flow, outflow_flow);
-            cudaCheck(cudaGetLastError(), "gridBoundaryKernel launch");
-        }
-        cudaCheck(cudaEventRecord(update_complete, compute_stream),
-                  "record update complete");
-        current = next;
+        std::swap(energy, energy_swap);
+        std::swap(flux, flux_swap);
     }
 
-    cudaCheck(cudaEventSynchronize(update_complete), "final event synchronize");
-    MPI_Barrier(MPI_COMM_WORLD);
-    const auto loop_end = std::chrono::high_resolution_clock::now();
-    const double compute_ms =
-        std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
+    checkCuda(cudaStreamSynchronize(mesh.stream), "sync simulation");
 
-    std::vector<double> final_energy(local_n);
-    std::vector<double> final_flux(local_n);
-    if (local_n > 0) {
-        cudaCheck(cudaMemcpyAsync(final_energy.data(), d_energy[current] + n,
-                                  local_n * sizeof(double),
-                                  cudaMemcpyDeviceToHost, compute_stream),
-                  "download final energy");
-        cudaCheck(cudaMemcpyAsync(final_flux.data(), d_flux,
-                                  local_n * sizeof(double),
-                                  cudaMemcpyDeviceToHost, compute_stream),
-                  "download final flux");
-    }
-    cudaCheck(cudaStreamSynchronize(compute_stream),
-              "final download synchronize");
-
-    std::vector<double> global_energy;
-    std::vector<double> global_flux;
-    if (mpi_rank == 0) {
-        global_energy.resize(static_cast<size_t>(n_elems));
-        global_flux.resize(static_cast<size_t>(n_elems));
-    }
-    MPI_Gatherv(final_energy.data(), static_cast<int>(local_n), MPI_DOUBLE,
-                mpi_rank == 0 ? global_energy.data() : nullptr, counts.data(),
-                displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    MPI_Gatherv(final_flux.data(), static_cast<int>(local_n), MPI_DOUBLE,
-                mpi_rank == 0 ? global_flux.data() : nullptr, counts.data(),
-                displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-    if (mpi_rank == 0) {
-        world.elements_dynamic.resize(static_cast<size_t>(n_elems));
-        #pragma omp parallel for schedule(static)
-        for (long long ii = 0; ii < static_cast<long long>(n_elems); ++ii) {
-            const size_t i = static_cast<size_t>(ii);
-            world.elements_dynamic[i].current_energy = global_energy[i];
-            world.elements_dynamic[i].total_flux = global_flux[i];
-        }
-    }
-
-    if (mpi_size > 1) {
-        cudaCheck(cudaFreeHost(h_send_previous), "free send_previous");
-        cudaCheck(cudaFreeHost(h_send_next), "free send_next");
-        cudaCheck(cudaFreeHost(h_receive_previous), "free receive_previous");
-        cudaCheck(cudaFreeHost(h_receive_next), "free receive_next");
-    }
-    cudaCheck(cudaEventDestroy(halos_ready), "destroy halos event");
-    cudaCheck(cudaEventDestroy(update_complete), "destroy update event");
-    cudaCheck(cudaStreamDestroy(comm_stream), "destroy comm stream");
-    cudaCheck(cudaStreamDestroy(compute_stream), "destroy compute stream");
-    cudaCheck(cudaFree(d_energy[0]), "cudaFree energy 0");
-    cudaCheck(cudaFree(d_energy[1]), "cudaFree energy 1");
-    cudaCheck(cudaFree(d_flux), "cudaFree flux");
-
-    double max_compute_ms = 0.0;
-    MPI_Allreduce(&compute_ms, &max_compute_ms, 1, MPI_DOUBLE, MPI_MAX,
-                  MPI_COMM_WORLD);
-    return max_compute_ms;
+    mesh.d_energy = energy;
+    mesh.d_energy_swap = energy_swap;
+    mesh.d_flux = flux;
+    mesh.d_flux_swap = flux_swap;
 }
 
 // Validate simulation results
-bool validateResults(const World& world) {
+static bool validateResults(const std::vector<ElementDynamic>& elements) {
     val_t energy_sum = 0.0;
     val_t flux_sum = 0.0;
     val_t energy_max = std::numeric_limits<val_t>::lowest();
     val_t energy_min = std::numeric_limits<val_t>::max();
-    
-    for (const auto& elem : world.elements_dynamic) {
+
+    for (const auto& elem : elements) {
         energy_sum += elem.current_energy;
         flux_sum += elem.total_flux;
         energy_max = std::max(elem.current_energy, energy_max);
         energy_min = std::min(elem.current_energy, energy_min);
     }
-    
+
     printf("Validation results:\n");
     printf("  Energy sum: %.12f\n", energy_sum);
     printf("  Flux sum: %.2f\n", flux_sum);
     printf("  Energy range: [%.6f, %.6f]\n", energy_min, energy_max);
-    
+
     // Check for numerical issues
     constexpr val_t energy_epsilon = 1e-8;
-    
+
     if (!std::isfinite(energy_sum)) {
         printf("  ERROR: Energy sum is not finite\n");
         return false;
     }
-    
+
     if (std::abs(energy_sum) > energy_epsilon) {
         printf("  WARNING: Energy sum diverged from 0 (expected conservation)\n");
         // Don't fail validation as this can happen with external flows
     }
-    
+
     if (!std::isfinite(flux_sum)) {
         printf("  ERROR: Flux sum is not finite\n");
         return false;
     }
-    
+
     if (!std::isfinite(energy_max) || !std::isfinite(energy_min)) {
         printf("  ERROR: Energy extrema are not finite\n");
         return false;
     }
-    
+
     printf("  Validation: PASSED\n");
     return true;
 }
 
-// Compute a simple hash of the results for verification
-uint64_t computeHash(const std::vector<ElementDynamic>& elements) {
-    uint64_t hash = 0;
-    #pragma omp parallel for schedule(static) reduction(^ : hash)
-    for (long long ii = 0; ii < static_cast<long long>(elements.size()); ++ii) {
-        const size_t i = static_cast<size_t>(ii);
-        // Simple hash combining energy and flux values
-        const uint64_t* e_ptr = reinterpret_cast<const uint64_t*>(&elements[i].current_energy);
-        const uint64_t* f_ptr = reinterpret_cast<const uint64_t*>(&elements[i].total_flux);
-        hash ^= (*e_ptr + i) * 0x9e3779b97f4a7c15ULL;
-        hash ^= (*f_ptr + i) * 0xbf58476d1ce4e5b9ULL;
+static void chooseProcessGrid(int world_size, int N, int dims[2]) {
+    if (world_size <= N && world_size <= 8) {
+        dims[0] = world_size;
+        dims[1] = 1;
+        return;
     }
-    return hash;
+
+    int best_px = 1;
+    int best_py = 1;
+    int best_prod = 0;
+    const int max_px = std::min(world_size, N);
+    for (int px = 1; px <= max_px; ++px) {
+        const int py = std::min(N, world_size / px);
+        if (py < 1) {
+            continue;
+        }
+        const int prod = px * py;
+        const int diff = std::abs(px - py);
+        const int best_diff = std::abs(best_px - best_py);
+        const bool better =
+            (prod > best_prod) ||
+            (prod == best_prod && diff < best_diff) ||
+            (prod == best_prod && diff == best_diff && px > best_px);
+        if (better) {
+            best_px = px;
+            best_py = py;
+            best_prod = prod;
+        }
+    }
+    dims[0] = best_px;
+    dims[1] = best_py;
 }
 
 void printUsage(const char* progName) {
@@ -515,45 +387,18 @@ void printUsage(const char* progName) {
 }
 
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+    checkMpi(MPI_Init(&argc, &argv), "MPI_Init");
 
-    int mpi_rank = 0;
-    int mpi_size = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
-
-    // One GPU per local rank (several ranks may share a GPU if necessary).
-    MPI_Comm local_comm = MPI_COMM_NULL;
-    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, mpi_rank,
-                        MPI_INFO_NULL, &local_comm);
-    int local_rank = 0;
-    int local_size = 1;
-    MPI_Comm_rank(local_comm, &local_rank);
-    MPI_Comm_size(local_comm, &local_size);
-
-    int device_count = 0;
-    cudaError_t device_status = cudaGetDeviceCount(&device_count);
-    if (device_status != cudaSuccess || device_count == 0) {
-        if (mpi_rank == 0) {
-            fprintf(stderr, "No CUDA device available\n");
-        }
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    cudaCheck(cudaSetDevice(local_rank % device_count), "cudaSetDevice");
-
-#ifdef _OPENMP
-    if (getenv("OMP_NUM_THREADS") == nullptr && local_size > 1) {
-        const int threads = std::max(1, omp_get_max_threads() / local_size);
-        omp_set_num_threads(threads);
-    }
-#endif
+    int world_rank = 0;
+    int world_size = 1;
+    checkMpi(MPI_Comm_rank(MPI_COMM_WORLD, &world_rank), "MPI_Comm_rank");
+    checkMpi(MPI_Comm_size(MPI_COMM_WORLD, &world_size), "MPI_Comm_size");
 
     int n_elems_root = 512;
     int n_iters = 10;
     bool validate = false;
     bool printResults = false;
-    int bad_arguments = 0;
-    
+
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
@@ -565,58 +410,112 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-r") == 0) {
             printResults = true;
         } else if (strcmp(argv[i], "-h") == 0) {
-            if (mpi_rank == 0) {
+            if (world_rank == 0) {
                 printUsage(argv[0]);
             }
-            MPI_Comm_free(&local_comm);
             MPI_Finalize();
             return 0;
         } else {
-            if (mpi_rank == 0) {
+            if (world_rank == 0) {
                 printf("Unknown option: %s\n", argv[i]);
                 printUsage(argv[0]);
             }
-            bad_arguments = 1;
-            break;
+            MPI_Finalize();
+            return 1;
         }
     }
 
-    int global_bad = 0;
-    MPI_Allreduce(&bad_arguments, &global_bad, 1, MPI_INT, MPI_MAX,
-                  MPI_COMM_WORLD);
-    if (global_bad) {
-        MPI_Comm_free(&local_comm);
+    if (n_elems_root <= 0) {
+        if (world_rank == 0) {
+            printf("Grid size must be positive\n");
+        }
         MPI_Finalize();
         return 1;
     }
-    
-    const long long n_elems = static_cast<long long>(n_elems_root) *
-                              static_cast<long long>(n_elems_root);
-    
-    if (mpi_rank == 0) {
+
+    const int N = n_elems_root;
+    const long long n_elems_ll = static_cast<long long>(N) * N;
+    const size_t n_elems = static_cast<size_t>(n_elems_ll);
+
+    int device_count = 0;
+    checkCuda(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
+    if (device_count <= 0) {
+        if (world_rank == 0) {
+            fprintf(stderr, "No CUDA device available\n");
+        }
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    MPI_Comm node_comm = MPI_COMM_NULL;
+    checkMpi(MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, world_rank,
+                                 MPI_INFO_NULL, &node_comm),
+             "MPI_Comm_split_type");
+    int local_rank = 0;
+    int local_size = 1;
+    checkMpi(MPI_Comm_rank(node_comm, &local_rank), "MPI_Comm_rank(node)");
+    checkMpi(MPI_Comm_size(node_comm, &local_size), "MPI_Comm_size(node)");
+    const int device_id = local_rank % device_count;
+    checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
+    checkMpi(MPI_Comm_free(&node_comm), "MPI_Comm_free(node)");
+
+    if (std::getenv("OMP_NUM_THREADS") == nullptr) {
+        omp_set_num_threads(std::max(1, omp_get_max_threads() / local_size));
+    }
+
+    int dims[2] = {1, 1};
+    chooseProcessGrid(world_size, N, dims);
+    const int active_ranks = dims[0] * dims[1];
+
+    LocalMesh mesh;
+    mesh.N = N;
+
+    MPI_Comm active_comm = MPI_COMM_NULL;
+    checkMpi(MPI_Comm_split(MPI_COMM_WORLD,
+                            world_rank < active_ranks ? 0 : MPI_UNDEFINED,
+                            world_rank, &active_comm),
+             "MPI_Comm_split(active)");
+
+    if (active_comm != MPI_COMM_NULL) {
+        int periods[2] = {0, 0};
+        checkMpi(MPI_Cart_create(active_comm, 2, dims, periods, 0, &mesh.cart),
+                 "MPI_Cart_create");
+        checkMpi(MPI_Comm_free(&active_comm), "MPI_Comm_free(active)");
+
+        int cart_rank = 0;
+        checkMpi(MPI_Comm_rank(mesh.cart, &cart_rank), "MPI_Comm_rank(cart)");
+        int coords[2] = {0, 0};
+        checkMpi(MPI_Cart_coords(mesh.cart, cart_rank, 2, coords),
+                 "MPI_Cart_coords");
+
+        checkMpi(MPI_Cart_shift(mesh.cart, 0, 1, &mesh.xm, &mesh.xp),
+                 "MPI_Cart_shift x");
+        checkMpi(MPI_Cart_shift(mesh.cart, 1, 1, &mesh.ym, &mesh.yp),
+                 "MPI_Cart_shift y");
+
+        mesh.xs = static_cast<int>((static_cast<long long>(coords[0]) * N) / dims[0]);
+        const int xe =
+            static_cast<int>((static_cast<long long>(coords[0] + 1) * N) / dims[0]);
+        mesh.ys = static_cast<int>((static_cast<long long>(coords[1]) * N) / dims[1]);
+        const int ye =
+            static_cast<int>((static_cast<long long>(coords[1] + 1) * N) / dims[1]);
+        mesh.lx = xe - mesh.xs;
+        mesh.ly = ye - mesh.ys;
+    }
+
+    mesh.stride = mesh.ly + 2;
+    mesh.total = mesh.lx * mesh.ly;
+
+    if (world_rank == 0) {
         printf("Unstructured Mesh Energy Transfer Benchmark\n");
         printf("============================================\n");
-        printf("Grid size: %d x %d = %lld elements\n", n_elems_root,
-               n_elems_root, n_elems);
+        printf("Grid size: %d x %d = %zu elements\n", N, N, n_elems);
         printf("Iterations: %d\n", n_iters);
         printf("Validation: %s\n", validate ? "enabled" : "disabled");
         printf("\n");
-        
-        // Build the unstructured mesh
         printf("Building unstructured mesh...\n");
-    }
 
-    World world;
-    if (mpi_rank == 0) {
-        buildSquare2D(world, n_elems_root);
-    }
-
-    if (mpi_rank == 0) {
-        // Calculate memory usage
-        const size_t static_mem = static_cast<size_t>(n_elems) *
-                                  sizeof(ElementStatic);
-        const size_t dynamic_mem = static_cast<size_t>(n_elems) *
-                                   sizeof(ElementDynamic) * 2;
+        const size_t static_mem = n_elems * sizeof(ElementStatic);
+        const size_t dynamic_mem = n_elems * sizeof(ElementDynamic) * 2;
         const size_t total_mem = static_mem + dynamic_mem;
         printf("Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\n",
                total_mem / (1024.0 * 1024.0),
@@ -626,60 +525,258 @@ int main(int argc, char** argv) {
         printf("Running simulation...\n");
     }
 
-    // Run simulation.  The returned time covers only the time-stepping loop;
-    // mesh construction and one-time device/communication setup are excluded,
-    // matching the original benchmark's timing scope.
-    const double duration_ms = runSimulation(world, n_elems_root, n_iters);
-    const double measured_ms = std::max(duration_ms, 1e-9);
+    std::vector<Material> materials;
+    materials.emplace_back(Material{0.8, 0.0});    // Default material
+    materials.emplace_back(Material{0.8, 0.5});    // Inflow material
+    materials.emplace_back(Material{0.8, -0.5});   // Outflow material
+
+    std::vector<int> local_material(static_cast<size_t>(mesh.total));
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int a = 0; a < mesh.lx; ++a) {
+        for (int b = 0; b < mesh.ly; ++b) {
+            const int gx = mesh.xs + a;
+            const int gy = mesh.ys + b;
+            int mat = static_cast<int>(DEFAULT_MAT_ID);
+            if ((gx == 0 && gy == 0) || (gx == N - 1 && gy == N - 1)) {
+                mat = static_cast<int>(INFLOW_MAT_ID);
+            } else if ((gx == 0 && gy == N - 1) ||
+                       (gx == N - 1 && gy == 0)) {
+                mat = static_cast<int>(OUTFLOW_MAT_ID);
+            }
+            local_material[static_cast<size_t>(a) * mesh.ly + b] = mat;
+        }
+    }
+
+    const size_t local_total =
+        static_cast<size_t>(mesh.lx + 2) * static_cast<size_t>(mesh.stride);
+    const size_t local_bytes = std::max<size_t>(local_total, 1) * sizeof(double);
+    const size_t local_mat_bytes =
+        std::max<size_t>(static_cast<size_t>(mesh.total), 1) * sizeof(int);
+
+    checkCuda(cudaStreamCreateWithFlags(&mesh.stream, cudaStreamNonBlocking),
+              "cudaStreamCreateWithFlags");
+    checkCuda(cudaMalloc(reinterpret_cast<void**>(&mesh.d_energy), local_bytes),
+              "cudaMalloc energy");
+    checkCuda(cudaMalloc(reinterpret_cast<void**>(&mesh.d_energy_swap), local_bytes),
+              "cudaMalloc energy swap");
+    checkCuda(cudaMalloc(reinterpret_cast<void**>(&mesh.d_flux), local_bytes),
+              "cudaMalloc flux");
+    checkCuda(cudaMalloc(reinterpret_cast<void**>(&mesh.d_flux_swap), local_bytes),
+              "cudaMalloc flux swap");
+    checkCuda(cudaMalloc(reinterpret_cast<void**>(&mesh.d_columns),
+                         std::max<size_t>(2 * static_cast<size_t>(mesh.lx), 1) *
+                             sizeof(double)),
+              "cudaMalloc columns");
+    checkCuda(cudaMalloc(reinterpret_cast<void**>(&mesh.d_material), local_mat_bytes),
+              "cudaMalloc material");
+    checkCuda(cudaMalloc(reinterpret_cast<void**>(&mesh.d_materials),
+                         std::max<size_t>(materials.size(), 1) * sizeof(Material)),
+              "cudaMalloc materials");
+
+    checkCuda(cudaMemsetAsync(mesh.d_energy, 0, local_bytes, mesh.stream),
+              "memset energy");
+    checkCuda(cudaMemsetAsync(mesh.d_energy_swap, 0, local_bytes, mesh.stream),
+              "memset energy swap");
+    checkCuda(cudaMemsetAsync(mesh.d_flux, 0, local_bytes, mesh.stream),
+              "memset flux");
+    checkCuda(cudaMemsetAsync(mesh.d_flux_swap, 0, local_bytes, mesh.stream),
+              "memset flux swap");
+    if (mesh.total > 0) {
+        checkCuda(cudaMemcpyAsync(mesh.d_material, local_material.data(),
+                                  static_cast<size_t>(mesh.total) * sizeof(int),
+                                  cudaMemcpyHostToDevice, mesh.stream),
+                  "copy material ids");
+    }
+    checkCuda(cudaMemcpyAsync(mesh.d_materials, materials.data(),
+                              materials.size() * sizeof(Material),
+                              cudaMemcpyHostToDevice, mesh.stream),
+              "copy materials");
+
+    const size_t buf_count =
+        std::max<size_t>(2 * (static_cast<size_t>(mesh.lx) + mesh.ly), 1);
+    checkCuda(cudaHostAlloc(reinterpret_cast<void**>(&mesh.h_send),
+                            buf_count * sizeof(double), cudaHostAllocDefault),
+              "cudaHostAlloc send");
+    checkCuda(cudaHostAlloc(reinterpret_cast<void**>(&mesh.h_recv),
+                            buf_count * sizeof(double), cudaHostAllocDefault),
+              "cudaHostAlloc recv");
+    std::memset(mesh.h_send, 0, buf_count * sizeof(double));
+    std::memset(mesh.h_recv, 0, buf_count * sizeof(double));
+    checkCuda(cudaStreamSynchronize(mesh.stream), "sync initialization");
+
+    // Run simulation
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto start = std::chrono::high_resolution_clock::now();
+
+    runSimulation(mesh, n_iters);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto end = std::chrono::high_resolution_clock::now();
+    const double duration_ms =
+        std::chrono::duration<double, std::milli>(end - start).count();
+
+    std::vector<double> host_energy(static_cast<size_t>(mesh.total));
+    std::vector<double> host_flux(static_cast<size_t>(mesh.total));
+    if (mesh.total > 0) {
+        const size_t row_bytes = static_cast<size_t>(mesh.ly) * sizeof(double);
+        checkCuda(cudaMemcpy2DAsync(host_energy.data(), row_bytes,
+                                    mesh.d_energy + mesh.stride + 1,
+                                    static_cast<size_t>(mesh.stride) * sizeof(double),
+                                    row_bytes, mesh.lx,
+                                    cudaMemcpyDeviceToHost, mesh.stream),
+                  "copy owned energy D2H");
+        checkCuda(cudaMemcpy2DAsync(host_flux.data(), row_bytes,
+                                    mesh.d_flux + mesh.stride + 1,
+                                    static_cast<size_t>(mesh.stride) * sizeof(double),
+                                    row_bytes, mesh.lx,
+                                    cudaMemcpyDeviceToHost, mesh.stream),
+                  "copy owned flux D2H");
+        checkCuda(cudaStreamSynchronize(mesh.stream), "sync owned data D2H");
+    }
+
+    uint64_t local_hash = 0;
+#pragma omp parallel for reduction(^:local_hash) schedule(static)
+    for (int k = 0; k < mesh.total; ++k) {
+        const int a = k / mesh.ly;
+        const int b = k - a * mesh.ly;
+        const uint64_t i =
+            static_cast<uint64_t>(mesh.xs + a) * static_cast<uint64_t>(N) +
+            static_cast<uint64_t>(mesh.ys + b);
+        uint64_t e_bits = 0;
+        uint64_t f_bits = 0;
+        std::memcpy(&e_bits, &host_energy[static_cast<size_t>(k)], sizeof(e_bits));
+        std::memcpy(&f_bits, &host_flux[static_cast<size_t>(k)], sizeof(f_bits));
+        local_hash ^= (e_bits + i) * HASH_MULT_ENERGY;
+        local_hash ^= (f_bits + i) * HASH_MULT_FLUX;
+    }
+
+    uint64_t global_hash = 0;
+    checkMpi(MPI_Reduce(&local_hash, &global_hash, 1, MPI_UINT64_T, MPI_BXOR,
+                        0, MPI_COMM_WORLD),
+             "MPI_Reduce hash");
 
     int exit_code = 0;
-    if (mpi_rank == 0) {
-        printf("Computation time: %.3f ms\n", duration_ms);
-        
-        // Calculate performance metrics
+
+    if (world_rank == 0) {
+        printf("Computation time: %ld ms\n", static_cast<long>(duration_ms));
+
         const int n_measured_iters = std::max(n_iters - 1, 1);
         const double time_per_iter = duration_ms / n_measured_iters;
         const double giga_elems_per_sec =
-            (static_cast<double>(n_measured_iters) * static_cast<double>(n_elems)) /
-            (measured_ms / 1000.0) / 1e9;
-        
+            (static_cast<double>(n_measured_iters) * n_elems) /
+            (duration_ms / 1000.0) / 1e9;
+
         // Approximate FLOPS: ~22 FLOPS per element per iteration (from reference)
         const double gflops = giga_elems_per_sec * 22.0;
-        
+
         printf("Performance:\n");
         printf("  Time per iteration: %.4f ms\n", time_per_iter);
         printf("  Elements/sec: %.4f GigaElements/s\n", giga_elems_per_sec);
         printf("  Performance: %.4f GFLOPS\n", gflops);
-        
-        // Compute hash for verification
-        const uint64_t hash = computeHash(world.elements_dynamic);
-        printf("  Result hash: %016lX\n", static_cast<unsigned long>(hash));
+
+        printf("  Result hash: %016lX\n", global_hash);
         printf("\n");
-        
-        // Print results for external validation
-        if (printResults) {
-            std::vector<double> energyData;
-            energyData.reserve(world.elements_dynamic.size());
-            for (const auto& elem : world.elements_dynamic) {
-                energyData.push_back(elem.current_energy);
-            }
-            print_results(energyData, "ElementEnergy");
+    }
+
+    if (printResults || validate) {
+        int meta[4] = {mesh.xs, mesh.ys, mesh.lx, mesh.ly};
+        std::vector<int> all_meta;
+        if (world_rank == 0) {
+            all_meta.resize(static_cast<size_t>(world_size) * 4);
         }
-        
-        // Validation
-        if (validate) {
-            bool valid = validateResults(world);
-            if (!valid) {
-                exit_code = 1;
+        checkMpi(MPI_Gather(meta, 4, MPI_INT,
+                            world_rank == 0 ? all_meta.data() : nullptr,
+                            4, MPI_INT, 0, MPI_COMM_WORLD),
+                 "MPI_Gather meta");
+
+        std::vector<int> counts;
+        std::vector<int> displs;
+        std::vector<double> recv_energy;
+        std::vector<double> recv_flux;
+        int gathered_total = 0;
+        if (world_rank == 0) {
+            counts.resize(static_cast<size_t>(world_size));
+            displs.resize(static_cast<size_t>(world_size));
+            int offset = 0;
+            for (int r = 0; r < world_size; ++r) {
+                const int c = all_meta[static_cast<size_t>(r) * 4 + 2] *
+                              all_meta[static_cast<size_t>(r) * 4 + 3];
+                counts[static_cast<size_t>(r)] = c;
+                displs[static_cast<size_t>(r)] = offset;
+                offset += c;
+            }
+            gathered_total = offset;
+            recv_energy.resize(static_cast<size_t>(gathered_total));
+            recv_flux.resize(static_cast<size_t>(gathered_total));
+        }
+
+        checkMpi(MPI_Gatherv(host_energy.data(), mesh.total, MPI_DOUBLE,
+                             world_rank == 0 ? recv_energy.data() : nullptr,
+                             world_rank == 0 ? counts.data() : nullptr,
+                             world_rank == 0 ? displs.data() : nullptr,
+                             MPI_DOUBLE, 0, MPI_COMM_WORLD),
+                 "MPI_Gatherv energy");
+        checkMpi(MPI_Gatherv(host_flux.data(), mesh.total, MPI_DOUBLE,
+                             world_rank == 0 ? recv_flux.data() : nullptr,
+                             world_rank == 0 ? counts.data() : nullptr,
+                             world_rank == 0 ? displs.data() : nullptr,
+                             MPI_DOUBLE, 0, MPI_COMM_WORLD),
+                 "MPI_Gatherv flux");
+
+        if (world_rank == 0) {
+            std::vector<ElementDynamic> global(n_elems);
+#pragma omp parallel for schedule(static)
+            for (int r = 0; r < world_size; ++r) {
+                const int rxs = all_meta[static_cast<size_t>(r) * 4 + 0];
+                const int rys = all_meta[static_cast<size_t>(r) * 4 + 1];
+                const int rlx = all_meta[static_cast<size_t>(r) * 4 + 2];
+                const int rly = all_meta[static_cast<size_t>(r) * 4 + 3];
+                const double* e = recv_energy.data() + displs[static_cast<size_t>(r)];
+                const double* f = recv_flux.data() + displs[static_cast<size_t>(r)];
+                for (int a = 0; a < rlx; ++a) {
+                    const size_t base =
+                        static_cast<size_t>(rxs + a) * static_cast<size_t>(N) +
+                        static_cast<size_t>(rys);
+                    const double* er = e + static_cast<size_t>(a) * rly;
+                    const double* fr = f + static_cast<size_t>(a) * rly;
+                    for (int b = 0; b < rly; ++b) {
+                        global[base + static_cast<size_t>(b)] =
+                            ElementDynamic{er[b], fr[b]};
+                    }
+                }
+            }
+
+            if (printResults) {
+                std::vector<double> energyData;
+                energyData.reserve(global.size());
+                for (const auto& elem : global) {
+                    energyData.push_back(elem.current_energy);
+                }
+                print_results(energyData, "ElementEnergy");
+            }
+
+            if (validate) {
+                if (!validateResults(global)) {
+                    exit_code = 1;
+                }
             }
         }
     }
 
-    int global_exit = 0;
-    MPI_Allreduce(&exit_code, &global_exit, 1, MPI_INT, MPI_MAX,
-                  MPI_COMM_WORLD);
+    checkCuda(cudaFreeHost(mesh.h_send), "cudaFreeHost send");
+    checkCuda(cudaFreeHost(mesh.h_recv), "cudaFreeHost recv");
+    checkCuda(cudaFree(mesh.d_materials), "cudaFree materials");
+    checkCuda(cudaFree(mesh.d_material), "cudaFree material");
+    checkCuda(cudaFree(mesh.d_columns), "cudaFree columns");
+    checkCuda(cudaFree(mesh.d_flux_swap), "cudaFree flux swap");
+    checkCuda(cudaFree(mesh.d_flux), "cudaFree flux");
+    checkCuda(cudaFree(mesh.d_energy_swap), "cudaFree energy swap");
+    checkCuda(cudaFree(mesh.d_energy), "cudaFree energy");
+    checkCuda(cudaStreamDestroy(mesh.stream), "cudaStreamDestroy");
+    if (mesh.cart != MPI_COMM_NULL) {
+        checkMpi(MPI_Comm_free(&mesh.cart), "MPI_Comm_free(cart)");
+    }
 
-    MPI_Comm_free(&local_comm);
     MPI_Finalize();
-    return global_exit;
+    return exit_code;
 }

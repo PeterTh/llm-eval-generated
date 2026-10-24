@@ -7,20 +7,19 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 70 80 86 90)
+    set(CMAKE_CUDA_ARCHITECTURES 70 80 86)
 endif()
 
-find_package(MPI REQUIRED COMPONENTS CXX)
+find_package(MPI REQUIRED)
+find_package(OpenMP REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
 set_source_files_properties(cholesky.cpp PROPERTIES LANGUAGE CUDA)
 
 add_executable(cholesky cholesky.cpp)
 
-target_include_directories(cholesky PRIVATE ${MPI_CXX_INCLUDE_DIRS})
-
 target_compile_options(cholesky PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3 --expt-relaxed-constexpr
-        -Xcompiler=-fopenmp,-O3,-march=native,-Wall,-Wextra>
-)
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3 -Xcompiler=-fopenmp,-O3,-march=native,-Wall,-Wextra>
+    $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -Wall -Wextra>)
 
-target_link_libraries(cholesky PRIVATE ${MPI_CXX_LIBRARIES} gomp m)
+target_link_libraries(cholesky PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX m)

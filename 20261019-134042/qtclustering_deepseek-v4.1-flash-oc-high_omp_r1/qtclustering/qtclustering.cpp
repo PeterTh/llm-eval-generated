@@ -1,4 +1,4 @@
-// QT Clustering Benchmark - Simplified Sequential Version
+// QT Clustering Benchmark - OpenMP Parallel Version
 // 
 // QT (Quality Threshold) clustering is an algorithm that builds clusters
 // by starting with a seed point and iteratively adding the closest point
@@ -70,94 +70,115 @@ void generateSyntheticData(std::vector<Point>& points, const int N, unsigned int
     }
 }
 
-// Calculate squared Euclidean distance between two points
-inline double distanceSquared(const Point& p1, const Point& p2) {
-    const double dx = p1.x - p2.x;
-    const double dy = p1.y - p2.y;
-    return dx * dx + dy * dy;
-}
-
 // Calculate Euclidean distance between two points
 inline double distance(const Point& p1, const Point& p2) {
-    return std::sqrt(distanceSquared(p1, p2));
+    double dx = p1.x - p2.x;
+    double dy = p1.y - p2.y;
+    return std::sqrt(dx * dx + dy * dy);
 }
 
-// Find the closest unclustered point to the current cluster that maintains diameter < threshold
-// Returns -1 if no such point exists
-int findClosestPoint(const std::vector<int>& cluster_members,
-                     const std::vector<bool>& clustered,
-                     const std::vector<bool>& in_cluster,
-                     const std::vector<Point>& points,
-                     const double threshold,
-                     const int point_count) {
-    int closest_point = -1;
-    double min_diameter = std::numeric_limits<double>::max();
-    // Squared rejection bound.  Bumping the rounded square up by one ulp
-    // guarantees it is strictly above the true threshold squared, so a candidate
-    // that exceeds it is always rejected, exactly as in the full scan.
-    const double reject_sq = threshold > 0.0
-        ? std::nextafter(threshold * threshold, std::numeric_limits<double>::infinity())
-        : 0.0;
-    
-    // Try each unclustered point as a candidate
-    for (int candidate = 0; candidate < point_count; ++candidate) {
-        // Skip if already clustered or already in this cluster
-        if (clustered[candidate] || in_cluster[candidate]) continue;
-        
-        // Calculate the maximum distance from candidate to all cluster members.
-        // Operating on squared distances and taking the square root once is
-        // equivalent because sqrt is monotonic.
-        double max_sqdist = 0.0;
-        for (size_t i = 0; i < cluster_members.size(); ++i) {
-            const int member = cluster_members[i];
-            const double sq = distanceSquared(points[candidate], points[member]);
-            if (sq > max_sqdist) max_sqdist = sq;
-            // Any remaining member can only increase the maximum, so once the
-            // squared distance safely exceeds the threshold the candidate can
-            // be rejected without scanning the rest of the cluster.
-            if (reject_sq > 0.0 && max_sqdist >= reject_sq) break;
-        }
-        const double max_dist = std::sqrt(max_sqdist);
-        
-        // If adding this point keeps diameter below threshold and is better than current best
-        if (max_dist < threshold && max_dist < min_diameter) {
-            min_diameter = max_dist;
-            closest_point = candidate;
-        }
+// Per-thread scratch space.  Reusing it avoids allocating vectors for every
+// candidate seed and lets the membership stamps be reset in O(1).
+struct ThreadWorkspace {
+    std::vector<int> stamp;
+    std::vector<double> max_dist;
+    std::vector<int> members;
+    std::vector<int> best_members;
+    int generation = 0;
+    int best_cardinality = -1;
+    int best_seed = -1;
+    size_t best_index = 0;
+
+    void init(const int n) {
+        stamp.assign(n, 0);
+        max_dist.resize(n);
+        members.reserve(n);
+        best_members.reserve(n);
     }
-    
-    return closest_point;
-}
 
-// Generate a candidate cluster starting from a seed point
-// Returns the cardinality (size) of the cluster
+    void resetBest() {
+        best_cardinality = -1;
+        best_seed = -1;
+        best_index = std::numeric_limits<size_t>::max();
+    }
+};
+
+// Generate a candidate cluster starting from a seed point.
+//
+// The maximum distance from every remaining candidate to the cluster is
+// maintained incrementally: when a point joins the cluster only the distance
+// to that new member has to be considered.  This is the same value the
+// original implementation recomputed from scratch on every iteration, so the
+// resulting cluster is identical while being asymptotically cheaper.
+//
+// Returns the cardinality (size) of the cluster; members are left in
+// ws.members.
 int generateCandidateCluster(const int seed_point,
-                              const std::vector<bool>& clustered,
-                              const std::vector<Point>& points,
-                              const double threshold,
-                              const int point_count,
-                              std::vector<int>* cluster_members = nullptr) {
-    std::vector<bool> in_cluster(point_count, false);
-    std::vector<int> fallback_members;
-    std::vector<int>& members = cluster_members ? *cluster_members : fallback_members;
-    members.clear();
-    
-    // Add seed point
-    in_cluster[seed_point] = true;
-    members.push_back(seed_point);
-    
-    // Iteratively add closest points
-    while (static_cast<int>(members.size()) < point_count) {
-        // Find closest point to current cluster that maintains diameter < threshold
-        const int closest = findClosestPoint(members, clustered, in_cluster, points, 
-                                             threshold, point_count);
-        
-        if (closest < 0) break; // No more points can be added
-        
-        in_cluster[closest] = true;
-        members.push_back(closest);
+                             const std::vector<int>& candidates,
+                             const std::vector<Point>& points,
+                             const double threshold,
+                             ThreadWorkspace& ws) {
+    if (++ws.generation == std::numeric_limits<int>::max()) {
+        std::fill(ws.stamp.begin(), ws.stamp.end(), 0);
+        ws.generation = 1;
     }
-    
+    const int gen = ws.generation;
+
+    int* const stamp = ws.stamp.data();
+    double* const max_dist = ws.max_dist.data();
+    const Point* const pts = points.data();
+    std::vector<int>& members = ws.members;
+    const int candidate_count = static_cast<int>(candidates.size());
+
+    members.clear();
+
+    // Add seed point
+    stamp[seed_point] = gen;
+    members.push_back(seed_point);
+
+    // Initial maximum distance of each candidate is its distance to the seed.
+    const double seed_x = pts[seed_point].x;
+    const double seed_y = pts[seed_point].y;
+    for (int i = 0; i < candidate_count; ++i) {
+        const int c = candidates[i];
+        const double dx = pts[c].x - seed_x;
+        const double dy = pts[c].y - seed_y;
+        max_dist[c] = std::sqrt(dx * dx + dy * dy);
+    }
+
+    // Iteratively add closest points
+    while (static_cast<int>(members.size()) < candidate_count) {
+        int closest = -1;
+        double min_diameter = std::numeric_limits<double>::max();
+
+        for (int i = 0; i < candidate_count; ++i) {
+            const int c = candidates[i];
+            if (stamp[c] == gen) continue;
+            const double d = max_dist[c];
+            if (d < threshold && d < min_diameter) {
+                min_diameter = d;
+                closest = c;
+            }
+        }
+
+        if (closest < 0) break; // No more points can be added
+
+        stamp[closest] = gen;
+        members.push_back(closest);
+
+        // Extend the incremental maximum distance with the new member.
+        const double cx = pts[closest].x;
+        const double cy = pts[closest].y;
+        for (int i = 0; i < candidate_count; ++i) {
+            const int c = candidates[i];
+            if (stamp[c] == gen) continue;
+            const double dx = pts[c].x - cx;
+            const double dy = pts[c].y - cy;
+            const double d = std::sqrt(dx * dx + dy * dy);
+            if (d > max_dist[c]) max_dist[c] = d;
+        }
+    }
+
     return static_cast<int>(members.size());
 }
 
@@ -165,7 +186,7 @@ int generateCandidateCluster(const int seed_point,
 std::vector<Cluster> qtClustering(const std::vector<Point>& points,
                                   const double threshold) {
     const int N = static_cast<int>(points.size());
-    std::vector<bool> clustered(N, false);
+    std::vector<char> clustered(N, 0);
     std::vector<int> unclustered_indices;
     std::vector<Cluster> clusters;
     
@@ -173,73 +194,61 @@ std::vector<Cluster> qtClustering(const std::vector<Point>& points,
     for (int i = 0; i < N; ++i) {
         unclustered_indices.push_back(i);
     }
+
+    // Persistent, per-thread scratch space reused across clustering rounds.
+    const int max_threads = omp_get_max_threads();
+    std::vector<ThreadWorkspace> workspaces(max_threads);
+    for (int t = 0; t < max_threads; ++t) {
+        workspaces[t].init(N);
+    }
     
-    const int max_threads = std::max(1, omp_get_max_threads());
-
-    // Per-thread best candidate for one iteration of the seed scan.
-    struct SeedResult {
-        int cardinality = -1;
-        int seed = -1;
-        size_t pos = std::numeric_limits<size_t>::max();
-        std::vector<int> members;
-    };
-
     // Main clustering loop
     while (!unclustered_indices.empty()) {
-        const size_t num_seeds = unclustered_indices.size();
-
         int max_cardinality = -1;
         int best_seed = -1;
-        size_t best_pos = std::numeric_limits<size_t>::max();
+        size_t best_index = std::numeric_limits<size_t>::max();
         std::vector<int> best_cluster_members;
-
-        // Candidate clusters are independent, so all seeds for this iteration are
-        // distributed across the team with dynamic scheduling.  Each thread keeps
-        // its own best result and the winners are merged deterministically below,
-        // so the outcome is identical to the sequential scan (largest cardinality,
-        // earliest seed on ties).  The team is limited to the number of seeds to
-        // avoid waking idle threads in the final iterations, and to the amount of
-        // available work so that small problem sizes do not pay for excessive
-        // synchronization.
-        const int work_threads = std::max(1, N / 16);
-        const int team = std::max(1, std::min<int>(
-            max_threads, std::min<int>(static_cast<int>(num_seeds), work_threads)));
-        std::vector<SeedResult> results(static_cast<size_t>(team));
-
-#pragma omp parallel num_threads(team)
+        const int num_seeds = static_cast<int>(unclustered_indices.size());
+        
+        // Try each unclustered point as a seed.  All seeds in a round observe
+        // the same clustered[] snapshot, so they can be evaluated in parallel.
+#pragma omp parallel
         {
-            SeedResult& local = results[static_cast<size_t>(omp_get_thread_num())];
-            std::vector<int> candidate_members;
+            ThreadWorkspace& ws = workspaces[omp_get_thread_num()];
+            ws.resetBest();
 
-#pragma omp for schedule(dynamic)
-            for (size_t i = 0; i < num_seeds; ++i) {
+#pragma omp for schedule(guided) nowait
+            for (int i = 0; i < num_seeds; ++i) {
                 const int seed = unclustered_indices[i];
                 if (clustered[seed]) continue;
 
-                candidate_members.clear();
-                const int cardinality = generateCandidateCluster(seed, clustered, points,
-                                                                 threshold, N,
-                                                                 &candidate_members);
+                const int cardinality = generateCandidateCluster(
+                    seed, unclustered_indices, points, threshold, ws);
 
-                if (local.cardinality < 0 || cardinality > local.cardinality ||
-                    (cardinality == local.cardinality && i < local.pos)) {
-                    local.cardinality = cardinality;
-                    local.seed = seed;
-                    local.pos = i;
-                    local.members = candidate_members;
+                // Strictly larger cardinality wins; on ties the earliest seed
+                // in unclustered_indices order wins, matching the sequential
+                // implementation.
+                if (cardinality > ws.best_cardinality ||
+                    (cardinality == ws.best_cardinality &&
+                     static_cast<size_t>(i) < ws.best_index)) {
+                    ws.best_cardinality = cardinality;
+                    ws.best_seed = seed;
+                    ws.best_index = static_cast<size_t>(i);
+                    ws.best_members = ws.members;
                 }
             }
-        }
 
-        // Merge the per-thread winners, breaking ties by the earliest seed position.
-        for (int t = 0; t < team; ++t) {
-            SeedResult& r = results[static_cast<size_t>(t)];
-            if (r.cardinality > max_cardinality ||
-                (r.cardinality == max_cardinality && r.pos < best_pos)) {
-                max_cardinality = r.cardinality;
-                best_seed = r.seed;
-                best_pos = r.pos;
-                best_cluster_members.swap(r.members);
+            // Deterministic merge of this thread's best candidate.
+#pragma omp critical(qt_select_best)
+            {
+                if (ws.best_cardinality > max_cardinality ||
+                    (ws.best_cardinality == max_cardinality &&
+                     ws.best_index < best_index)) {
+                    max_cardinality = ws.best_cardinality;
+                    best_seed = ws.best_seed;
+                    best_index = ws.best_index;
+                    best_cluster_members = ws.best_members;
+                }
             }
         }
         

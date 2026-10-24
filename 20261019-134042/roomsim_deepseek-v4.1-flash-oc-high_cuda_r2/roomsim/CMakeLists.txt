@@ -6,21 +6,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# Optimize CUDA code generation for the GPU present on the build machine.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES native)
-endif()
-
-# The benchmark source contains CUDA kernels; compile it with nvcc while
-# keeping the existing file name and executable name unchanged.
-set_source_files_properties(roomsim.cpp PROPERTIES LANGUAGE CUDA)
+# Build for the GPU(s) present on the build machine instead of the very old
+# default architecture (which forces expensive PTX JIT at every startup).
+set(CMAKE_CUDA_ARCHITECTURES native)
 
 add_executable(roomsim roomsim.cpp)
 
-# Enable optimizations and warnings
+# Compile the existing .cpp as CUDA so the GPU kernels live in the same file.
+set_source_files_properties(roomsim.cpp PROPERTIES LANGUAGE CUDA)
+
+# Enable optimizations and warnings. Disable FMA contraction in device code so
+# that the arithmetic matches the sequential implementation.
 target_compile_options(roomsim PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3 -Xcompiler=-O3,-march=native,-Wall,-Wextra>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;-Xcompiler=-O3,-march=native,-Wall,-Wextra>
 )
 
-# Link math library
-target_link_libraries(roomsim PRIVATE m)
+# Link math library and the CUDA runtime
+target_link_libraries(roomsim m)

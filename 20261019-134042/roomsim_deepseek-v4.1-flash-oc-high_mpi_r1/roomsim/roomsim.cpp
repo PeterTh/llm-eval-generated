@@ -1,18 +1,15 @@
 /**
  * Room Response Simulation Benchmark
  * 
- * This is an MPI-parallel implementation of room impulse response simulation
- * using radiosity-based wave propagation. It models how sound/light waves
- * propagate between surfaces in a room by computing:
+ * This is a simplified, purely sequential implementation of room impulse response
+ * simulation using radiosity-based wave propagation. It models how sound/light
+ * waves propagate between surfaces in a room by computing:
  * 
  * 1. Form factors (Kij) between all pairs of triangles based on visibility and geometry
  * 2. Wave propagation using radiosity equations with time delays (Tau)
  * 3. Distance estimation via cross-correlation of radiosity values
  * 
  * The implementation generates a procedural icosphere mesh to simulate a room.
- *
- * The work is distributed across MPI ranks by partitioning the destination
- * triangle rows of the Kij/Tau matrices and the distance results.
  */
 
 #include <algorithm>
@@ -32,6 +29,11 @@
 #include <mpi.h>
 
 #include "../common/results_output.hpp"
+
+static int g_rank = 0;
+static int g_size = 1;
+
+static inline bool isRoot() { return g_rank == 0; }
 
 // ============================================================================
 // Types and Constants
@@ -402,6 +404,12 @@ class RandomGenerator {
 public:
     explicit RandomGenerator(uint32_t seed = 42) : rng(seed), dist(0.0f, 1.0f) {}
     val_t rand() { return dist(rng); }
+
+    // Advance the generator by exactly n calls to rand().  For a 32-bit
+    // mt19937 and a float uniform distribution each rand() consumes exactly
+    // one engine value, which lets us jump directly to a row's starting
+    // state while preserving the original sequential stream bit-for-bit.
+    void skip(uint64_t n) { rng.discard(n); }
 };
 
 // Generate a random point inside a triangle using barycentric coordinates
@@ -525,37 +533,43 @@ int computeTau(const Triangle& triI, const Triangle& triJ) {
 // Room Response Simulation State
 // ============================================================================
 
+struct RowPartition {
+    size_t start;
+    size_t count;
+};
+
+static RowPartition partitionRows(size_t n, int rank, int size) {
+    size_t base = n / static_cast<size_t>(size);
+    size_t rem = n % static_cast<size_t>(size);
+    size_t r = static_cast<size_t>(rank);
+    size_t start = r * base + std::min(r, rem);
+    size_t count = base + (r < rem ? 1 : 0);
+    return {start, count};
+}
+
 struct SimulationState {
     size_t numTriangles;
     size_t numTimesteps;
-    size_t timeOff;
-
-    int mpiRank = 0;
-    int mpiSize = 1;
-
-    size_t rowStart = 0;
-    size_t rowEnd = 0;
-    size_t localRows = 0;
 
     std::vector<Triangle> triangles;
     std::vector<val_t> areas;       // Area of each triangle
     std::vector<val_t> rho;         // Reflectivity (0.0 to 1.0)
-
-    std::vector<val_t> kij;         // Local rows of min(Kij * area[j], 1)
-    std::vector<int> tau;           // Local rows of time delays
-
+    std::vector<val_t> kij;         // Local row block of form factors
+    std::vector<int> tau;           // Local row block of time delays
+    std::vector<val_t> radE;        // Emission radiosity (T x N matrix)
     std::vector<val_t> radB;        // Reflected radiosity (T x N matrix)
     std::vector<val_t> distances;   // Computed distances from source
-
-    size_t localNonZeroKij = 0;
 
     Octree octree;                  // Spatial acceleration structure
 
     size_t sourceIndex;
 
-    size_t idx2d(size_t i, size_t j) const {
-        return (i - rowStart) * numTriangles + j;
-    }
+    // Contiguous block of triangle rows owned by this MPI rank.
+    size_t rowStart = 0;
+    size_t rowCount = 0;
+
+    // Index into a rank-local row block.
+    size_t idx2d(size_t localRow, size_t j) const { return localRow * numTriangles + j; }
     size_t idxTN(size_t t, size_t n) const { return t * numTriangles + n; }
 };
 
@@ -564,28 +578,25 @@ struct SimulationState {
 // ============================================================================
 
 void initializeSimulation(SimulationState& state, int subdivisions, size_t timesteps,
-                          size_t sourceIdx, val_t reflectivity, int mpiRank, int mpiSize) {
-    state.mpiRank = mpiRank;
-    state.mpiSize = mpiSize;
-
+                          size_t sourceIdx, val_t reflectivity) {
     // Generate mesh
     IcosphereMesh mesh(subdivisions, 10.0f);  // Radius 10 units
     state.triangles = std::move(mesh.triangles);
     state.numTriangles = state.triangles.size();
     state.numTimesteps = timesteps;
-    state.timeOff = timesteps / 2;
     state.sourceIndex = sourceIdx % state.numTriangles;
 
-    state.rowStart = (static_cast<size_t>(mpiRank) * state.numTriangles) / static_cast<size_t>(mpiSize);
-    state.rowEnd = (static_cast<size_t>(mpiRank + 1) * state.numTriangles) / static_cast<size_t>(mpiSize);
-    state.localRows = state.rowEnd - state.rowStart;
+    // Each rank owns a contiguous set of rows of the N x N matrices.
+    RowPartition part = partitionRows(state.numTriangles, g_rank, g_size);
+    state.rowStart = part.start;
+    state.rowCount = part.count;
 
-    if (mpiRank == 0) {
+    if (isRoot()) {
         printf("Generated icosphere mesh with %zu triangles\n", state.numTriangles);
+
+        // Build octree for spatial acceleration
         printf("Building octree...\n");
     }
-
-    // Build octree for spatial acceleration
     state.octree.build(state.triangles);
 
     // Initialize areas
@@ -597,12 +608,19 @@ void initializeSimulation(SimulationState& state, int subdivisions, size_t times
     // Initialize reflectivity
     state.rho.resize(state.numTriangles, reflectivity);
 
-    // Initialize matrices
-    state.kij.assign(state.localRows * state.numTriangles, ZERO);
-    state.tau.assign(state.localRows * state.numTriangles, 0);
+    // Initialize local matrix blocks and globally replicated vectors
+    state.kij.assign(state.rowCount * state.numTriangles, ZERO);
+    state.tau.assign(state.rowCount * state.numTriangles, 0);
+    state.radE.assign(timesteps * state.numTriangles, ZERO);
     state.radB.assign(timesteps * state.numTriangles, ZERO);
     state.distances.assign(state.numTriangles, ZERO);
-    state.localNonZeroKij = 0;
+
+    // Set source emission (active for first half of timesteps)
+    size_t timeOn = 0;
+    size_t timeOff = timesteps / 2;
+    for (size_t t = timeOn; t < timeOff; ++t) {
+        state.radE[state.idxTN(t, state.sourceIndex)] = 1.0f;
+    }
 }
 
 // ============================================================================
@@ -610,36 +628,48 @@ void initializeSimulation(SimulationState& state, int subdivisions, size_t times
 // ============================================================================
 
 void computeFormFactors(SimulationState& state) {
-    if (state.mpiRank == 0) printf("Computing form factors (Kij)...\n");
+    if (isRoot()) printf("Computing form factors (Kij)...\n");
+    RandomGenerator rng(42);
 
-    size_t localNonZero = 0;
+    const size_t n = state.numTriangles;
+    const uint64_t drawsPerCell = static_cast<uint64_t>(4 * NUM_RAYS);
 
-    for (size_t i = state.rowStart; i < state.rowEnd; ++i) {
-        RandomGenerator rng(42u + static_cast<uint32_t>(i) * 2654435761u);
-
-        for (size_t j = 0; j < state.numTriangles; ++j) {
+    // Replay the exact number of random draws consumed by all rows before the
+    // start of this rank's block.  This keeps every cell's samples identical
+    // to the sequential reference while rows are computed independently.
+    uint64_t drawsToSkip = 0;
+    for (size_t i = 0; i < state.rowStart; ++i) {
+        const Vec3& ni = state.triangles[i].normal();
+        for (size_t j = 0; j < n; ++j) {
             if (i == j) continue;
-            val_t rawKij = computeKij(i, j, state.triangles, state.octree, rng);
-            if (rawKij > EPSILON) ++localNonZero;
-            state.kij[state.idx2d(i, j)] = std::min(rawKij * state.areas[j], ONE);
-        }
-
-        if (state.mpiRank == 0 &&
-            ((i + 1) % 100 == 0 || i + 1 == state.numTriangles)) {
-            printf("  Progress: %zu/%zu triangles\n", i + 1, state.numTriangles);
+            if (ni.dot(state.triangles[j].normal()) > 0.99f) continue;
+            drawsToSkip += drawsPerCell;
         }
     }
+    rng.skip(drawsToSkip);
 
-    state.localNonZeroKij = localNonZero;
+    for (size_t lr = 0; lr < state.rowCount; ++lr) {
+        size_t i = state.rowStart + lr;
+        for (size_t j = 0; j < n; ++j) {
+            if (i == j) continue;
+            state.kij[state.idx2d(lr, j)] = computeKij(
+                i, j, state.triangles, state.octree, rng);
+        }
+        if (isRoot() && ((i + 1) % 100 == 0 || i + 1 == n)) {
+            printf("  Progress: %zu/%zu triangles\n", i + 1, n);
+        }
+    }
 }
 
 void computeTimeDelays(SimulationState& state) {
-    if (state.mpiRank == 0) printf("Computing time delays (Tau)...\n");
+    if (isRoot()) printf("Computing time delays (Tau)...\n");
 
-    for (size_t i = state.rowStart; i < state.rowEnd; ++i) {
-        for (size_t j = 0; j < state.numTriangles; ++j) {
+    const size_t n = state.numTriangles;
+    for (size_t lr = 0; lr < state.rowCount; ++lr) {
+        size_t i = state.rowStart + lr;
+        for (size_t j = 0; j < n; ++j) {
             if (i == j) continue;
-            state.tau[state.idx2d(i, j)] = computeTau(
+            state.tau[state.idx2d(lr, j)] = computeTau(
                 state.triangles[i], state.triangles[j]);
         }
     }
@@ -650,35 +680,33 @@ void computeTimeDelays(SimulationState& state) {
 // ============================================================================
 
 void runSimulation(SimulationState& state) {
-    if (state.mpiRank == 0) printf("Running wave propagation simulation...\n");
+    if (isRoot()) printf("Running wave propagation simulation...\n");
 
     const size_t n = state.numTriangles;
-    std::vector<int> counts(state.mpiSize);
-    std::vector<int> displs(state.mpiSize);
-    for (int r = 0; r < state.mpiSize; ++r) {
-        size_t s = (static_cast<size_t>(r) * n) / static_cast<size_t>(state.mpiSize);
-        size_t e = (static_cast<size_t>(r + 1) * n) / static_cast<size_t>(state.mpiSize);
-        counts[r] = static_cast<int>(e - s);
-        displs[r] = static_cast<int>(s);
+
+    std::vector<int> recvCounts(g_size);
+    std::vector<int> displs(g_size);
+    for (int r = 0; r < g_size; ++r) {
+        RowPartition p = partitionRows(n, r, g_size);
+        recvCounts[r] = static_cast<int>(p.count);
+        displs[r] = static_cast<int>(p.start);
     }
 
-    std::vector<val_t> localVals(state.localRows > 0 ? state.localRows : 1, ZERO);
-
     for (size_t t = 0; t < state.numTimesteps; ++t) {
-        for (size_t i = state.rowStart; i < state.rowEnd; ++i) {
+        for (size_t lr = 0; lr < state.rowCount; ++lr) {
+            size_t i = state.rowStart + lr;
             val_t sumB = ZERO;
-            const size_t base = state.idx2d(i, 0);
 
             for (size_t j = 0; j < n; ++j) {
                 if (i == j) continue;
 
-                int tauij = state.tau[base + j];
+                int tauij = state.tau[state.idx2d(lr, j)];
 
                 // Skip if wave hasn't yet propagated from j to i
                 if (static_cast<int>(t) < tauij) continue;
 
-                val_t coef = state.kij[base + j];
-                if (coef <= ZERO) continue;
+                val_t kij = state.kij[state.idx2d(lr, j)];
+                if (kij <= ZERO) continue;
 
                 // Get radiosity from source triangle at time when emission occurred
                 size_t srcTime = t - static_cast<size_t>(tauij);
@@ -686,21 +714,20 @@ void runSimulation(SimulationState& state) {
                 if (radJ <= ZERO) continue;
 
                 // Accumulate contribution: form factor * area * source radiosity
-                sumB += coef * radJ;
+                sumB += std::min(kij * state.areas[j], ONE) * radJ;
             }
 
             // Update radiosity: reflection + emission
-            val_t value = state.rho[i] * sumB;
-            if (i == state.sourceIndex && t < state.timeOff) value += ONE;
-            localVals[i - state.rowStart] = value;
+            state.radB[state.idxTN(t, i)] = state.rho[i] * sumB + state.radE[state.idxTN(t, i)];
         }
 
-        MPI_Allgatherv(localVals.data(), static_cast<int>(state.localRows), MPI_FLOAT,
-                       state.radB.data() + t * n, counts.data(), displs.data(), MPI_FLOAT,
+        // Publish this timestep's radiosity so every rank has the full row.
+        MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_FLOAT,
+                       state.radB.data() + state.idxTN(t, 0),
+                       recvCounts.data(), displs.data(), MPI_FLOAT,
                        MPI_COMM_WORLD);
 
-        if (state.mpiRank == 0 &&
-            ((t + 1) % 10 == 0 || t + 1 == state.numTimesteps)) {
+        if (isRoot() && ((t + 1) % 10 == 0 || t + 1 == state.numTimesteps)) {
             printf("  Timestep %zu/%zu\n", t + 1, state.numTimesteps);
         }
     }
@@ -711,31 +738,20 @@ void runSimulation(SimulationState& state) {
 // ============================================================================
 
 void computeDistances(SimulationState& state) {
-    if (state.mpiRank == 0) printf("Computing distances via cross-correlation...\n");
+    if (isRoot()) printf("Computing distances via cross-correlation...\n");
 
     const size_t n = state.numTriangles;
-    const size_t T = state.numTimesteps;
 
-    std::vector<int> counts(state.mpiSize);
-    std::vector<int> displs(state.mpiSize);
-    for (int r = 0; r < state.mpiSize; ++r) {
-        size_t s = (static_cast<size_t>(r) * n) / static_cast<size_t>(state.mpiSize);
-        size_t e = (static_cast<size_t>(r + 1) * n) / static_cast<size_t>(state.mpiSize);
-        counts[r] = static_cast<int>(e - s);
-        displs[r] = static_cast<int>(s);
-    }
-
-    std::vector<val_t> localDist(state.localRows > 0 ? state.localRows : 1, ZERO);
-
-    for (size_t i = state.rowStart; i < state.rowEnd; ++i) {
+    for (size_t lr = 0; lr < state.rowCount; ++lr) {
+        size_t i = state.rowStart + lr;
         val_t maxCorr = ZERO;
         int bestT = 0;
 
         // Discrete cross-correlation to find time delay
-        for (size_t t = 0; t < T; ++t) {
+        for (size_t t = 0; t < state.numTimesteps; ++t) {
             val_t sum = ZERO;
 
-            for (size_t tt = t; tt < T; ++tt) {
+            for (size_t tt = t; tt < state.numTimesteps; ++tt) {
                 val_t pB = state.radB[state.idxTN(tt, i)];
                 val_t pS = state.radB[state.idxTN(tt - t, state.sourceIndex)];
                 sum += pS * pB;
@@ -747,11 +763,19 @@ void computeDistances(SimulationState& state) {
             }
         }
 
-        localDist[i - state.rowStart] = WAVE_SPEED * static_cast<val_t>(bestT);
+        state.distances[i] = WAVE_SPEED * static_cast<val_t>(bestT);
     }
 
-    MPI_Allgatherv(localDist.data(), static_cast<int>(state.localRows), MPI_FLOAT,
-                   state.distances.data(), counts.data(), displs.data(), MPI_FLOAT,
+    std::vector<int> recvCounts(g_size);
+    std::vector<int> displs(g_size);
+    for (int r = 0; r < g_size; ++r) {
+        RowPartition p = partitionRows(n, r, g_size);
+        recvCounts[r] = static_cast<int>(p.count);
+        displs[r] = static_cast<int>(p.start);
+    }
+    MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_FLOAT,
+                   state.distances.data(),
+                   recvCounts.data(), displs.data(), MPI_FLOAT,
                    MPI_COMM_WORLD);
 }
 
@@ -759,10 +783,10 @@ void computeDistances(SimulationState& state) {
 // Validation
 // ============================================================================
 
-bool validateResults(const SimulationState& state) {
-    const bool isRoot = (state.mpiRank == 0);
-    if (isRoot) printf("\nValidation:\n");
+bool validateResults(const SimulationState& state, int nonZeroKij) {
+    printf("\nValidation:\n");
 
+    // Check that distances are non-negative
     bool allNonNegative = true;
     val_t minDist = std::numeric_limits<val_t>::max();
     val_t maxDist = std::numeric_limits<val_t>::lowest();
@@ -773,10 +797,10 @@ bool validateResults(const SimulationState& state) {
         val_t d = state.distances[i];
         if (d < 0) {
             allNonNegative = false;
-            if (isRoot) printf("  ERROR: Negative distance at triangle %zu: %f\n", i, d);
+            printf("  ERROR: Negative distance at triangle %zu: %f\n", i, d);
         }
         if (!std::isfinite(d)) {
-            if (isRoot) printf("  ERROR: Non-finite distance at triangle %zu: %f\n", i, d);
+            printf("  ERROR: Non-finite distance at triangle %zu: %f\n", i, d);
             return false;
         }
         minDist = std::min(minDist, d);
@@ -785,59 +809,41 @@ bool validateResults(const SimulationState& state) {
         if (d > EPSILON) nonZeroCount++;
     }
 
-    if (isRoot) {
-        printf("  Distance range: [%.4f, %.4f]\n", minDist, maxDist);
-        printf("  Average distance: %.4f\n", sumDist / static_cast<val_t>(state.numTriangles));
-        printf("  Non-zero distances: %d/%zu\n", nonZeroCount, state.numTriangles);
-    }
+    printf("  Distance range: [%.4f, %.4f]\n", minDist, maxDist);
+    printf("  Average distance: %.4f\n", sumDist / static_cast<val_t>(state.numTriangles));
+    printf("  Non-zero distances: %d/%zu\n", nonZeroCount, state.numTriangles);
 
     // Check source distance is zero or very small
-    if (isRoot) {
-        val_t srcDist = state.distances[state.sourceIndex];
-        if (srcDist > WAVE_SPEED * 2) {
-            printf("  WARNING: Source triangle distance is non-zero: %.4f\n", srcDist);
-        }
+    val_t srcDist = state.distances[state.sourceIndex];
+    if (srcDist > WAVE_SPEED * 2) {
+        printf("  WARNING: Source triangle distance is non-zero: %.4f\n", srcDist);
     }
 
     // Check radiosity propagation (some triangles should have received energy)
-    int localReceivedEnergy = 0;
-    for (size_t i = state.rowStart; i < state.rowEnd; ++i) {
+    int receivedEnergy = 0;
+    for (size_t i = 0; i < state.numTriangles; ++i) {
         for (size_t t = 0; t < state.numTimesteps; ++t) {
             if (state.radB[state.idxTN(t, i)] > EPSILON) {
-                localReceivedEnergy++;
+                receivedEnergy++;
                 break;
             }
         }
     }
 
-    int receivedEnergy = 0;
-    MPI_Allreduce(&localReceivedEnergy, &receivedEnergy, 1, MPI_INT, MPI_SUM,
-                  MPI_COMM_WORLD);
-
-    if (isRoot) {
-        printf("  Triangles receiving energy: %d/%zu\n", receivedEnergy, state.numTriangles);
-    }
+    printf("  Triangles receiving energy: %d/%zu\n", receivedEnergy, state.numTriangles);
 
     if (receivedEnergy == 0) {
-        if (isRoot) printf("  ERROR: No triangles received energy - simulation failed\n");
+        printf("  ERROR: No triangles received energy - simulation failed\n");
         return false;
     }
 
     // Check Kij matrix (should have some non-zero entries)
-    unsigned long long localNonZeroKij = static_cast<unsigned long long>(state.localNonZeroKij);
-    unsigned long long nonZeroKij = 0;
-    MPI_Allreduce(&localNonZeroKij, &nonZeroKij, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM,
-                  MPI_COMM_WORLD);
-
-    if (isRoot) {
-        printf("  Non-zero form factors: %llu/%zu (%.2f%%)\n",
-               nonZeroKij, state.numTriangles * state.numTriangles,
-               100.0f * static_cast<double>(nonZeroKij) /
-                   static_cast<double>(state.numTriangles * state.numTriangles));
-    }
+    printf("  Non-zero form factors: %d/%zu (%.2f%%)\n",
+           nonZeroKij, state.numTriangles * state.numTriangles,
+           100.0f * nonZeroKij / static_cast<val_t>(state.numTriangles * state.numTriangles));
 
     if (nonZeroKij == 0) {
-        if (isRoot) printf("  ERROR: All form factors are zero - visibility computation failed\n");
+        printf("  ERROR: All form factors are zero - visibility computation failed\n");
         return false;
     }
 
@@ -845,7 +851,7 @@ bool validateResults(const SimulationState& state) {
         return false;
     }
 
-    if (isRoot) printf("  Validation: PASSED\n");
+    printf("  Validation: PASSED\n");
     return true;
 }
 
@@ -898,11 +904,8 @@ void printUsage(const char* progName) {
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
-
-    int mpiRank = 0;
-    int mpiSize = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank);
-    MPI_Comm_size(MPI_COMM_WORLD, &mpiSize);
+    MPI_Comm_rank(MPI_COMM_WORLD, &g_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &g_size);
 
     int targetTriangles = 320;
     int timesteps = 50;
@@ -926,11 +929,11 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-o") == 0) {
             printResults = true;
         } else if (strcmp(argv[i], "-h") == 0) {
-            if (mpiRank == 0) printUsage(argv[0]);
+            if (isRoot()) printUsage(argv[0]);
             MPI_Finalize();
             return 0;
         } else {
-            if (mpiRank == 0) {
+            if (isRoot()) {
                 printf("Unknown option: %s\n", argv[i]);
                 printUsage(argv[0]);
             }
@@ -941,7 +944,7 @@ int main(int argc, char** argv) {
 
     int subdivisions = getSubdivisionsForTriangleCount(targetTriangles);
 
-    if (mpiRank == 0) {
+    if (isRoot()) {
         printf("Room Response Simulation Benchmark\n");
         printf("===================================\n");
         printf("Target triangles: %d (using %d subdivisions)\n", targetTriangles, subdivisions);
@@ -955,63 +958,59 @@ int main(int argc, char** argv) {
     // Initialize
     SimulationState state;
     initializeSimulation(state, subdivisions, static_cast<size_t>(timesteps),
-                         static_cast<size_t>(sourceIdx), reflectivity, mpiRank, mpiSize);
+                         static_cast<size_t>(sourceIdx), reflectivity);
 
-    if (mpiRank == 0) printf("\n");
+    if (isRoot()) printf("\n");
 
     // Precomputation
     MPI_Barrier(MPI_COMM_WORLD);
-    double startPre = MPI_Wtime();
+    auto startPre = std::chrono::high_resolution_clock::now();
 
     computeTimeDelays(state);
     computeFormFactors(state);
 
     MPI_Barrier(MPI_COMM_WORLD);
-    double endPre = MPI_Wtime();
-    long preDuration = static_cast<long>((endPre - startPre) * 1000.0);
+    auto endPre = std::chrono::high_resolution_clock::now();
+    auto preDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count();
 
-    if (mpiRank == 0) {
+    if (isRoot()) {
         printf("Precomputation time: %ld ms\n", preDuration);
         printf("\n");
     }
 
     // Simulation
     MPI_Barrier(MPI_COMM_WORLD);
-    double startSim = MPI_Wtime();
+    auto startSim = std::chrono::high_resolution_clock::now();
 
     runSimulation(state);
 
     MPI_Barrier(MPI_COMM_WORLD);
-    double endSim = MPI_Wtime();
-    long simDuration = static_cast<long>((endSim - startSim) * 1000.0);
+    auto endSim = std::chrono::high_resolution_clock::now();
+    auto simDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count();
 
-    if (mpiRank == 0) {
+    if (isRoot()) {
         printf("Simulation time: %ld ms\n", simDuration);
         printf("\n");
     }
 
     // Distance computation
     MPI_Barrier(MPI_COMM_WORLD);
-    double startDist = MPI_Wtime();
+    auto startDist = std::chrono::high_resolution_clock::now();
 
     computeDistances(state);
 
     MPI_Barrier(MPI_COMM_WORLD);
-    double endDist = MPI_Wtime();
-    long distDuration = static_cast<long>((endDist - startDist) * 1000.0);
+    auto endDist = std::chrono::high_resolution_clock::now();
+    auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
 
-    if (mpiRank == 0) {
+    if (isRoot()) {
         printf("Distance computation time: %ld ms\n", distDuration);
         printf("\n");
     }
 
     // Total time
-    double localPhaseTimes[3] = {endPre - startPre, endSim - startSim, endDist - startDist};
-    double maxPhaseTimes[3] = {};
-    MPI_Reduce(localPhaseTimes, maxPhaseTimes, 3, MPI_DOUBLE, MPI_MAX, 0,
-               MPI_COMM_WORLD);
-    long totalTime = static_cast<long>((maxPhaseTimes[0] + maxPhaseTimes[1] +
-                                        maxPhaseTimes[2]) * 1000.0);
+    long totalTime = preDuration + simDuration + distDuration;
+    if (isRoot()) printf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics
     size_t n = state.numTriangles;
@@ -1020,11 +1019,7 @@ int main(int argc, char** argv) {
     double simOps = static_cast<double>(n * n * t);
     double distOps = static_cast<double>(n * t * t);
 
-    uint64_t hash = computeHash(state);
-
-    if (mpiRank == 0) {
-        printf("Total computation time: %ld ms\n", totalTime);
-
+    if (isRoot()) {
         printf("\nPerformance:\n");
         printf("  Triangles: %zu\n", n);
         printf("  Timesteps: %zu\n", t);
@@ -1041,23 +1036,36 @@ int main(int argc, char** argv) {
         printf("  Memory usage: %.2f MB\n", totalMem / (1024.0 * 1024.0));
 
         // Hash
+        uint64_t hash = computeHash(state);
         printf("  Result hash: %016lX\n", hash);
         printf("\n");
+
+        // Print results for external validation
+        if (printResults) {
+            // Convert distances to double for output
+            std::vector<double> distData(state.distances.begin(), state.distances.end());
+            print_results(distData, "Distances");
+        }
     }
 
-    // Print results for external validation
-    if (printResults && mpiRank == 0) {
-        // Convert distances to double for output
-        std::vector<double> distData(state.distances.begin(), state.distances.end());
-        print_results(distData, "Distances");
-    }
+    int exitCode = 0;
 
     // Validation
-    int exitCode = 0;
     if (validate) {
-        if (!validateResults(state)) {
-            exitCode = 1;
+        long long localNonZeroKij = 0;
+        for (size_t k = 0; k < state.rowCount * state.numTriangles; ++k) {
+            if (state.kij[k] > EPSILON) localNonZeroKij++;
         }
+        long long globalNonZeroKij = 0;
+        MPI_Reduce(&localNonZeroKij, &globalNonZeroKij, 1, MPI_LONG_LONG,
+                   MPI_SUM, 0, MPI_COMM_WORLD);
+
+        if (isRoot()) {
+            if (!validateResults(state, static_cast<int>(globalNonZeroKij))) {
+                exitCode = 1;
+            }
+        }
+        MPI_Bcast(&exitCode, 1, MPI_INT, 0, MPI_COMM_WORLD);
     }
 
     MPI_Finalize();

@@ -9,7 +9,7 @@ find_package(OpenMP REQUIRED)
 add_executable(matmul matmul.cpp)
 
 # Enable optimizations
-target_compile_options(matmul PRIVATE -O3 -march=native -Wall -Wextra)
+target_compile_options(matmul PRIVATE -O3 -march=native -ffp-contract=off -Wall -Wextra)
 
-# Enable OpenMP (multicore CPU shared memory parallelism) and link math library
+# Link OpenMP and math library
 target_link_libraries(matmul PRIVATE OpenMP::OpenMP_CXX m)

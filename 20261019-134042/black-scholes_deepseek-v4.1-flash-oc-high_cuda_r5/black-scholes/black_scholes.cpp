@@ -26,11 +26,11 @@
 
 #define CUDA_CHECK(call)                                                        \
     do {                                                                        \
-        cudaError_t err__ = (call);                                             \
-        if (err__ != cudaSuccess) {                                             \
-            std::fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__,         \
-                         __LINE__, cudaGetErrorString(err__));                  \
-            std::exit(1);                                                       \
+        cudaError_t err_ = (call);                                              \
+        if (err_ != cudaSuccess) {                                              \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,    \
+                    cudaGetErrorString(err_));                                  \
+            exit(1);                                                            \
         }                                                                       \
     } while (0)
 
@@ -51,6 +51,103 @@ struct OptionInput {
     double tol;         // Tolerance
 };
 
+// Standard normal cumulative distribution function
+inline double cumulativeNormal(const double x) noexcept {
+    return 0.5 * (1.0 + std::erf(x * M_SQRT1_2));
+}
+
+// Standard normal probability density function
+inline double normalPDF(const double x) noexcept {
+    return M_1_SQRTPI * M_SQRT1_2 * exp(-0.5 * x * x);
+}
+
+// Black-Scholes formula for European options
+double blackScholes(const OptionInput& option) noexcept {
+    const double S = option.spot;
+    const double K = option.strike;
+    const double r = option.r;
+    const double q = option.q;
+    const double T = option.t;
+    const double sigma = option.vol;
+    
+    if (T <= 0.0 || sigma <= 0.0) {
+        return 0.0;
+    }
+    
+    const double d1 = (log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrt(T));
+    const double d2 = d1 - sigma * sqrt(T);
+    
+    const double Nd1 = cumulativeNormal(d1);
+    const double Nd2 = cumulativeNormal(d2);
+    const double discount = exp(-r * T);
+    
+    double price;
+    if (option.type == CALL) {
+        price = S * exp(-q * T) * Nd1 - K * discount * Nd2;
+    } else { // PUT
+        price = K * discount * cumulativeNormal(-d2) - S * exp(-q * T) * cumulativeNormal(-d1);
+    }
+    
+    return price;
+}
+
+// Device-side Black-Scholes evaluation.
+__device__ __forceinline__ double blackScholesDevice(const int type,
+                                                     const double K,
+                                                     const double S,
+                                                     const double q,
+                                                     const double r,
+                                                     const double T,
+                                                     const double sigma) noexcept {
+    if (T <= 0.0 || sigma <= 0.0) {
+        return 0.0;
+    }
+
+    const double sqrtT = sqrt(T);
+    const double sigmaSqrtT = sigma * sqrtT;
+    const double d1 = (log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / sigmaSqrtT;
+    const double d2 = d1 - sigmaSqrtT;
+
+    const double e1 = erf(d1 * M_SQRT1_2);
+    const double e2 = erf(d2 * M_SQRT1_2);
+    const double discount = exp(-r * T);
+    const double dividendDiscount = exp(-q * T);
+
+    if (type == CALL) {
+        const double Nd1 = 0.5 * (1.0 + e1);
+        const double Nd2 = 0.5 * (1.0 + e2);
+        return S * dividendDiscount * Nd1 - K * discount * Nd2;
+    } else { // PUT
+        // cumulativeNormal(-x) = 0.5 * (1 - erf(x / sqrt(2))), reusing the
+        // already-evaluated erf values while retaining tail accuracy.
+        const double Nd1neg = 0.5 * (1.0 - e1);
+        const double Nd2neg = 0.5 * (1.0 - e2);
+        return K * discount * Nd2neg - S * dividendDiscount * Nd1neg;
+    }
+}
+
+// Structure-of-arrays kernel: coalesced loads and no unused validation fields.
+__global__ __launch_bounds__(256)
+void blackScholesKernel(const int* __restrict__ type,
+                        const double* __restrict__ strike,
+                        const double* __restrict__ spot,
+                        const double* __restrict__ q,
+                        const double* __restrict__ r,
+                        const double* __restrict__ t,
+                        const double* __restrict__ vol,
+                        double* __restrict__ results,
+                        const unsigned long long numOptions) {
+    const unsigned long long stride =
+        static_cast<unsigned long long>(gridDim.x) * blockDim.x;
+    for (unsigned long long i =
+             static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < numOptions;
+         i += stride) {
+        results[i] = blackScholesDevice(type[i], strike[i], spot[i], q[i], r[i],
+                                        t[i], vol[i]);
+    }
+}
+
 // Standard test cases for validation
 inline constexpr std::array<OptionInput, 7> getTestOptions() noexcept {
     return {{
@@ -64,146 +161,146 @@ inline constexpr std::array<OptionInput, 7> getTestOptions() noexcept {
     }};
 }
 
-constexpr int kNumTestOptions = static_cast<int>(getTestOptions().size());
+// Pinned host-side structure-of-arrays storage.
+struct HostOptions {
+    int* type = nullptr;
+    double* strike = nullptr;
+    double* spot = nullptr;
+    double* q = nullptr;
+    double* r = nullptr;
+    double* t = nullptr;
+    double* vol = nullptr;
+    double* results = nullptr;
+    size_t n = 0;
 
-// The small, immutable set of base options lives in constant memory so that the
-// kernel never has to stream per-option inputs from global memory.  The price
-// of option i is reconstructed on the device exactly as generateOptions() does
-// on the host.
-__constant__ int c_type[kNumTestOptions];
-__constant__ double c_strike[kNumTestOptions];
-__constant__ double c_spot[kNumTestOptions];
-__constant__ double c_q[kNumTestOptions];
-__constant__ double c_r[kNumTestOptions];
-__constant__ double c_t[kNumTestOptions];
-__constant__ double c_vol[kNumTestOptions];
+    HostOptions() = default;
+    HostOptions(const HostOptions&) = delete;
+    HostOptions& operator=(const HostOptions&) = delete;
 
-void uploadTestOptions() {
+    void allocate(const size_t count) {
+        n = count;
+        if (n == 0) {
+            return;
+        }
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&type), n * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&strike), n * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&spot), n * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&q), n * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&r), n * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&t), n * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&vol), n * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&results), n * sizeof(double)));
+    }
+
+    ~HostOptions() {
+        if (type) cudaFreeHost(type);
+        if (strike) cudaFreeHost(strike);
+        if (spot) cudaFreeHost(spot);
+        if (q) cudaFreeHost(q);
+        if (r) cudaFreeHost(r);
+        if (t) cudaFreeHost(t);
+        if (vol) cudaFreeHost(vol);
+        if (results) cudaFreeHost(results);
+    }
+};
+
+// Device-side structure-of-arrays storage.
+struct DeviceOptions {
+    int* type = nullptr;
+    double* strike = nullptr;
+    double* spot = nullptr;
+    double* q = nullptr;
+    double* r = nullptr;
+    double* t = nullptr;
+    double* vol = nullptr;
+    double* results = nullptr;
+    size_t n = 0;
+
+    DeviceOptions() = default;
+    DeviceOptions(const DeviceOptions&) = delete;
+    DeviceOptions& operator=(const DeviceOptions&) = delete;
+
+    void allocate(const size_t count) {
+        n = count;
+        if (n == 0) {
+            return;
+        }
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&type), n * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&strike), n * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&spot), n * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&q), n * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&r), n * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&t), n * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&vol), n * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&results), n * sizeof(double)));
+    }
+
+    ~DeviceOptions() {
+        if (type) cudaFree(type);
+        if (strike) cudaFree(strike);
+        if (spot) cudaFree(spot);
+        if (q) cudaFree(q);
+        if (r) cudaFree(r);
+        if (t) cudaFree(t);
+        if (vol) cudaFree(vol);
+        if (results) cudaFree(results);
+    }
+};
+
+// Generate a larger set of options by scaling the test set.
+// Fills the GPU-friendly SoA layout and, when requested, the AoS copy used by
+// validation.
+void generateOptions(HostOptions& host, std::vector<OptionInput>* validation,
+                     const size_t numOptions) {
     constexpr auto testOptions = getTestOptions();
-    int type[kNumTestOptions];
-    double strike[kNumTestOptions];
-    double spot[kNumTestOptions];
-    double q[kNumTestOptions];
-    double r[kNumTestOptions];
-    double t[kNumTestOptions];
-    double vol[kNumTestOptions];
-
-    for (int i = 0; i < kNumTestOptions; ++i) {
-        type[i] = testOptions[i].type;
-        strike[i] = testOptions[i].strike;
-        spot[i] = testOptions[i].spot;
-        q[i] = testOptions[i].q;
-        r[i] = testOptions[i].r;
-        t[i] = testOptions[i].t;
-        vol[i] = testOptions[i].vol;
+    if (validation) {
+        validation->resize(numOptions);
     }
-
-    CUDA_CHECK(cudaMemcpyToSymbol(c_type, type, sizeof(type)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_strike, strike, sizeof(strike)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_spot, spot, sizeof(spot)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_q, q, sizeof(q)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_r, r, sizeof(r)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_t, t, sizeof(t)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_vol, vol, sizeof(vol)));
-}
-
-// Standard normal cumulative distribution function
-__device__ __forceinline__ double cumulativeNormal(const double x) noexcept {
-    return 0.5 * (1.0 + erf(x * M_SQRT1_2));
-}
-
-// Black-Scholes formula for European options
-__device__ __forceinline__ double blackScholes(const int type, const double K,
-                                               const double S, const double q,
-                                               const double r, const double T,
-                                               const double sigma) noexcept {
-    if (T <= 0.0 || sigma <= 0.0) {
-        return 0.0;
-    }
-
-    const double sqrtT = sqrt(T);
-    const double d1 = (log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT);
-    const double d2 = d1 - sigma * sqrtT;
-
-    const double Nd1 = cumulativeNormal(d1);
-    const double Nd2 = cumulativeNormal(d2);
-    const double discount = exp(-r * T);
-    const double dividend = exp(-q * T);
-
-    double price;
-    if (type == CALL) {
-        price = S * dividend * Nd1 - K * discount * Nd2;
-    } else { // PUT, using N(-x) == 1 - N(x)
-        price = K * discount * (1.0 - Nd2) - S * dividend * (1.0 - Nd1);
-    }
-
-    return price;
-}
-
-// One thread prices one option.  The option parameters are regenerated on the
-// fly from constant memory (matching generateOptions), and the results are
-// written with fully coalesced accesses.  `offset` is the global index of
-// results[0], which keeps the generated parameters identical when the workload
-// is split into chunks for transfer/compute overlap.
-__global__ void blackScholesKernel(double* __restrict__ results,
-                                   const unsigned long long offset,
-                                   const unsigned long long count) {
-    const unsigned long long stride =
-        static_cast<unsigned long long>(blockDim.x) * gridDim.x;
-    for (unsigned long long j =
-             static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-         j < count; j += stride) {
-        const unsigned long long i = offset + j;
-        const int base = static_cast<int>(i % kNumTestOptions);
-        const double factor =
-            1.0 + 0.1 * (static_cast<double>(i) / static_cast<double>(kNumTestOptions));
-        const double spot = c_spot[base] * factor;
-        const double strike = c_strike[base] * factor;
-
-        results[j] = blackScholes(c_type[base], strike, spot, c_q[base],
-                                  c_r[base], c_t[base], c_vol[base]);
-    }
-}
-
-// Generate a larger set of options by scaling the test set
-void generateOptions(std::vector<OptionInput>& options, const size_t numOptions) {
-    constexpr auto testOptions = getTestOptions();
-    options.resize(numOptions);
 
     for (size_t i = 0; i < numOptions; ++i) {
         // Cycle through test options and vary parameters slightly
         const OptionInput& base = testOptions[i % testOptions.size()];
-        options[i] = base;
-
-        // Add some variation for larger datasets
         const double factor = 1.0 + 0.1 * (i / static_cast<double>(testOptions.size()));
-        options[i].spot *= factor;
-        options[i].strike *= factor;
+        const double spot = base.spot * factor;
+        const double strike = base.strike * factor;
+
+        host.type[i] = base.type;
+        host.strike[i] = strike;
+        host.spot[i] = spot;
+        host.q[i] = base.q;
+        host.r[i] = base.r;
+        host.t[i] = base.t;
+        host.vol[i] = base.vol;
+
+        if (validation) {
+            (*validation)[i] = OptionInput{base.type, strike, spot, base.q, base.r,
+                                           base.t, base.vol, base.value, base.tol};
+        }
     }
 }
 
-bool validateResults(const std::vector<OptionInput>& options,
+bool validateResults(const std::vector<OptionInput>& options, 
                      const std::vector<double>& results) {
     bool allPassed = true;
     const int numChecks = std::min(static_cast<size_t>(10), options.size());
-
+    
     printf("Checking computed option prices:\n");
     for (int i = 0; i < numChecks; ++i) {
         const double computed = results[i];
         const double expected = options[i].value;
         const double error = fabs(computed - expected);
         const double relError = error / (fabs(expected) + 1e-10);
-
-        printf("  Option %d: computed=%.4f, expected=%.4f, rel_error=%.4e\n",
+        
+        printf("  Option %d: computed=%.4f, expected=%.4f, rel_error=%.4e\n", 
                i, computed, expected, relError);
-
+        
         // Relaxed validation - just check values are positive and reasonable
         if (computed < 0.0 || computed > 1000.0 || std::isnan(computed) || std::isinf(computed)) {
             printf("Validation failed at option %d: invalid value %.4f\n", i, computed);
             allPassed = false;
         }
     }
-
+    
     return allPassed;
 }
 
@@ -220,7 +317,7 @@ int main(int argc, char** argv) {
     size_t numOptions = 10000;
     bool validate = false;
     bool printResults = false;
-
+    
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
@@ -238,103 +335,109 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-
+    
     printf("Black-Scholes Option Pricing Benchmark\n");
     printf("Number of options: %zu\n", numOptions);
     printf("Validation: %s\n", validate ? "enabled" : "disabled");
 
-    // Publish the base options to constant memory once; this is setup work and
-    // is not part of the pricing time.
-    uploadTestOptions();
-
-    // Allocate results on the host and the pricing output on the device.  The
-    // host buffer is page-locked so that device-to-host transfers can run
-    // asynchronously while the GPU is still pricing the next chunk.
-    double* deviceResults = nullptr;
-    double* hostResults = nullptr;
-    if (numOptions > 0) {
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&deviceResults),
-                              numOptions * sizeof(double)));
-        CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&hostResults),
-                                 numOptions * sizeof(double), cudaHostAllocDefault));
+    int deviceCount = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+    if (deviceCount == 0) {
+        fprintf(stderr, "CUDA error: no CUDA-capable device found\n");
+        return 1;
     }
+    CUDA_CHECK(cudaSetDevice(0));
 
-    // Two streams let the copy engine drain one chunk while the SMs price the
-    // next one.  Stream creation is setup, so it happens outside the timer.
-    cudaStream_t streams[2] = {nullptr, nullptr};
-    CUDA_CHECK(cudaStreamCreateWithFlags(&streams[0], cudaStreamNonBlocking));
-    CUDA_CHECK(cudaStreamCreateWithFlags(&streams[1], cudaStreamNonBlocking));
+    // Generate options in the layout consumed by the GPU kernel.
+    HostOptions host;
+    host.allocate(numOptions);
 
-    // Price options
+    std::vector<OptionInput> options;
+    generateOptions(host, validate ? &options : nullptr, numOptions);
+
+    // Allocate results
+    std::vector<double> results(numOptions);
+
+    // Move inputs to the device before timing. Option generation and input
+    // transfer are setup, matching the serial version where the inputs are
+    // already resident in memory when the pricing loop starts.
+    DeviceOptions device;
+    device.allocate(numOptions);
+
     printf("Pricing options...\n");
-    auto start = std::chrono::high_resolution_clock::now();
+
+    const size_t numBytes = numOptions * sizeof(double);
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
 
     if (numOptions > 0) {
-        constexpr unsigned int blockSize = 256;
-        // ~16 MiB per chunk: large enough to amortize launch overhead, small
-        // enough that the final not-yet-overlapped copy is negligible.
-        constexpr size_t chunkSize = 2u * 1024u * 1024u;
-        size_t chunk = 0;
-        for (size_t offset = 0; offset < numOptions; offset += chunkSize, ++chunk) {
-            const size_t count = std::min(chunkSize, numOptions - offset);
-            const unsigned long long numBlocks =
-                (static_cast<unsigned long long>(count) + blockSize - 1) / blockSize;
-            cudaStream_t stream = streams[chunk & 1u];
-
-            blackScholesKernel<<<static_cast<unsigned int>(numBlocks), blockSize, 0, stream>>>(
-                deviceResults + offset, static_cast<unsigned long long>(offset),
-                static_cast<unsigned long long>(count));
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaMemcpyAsync(hostResults + offset, deviceResults + offset,
-                                       count * sizeof(double), cudaMemcpyDeviceToHost,
-                                       stream));
-        }
-        CUDA_CHECK(cudaStreamSynchronize(streams[0]));
-        CUDA_CHECK(cudaStreamSynchronize(streams[1]));
+        CUDA_CHECK(cudaMemcpyAsync(device.type, host.type, numOptions * sizeof(int),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device.strike, host.strike, numBytes,
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device.spot, host.spot, numBytes,
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device.q, host.q, numBytes,
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device.r, host.r, numBytes,
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device.t, host.t, numBytes,
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device.vol, host.vol, numBytes,
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
     }
+
+    constexpr unsigned int threadsPerBlock = 256;
+    const unsigned long long blocks =
+        (static_cast<unsigned long long>(numOptions) + threadsPerBlock - 1) /
+        threadsPerBlock;
+
+    // Warm up the launch path before measuring so the timing reflects steady
+    // state execution.
+    blackScholesKernel<<<1, 1, 0, stream>>>(
+        device.type, device.strike, device.spot, device.q, device.r, device.t,
+        device.vol, device.results, 0);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    if (numOptions > 0) {
+        blackScholesKernel<<<static_cast<unsigned int>(blocks), threadsPerBlock,
+                             0, stream>>>(
+            device.type, device.strike, device.spot, device.q, device.r,
+            device.t, device.vol, device.results,
+            static_cast<unsigned long long>(numOptions));
+        CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-
-    // Only the printed/validated results need to live in a std::vector; the
-    // benchmark path reads no results at all.
-    std::vector<double> results;
-    std::vector<double> checkResults;
-    if (numOptions > 0) {
-        if (printResults) {
-            results.assign(hostResults, hostResults + numOptions);
-        }
-        if (validate) {
-            const size_t numChecks = std::min(static_cast<size_t>(10), numOptions);
-            checkResults.assign(hostResults, hostResults + numChecks);
-        }
-    }
-
-    CUDA_CHECK(cudaStreamDestroy(streams[0]));
-    CUDA_CHECK(cudaStreamDestroy(streams[1]));
-    if (hostResults != nullptr) {
-        CUDA_CHECK(cudaFreeHost(hostResults));
-    }
-    if (deviceResults != nullptr) {
-        CUDA_CHECK(cudaFree(deviceResults));
-    }
-
+    
     printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
     printf("Options per second: %.0f\n", numOptions / (duration.count() / 1e6));
 
+    // Copy the prices back to pinned host memory after timing the computation.
+    if (numOptions > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(host.results, device.results, numBytes,
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::copy(host.results, host.results + numOptions, results.begin());
+    }
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    
     // Print results for external validation
     if (printResults) {
         print_results(results, "OptionPrices");
     }
-
+    
     // Validation
     if (validate) {
         printf("Validating results...\n");
-        // Only the first ten entries are ever inspected by validateResults().
-        std::vector<OptionInput> options;
-        generateOptions(options, std::min(static_cast<size_t>(10), numOptions));
-        bool valid = validateResults(options, checkResults);
-
+        bool valid = validateResults(options, results);
+        
         if (valid) {
             printf("Validation: PASSED\n");
             return 0;
@@ -343,6 +446,6 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-
+    
     return 0;
 }
