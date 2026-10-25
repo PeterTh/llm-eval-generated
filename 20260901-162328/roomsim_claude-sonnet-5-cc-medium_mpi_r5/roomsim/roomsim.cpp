@@ -995,7 +995,10 @@ int main(int argc, char** argv) {
     }
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long localDurations[3] = {preDuration, simDuration, distDuration};
+    long globalDurations[3] = {};
+    MPI_Reduce(localDurations, globalDurations, 3, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    long totalTime = globalDurations[0] + globalDurations[1] + globalDurations[2];
 
     int exitCode = 0;
     if (rank == 0) {
