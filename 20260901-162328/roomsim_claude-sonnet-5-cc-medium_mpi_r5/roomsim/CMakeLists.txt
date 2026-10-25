@@ -11,5 +11,5 @@ add_executable(roomsim roomsim.cpp)
 # Enable optimizations and warnings
 target_compile_options(roomsim PRIVATE -O3 -march=native -Wall -Wextra -Wpedantic)
 
-# Link math and MPI libraries
+# Link math library and MPI
 target_link_libraries(roomsim m MPI::MPI_CXX)

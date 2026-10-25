@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
 #include <mpi.h>
 
 #include "../common/results_output.hpp"
@@ -93,24 +94,39 @@ inline constexpr std::array<OptionInput, 7> getTestOptions() noexcept {
     }};
 }
 
-// Generate a range [startIndex, startIndex + count) of the larger option set.
-// Each entry depends only on its global index, so any rank can generate its
-// own slice independently without needing the full dataset materialized.
-void generateOptions(std::vector<OptionInput>& options, const size_t startIndex, const size_t count) {
+// Construct the option at a given global index (same scaling rule as the
+// original single-process generator), allowing each rank to independently
+// materialize only the slice of the dataset it owns.
+inline OptionInput makeOption(const size_t i) noexcept {
     constexpr auto testOptions = getTestOptions();
-    options.resize(count);
+    OptionInput opt = testOptions[i % testOptions.size()];
 
-    for (size_t k = 0; k < count; ++k) {
-        const size_t i = startIndex + k;
-        // Cycle through test options and vary parameters slightly
-        const OptionInput& base = testOptions[i % testOptions.size()];
-        options[k] = base;
+    // Add some variation for larger datasets
+    const double factor = 1.0 + 0.1 * (i / static_cast<double>(testOptions.size()));
+    opt.spot *= factor;
+    opt.strike *= factor;
 
-        // Add some variation for larger datasets
-        const double factor = 1.0 + 0.1 * (i / static_cast<double>(testOptions.size()));
-        options[k].spot *= factor;
-        options[k].strike *= factor;
+    return opt;
+}
+
+// Generate a larger set of options by scaling the test set
+void generateOptions(std::vector<OptionInput>& options, const size_t numOptions) {
+    options.resize(numOptions);
+    for (size_t i = 0; i < numOptions; ++i) {
+        options[i] = makeOption(i);
     }
+}
+
+// Compute the [start, start + count) slice of the dataset owned by a given
+// rank under a contiguous block distribution of numOptions items.
+void blockDistribution(const size_t numOptions, const int size, const int rank,
+                        size_t& start, size_t& count) noexcept {
+    const size_t base = numOptions / static_cast<size_t>(size);
+    const size_t remainder = numOptions % static_cast<size_t>(size);
+    const size_t rankIdx = static_cast<size_t>(rank);
+
+    count = base + (rankIdx < remainder ? 1 : 0);
+    start = rankIdx * base + std::min(rankIdx, remainder);
 }
 
 bool validateResults(const std::vector<OptionInput>& options, 
@@ -149,9 +165,11 @@ void printUsage(const char* progName) {
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
-    int worldSize, worldRank;
-    MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
-    MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
+
+    int rank = 0;
+    int numRanks = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
 
     size_t numOptions = 10000;
     bool validate = false;
@@ -166,13 +184,13 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-r") == 0) {
             printResults = true;
         } else if (strcmp(argv[i], "-h") == 0) {
-            if (worldRank == 0) {
+            if (rank == 0) {
                 printUsage(argv[0]);
             }
             MPI_Finalize();
             return 0;
         } else {
-            if (worldRank == 0) {
+            if (rank == 0) {
                 printf("Unknown option: %s\n", argv[i]);
                 printUsage(argv[0]);
             }
@@ -181,28 +199,29 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (worldRank == 0) {
+    if (rank == 0) {
         printf("Black-Scholes Option Pricing Benchmark\n");
         printf("Number of options: %zu\n", numOptions);
-        printf("Number of MPI ranks: %d\n", worldSize);
+        printf("Number of MPI ranks: %d\n", numRanks);
         printf("Validation: %s\n", validate ? "enabled" : "disabled");
     }
 
-    // Partition the options as evenly as possible across ranks
-    const size_t baseCount = numOptions / static_cast<size_t>(worldSize);
-    const size_t remainder = numOptions % static_cast<size_t>(worldSize);
-    const size_t localStart = static_cast<size_t>(worldRank) * baseCount +
-                               std::min(static_cast<size_t>(worldRank), remainder);
-    const size_t localCount = baseCount + (static_cast<size_t>(worldRank) < remainder ? 1 : 0);
+    // Determine this rank's contiguous slice of the dataset
+    size_t localStart = 0;
+    size_t localCount = 0;
+    blockDistribution(numOptions, numRanks, rank, localStart, localCount);
 
-    // Generate only this rank's slice of options
-    std::vector<OptionInput> localOptions;
-    generateOptions(localOptions, localStart, localCount);
+    // Generate only the options owned by this rank
+    std::vector<OptionInput> localOptions(localCount);
+    for (size_t i = 0; i < localCount; ++i) {
+        localOptions[i] = makeOption(localStart + i);
+    }
 
     // Allocate local results
     std::vector<double> localResults(localCount);
 
-    if (worldRank == 0) {
+    // Price options
+    if (rank == 0) {
         printf("Pricing options...\n");
     }
 
@@ -213,37 +232,37 @@ int main(int argc, char** argv) {
         localResults[i] = blackScholes(localOptions[i]);
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    const double localDurationMs = std::chrono::duration<double, std::milli>(end - start).count();
-    double maxDurationMs = 0.0;
-    MPI_Reduce(&localDurationMs, &maxDurationMs, 1, MPI_DOUBLE, MPI_MAX, 0,
-               MPI_COMM_WORLD);
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
-    // Gather all results on rank 0
-    std::vector<double> results;
-    std::vector<int> recvCounts;
-    std::vector<int> displs;
-    if (worldRank == 0) {
-        results.resize(numOptions);
-        recvCounts.resize(worldSize);
-        displs.resize(worldSize);
-        for (int rank = 0; rank < worldSize; ++rank) {
-            const size_t rankCount = baseCount + (static_cast<size_t>(rank) < remainder ? 1 : 0);
-            const size_t rankStart = static_cast<size_t>(rank) * baseCount +
-                                      std::min(static_cast<size_t>(rank), remainder);
-            recvCounts[rank] = static_cast<int>(rankCount);
-            displs[rank] = static_cast<int>(rankStart);
-        }
+    long long localMicros = duration.count();
+    long long maxMicros = 0;
+    MPI_Reduce(&localMicros, &maxMicros, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    // Gather per-rank result counts/offsets and the results themselves onto rank 0
+    std::vector<int> counts(numRanks);
+    std::vector<int> displs(numRanks);
+    for (int r = 0; r < numRanks; ++r) {
+        size_t rStart = 0;
+        size_t rCount = 0;
+        blockDistribution(numOptions, numRanks, r, rStart, rCount);
+        counts[r] = static_cast<int>(rCount);
+        displs[r] = static_cast<int>(rStart);
     }
 
+    std::vector<double> results;
+    if (rank == 0) {
+        results.resize(numOptions);
+    }
     MPI_Gatherv(localResults.data(), static_cast<int>(localCount), MPI_DOUBLE,
-                worldRank == 0 ? results.data() : nullptr,
-                recvCounts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+                results.data(), counts.data(), displs.data(), MPI_DOUBLE,
+                0, MPI_COMM_WORLD);
 
-    if (worldRank == 0) {
-        printf("Computation time: %.3f ms\n", maxDurationMs);
-        printf("Options per second: %.0f\n", numOptions / (maxDurationMs / 1000.0));
+    int exitCode = 0;
+
+    if (rank == 0) {
+        printf("Computation time: %.3f ms\n", maxMicros / 1000.0);
+        printf("Options per second: %.0f\n", numOptions / (maxMicros / 1e6));
 
         // Print results for external validation
         if (printResults) {
@@ -253,23 +272,25 @@ int main(int argc, char** argv) {
         // Validation
         if (validate) {
             printf("Validating results...\n");
-            const size_t numChecks = std::min(static_cast<size_t>(10), numOptions);
-            std::vector<OptionInput> checkOptions;
-            generateOptions(checkOptions, 0, numChecks);
-            bool valid = validateResults(checkOptions, results);
+
+            // Reconstruct the full option set (cheap, deterministic) for
+            // comparison against the known expected values.
+            std::vector<OptionInput> options;
+            generateOptions(options, numOptions);
+
+            bool valid = validateResults(options, results);
 
             if (valid) {
                 printf("Validation: PASSED\n");
-                MPI_Finalize();
-                return 0;
+                exitCode = 0;
             } else {
                 printf("Validation: FAILED\n");
-                MPI_Finalize();
-                return 1;
+                exitCode = 1;
             }
         }
     }
 
+    MPI_Bcast(&exitCode, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Finalize();
-    return 0;
+    return exitCode;
 }

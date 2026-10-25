@@ -4,8 +4,7 @@ project(unstructured_benchmark)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# MPI is required unconditionally for distributed-memory parallelism
-find_package(MPI REQUIRED)
+find_package(MPI REQUIRED COMPONENTS CXX)
 
 add_executable(unstructured unstructured.cpp)
 

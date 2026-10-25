@@ -1,6 +1,5 @@
 #include <chrono>
 #include <cmath>
-#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,14 +33,12 @@ void randomizeBodies(std::vector<Body>& bodies, unsigned int seed = 42) {
     }
 }
 
-// Compute forces for the local range [localStart, localStart + localCount) of
-// bodies, using the globally replicated `bodies` array, updating only the
-// locally owned velocities in place.
-void computeForces(std::vector<Body>& bodies, int localStart, int localCount) {
+// Computes forces for the local slice [begin, end) of bodies against the
+// full (globally consistent) bodies array, updating velocities in place.
+void computeForces(std::vector<Body>& bodies, size_t begin, size_t end) {
     const size_t n = bodies.size();
 
-    for (int li = 0; li < localCount; ++li) {
-        const size_t i = static_cast<size_t>(localStart + li);
+    for (size_t i = begin; i < end; ++i) {
         double Fx = 0.0, Fy = 0.0, Fz = 0.0;
 
         for (size_t j = 0; j < n; ++j) {
@@ -63,60 +60,66 @@ void computeForces(std::vector<Body>& bodies, int localStart, int localCount) {
     }
 }
 
-// Integrate the local range of bodies in place (only the locally owned
-// bodies' positions are updated).
-void integrateBodies(std::vector<Body>& bodies, int localStart, int localCount) {
-    for (int li = 0; li < localCount; ++li) {
-        Body& body = bodies[static_cast<size_t>(localStart + li)];
+void integrateBodies(std::vector<Body>& bodies, size_t begin, size_t end) {
+    for (size_t i = begin; i < end; ++i) {
+        Body& body = bodies[i];
         body.pos.x += body.vel.x * DT;
         body.pos.y += body.vel.y * DT;
         body.pos.z += body.vel.z * DT;
     }
 }
 
-// Compute the total energy (kinetic + potential) across all ranks. Each rank
-// contributes the kinetic energy of its local bodies and the potential energy
-// of pairs (i, j) with i in the local range and j > i; the partial sums are
-// then reduced across all ranks so every process ends up with the same total.
-double computeTotalEnergy(const std::vector<Body>& bodies, int localStart, int localCount, MPI_Comm comm) {
-    double localEnergy = 0.0;
-    const size_t n = bodies.size();
-
-    // Kinetic energy (assuming unit mass) for locally owned bodies
-    for (int li = 0; li < localCount; ++li) {
-        const Body& body = bodies[static_cast<size_t>(localStart + li)];
-        localEnergy += 0.5 * (body.vel.x * body.vel.x + body.vel.y * body.vel.y + body.vel.z * body.vel.z);
+// Computes the [counts, displs] (in units of Body, i.e. 6 doubles each) of a
+// contiguous block distribution of numBodies across numRanks ranks.
+void computeDistribution(int numBodies, int numRanks, std::vector<int>& counts,
+                          std::vector<int>& displs) {
+    counts.assign(numRanks, 0);
+    displs.assign(numRanks, 0);
+    const int base = numBodies / numRanks;
+    const int remainder = numBodies % numRanks;
+    int offset = 0;
+    for (int r = 0; r < numRanks; ++r) {
+        counts[r] = base + (r < remainder ? 1 : 0);
+        displs[r] = offset;
+        offset += counts[r];
     }
+}
 
-    // Potential energy (assuming unit mass for all bodies), partitioned by i
-    for (int li = 0; li < localCount; ++li) {
-        const size_t i = static_cast<size_t>(localStart + li);
+double computeTotalEnergy(const std::vector<Body>& bodies) {
+    double energy = 0.0;
+    const size_t n = bodies.size();
+    
+    // Kinetic energy (assuming unit mass)
+    for (const auto& body : bodies) {
+        energy += 0.5 * (body.vel.x * body.vel.x + 
+                        body.vel.y * body.vel.y + 
+                        body.vel.z * body.vel.z);
+    }
+    
+    // Potential energy (assuming unit mass for all bodies)
+    for (size_t i = 0; i < n; ++i) {
         for (size_t j = i + 1; j < n; ++j) {
             const double dx = bodies[j].pos.x - bodies[i].pos.x;
             const double dy = bodies[j].pos.y - bodies[i].pos.y;
             const double dz = bodies[j].pos.z - bodies[i].pos.z;
             const double dist = std::sqrt(dx * dx + dy * dy + dz * dz + SOFTENING);
-            localEnergy -= 1.0 / dist;
+            energy -= 1.0 / dist;
         }
     }
-
-    double totalEnergy = 0.0;
-    MPI_Allreduce(&localEnergy, &totalEnergy, 1, MPI_DOUBLE, MPI_SUM, comm);
-    return totalEnergy;
+    
+    return energy;
 }
 
-// Validate that the locally owned bodies produce finite, reasonable values
-bool validateSimulationLocal(const std::vector<Body>& bodies, int localStart, int localCount) {
-    for (int li = 0; li < localCount; ++li) {
-        const Body& body = bodies[static_cast<size_t>(localStart + li)];
-
+// Validate that simulation produces finite, reasonable values
+bool validateSimulation(const std::vector<Body>& bodies) {
+    for (const auto& body : bodies) {
         // Check for NaN or Inf values
         if (!std::isfinite(body.pos.x) || !std::isfinite(body.pos.y) || !std::isfinite(body.pos.z) ||
             !std::isfinite(body.vel.x) || !std::isfinite(body.vel.y) || !std::isfinite(body.vel.z)) {
             printf("Validation failed: found NaN or Inf value in body state\n");
             return false;
         }
-
+        
         // Check for extreme values (bodies shouldn't fly off to infinity)
         const double maxPos = 1e6;
         const double maxVel = 1e6;
@@ -142,27 +145,12 @@ void printUsage(const char* progName) {
     printf("  -h           Show this help message\n");
 }
 
-// Compute a block distribution of `numBodies` across `numRanks` ranks,
-// filling in per-rank counts and displacements (in number of bodies).
-void computeDistribution(int numBodies, int numRanks, std::vector<int>& counts, std::vector<int>& displs) {
-    counts.resize(numRanks);
-    displs.resize(numRanks);
-    const int base = numBodies / numRanks;
-    const int rem = numBodies % numRanks;
-    int offset = 0;
-    for (int r = 0; r < numRanks; ++r) {
-        counts[r] = base + (r < rem ? 1 : 0);
-        displs[r] = offset;
-        offset += counts[r];
-    }
-}
-
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
 
-    int rank = 0, worldSize = 1;
+    int rank = 0, numRanks = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
+    MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
 
     int numBodies = 1024;
     int numSteps = 10;
@@ -198,116 +186,83 @@ int main(int argc, char** argv) {
         printf("Number of bodies: %d\n", numBodies);
         printf("Number of steps: %d\n", numSteps);
         printf("Validation: %s\n", validate ? "enabled" : "disabled");
+        printf("MPI ranks: %d\n", numRanks);
     }
 
-    // Determine this rank's slice of the bodies (block distribution)
-    std::vector<int> counts, displs;
-    computeDistribution(numBodies, worldSize, counts, displs);
-    const int localStart = displs[rank];
-    const int localCount = counts[rank];
-
-    // Derived MPI datatype describing one Body's `pos` field (3 contiguous
-    // doubles), resized so consecutive elements stride across the array by
-    // sizeof(Body). This lets us gather/broadcast only positions in place
-    // inside the interleaved Body array, matching the original data layout
-    // (and therefore its floating-point evaluation order) exactly.
-    MPI_Datatype vec3Contig, posType;
-    MPI_Type_contiguous(3, MPI_DOUBLE, &vec3Contig);
-    MPI_Type_create_resized(vec3Contig, 0, sizeof(Body), &posType);
-    MPI_Type_commit(&posType);
-    MPI_Type_free(&vec3Contig);
-
-    // Initialize bodies identically to the serial version: generate the full
-    // set on rank 0 (matching the original single-seed RNG sequence exactly),
-    // then broadcast the whole array so every rank has identical initial state.
+    // Initialize bodies. Each rank generates the same deterministic data so
+    // no initial broadcast is required.
     std::vector<Body> bodies(numBodies);
-    if (rank == 0) {
-        randomizeBodies(bodies);
+    randomizeBodies(bodies);
+
+    // Distribute the bodies as contiguous blocks across ranks. counts/displs
+    // are expressed in units of Body (6 doubles each).
+    std::vector<int> counts, displs;
+    computeDistribution(numBodies, numRanks, counts, displs);
+    const size_t localBegin = static_cast<size_t>(displs[rank]);
+    const size_t localEnd = localBegin + static_cast<size_t>(counts[rank]);
+
+    std::vector<int> byteCounts(numRanks), byteDispls(numRanks);
+    for (int r = 0; r < numRanks; ++r) {
+        byteCounts[r] = counts[r] * static_cast<int>(sizeof(Body));
+        byteDispls[r] = displs[r] * static_cast<int>(sizeof(Body));
     }
-    MPI_Bcast(bodies.data(), numBodies * 6, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     // Run simulation
     MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int step = 0; step < numSteps; ++step) {
-        computeForces(bodies, localStart, localCount);
-        integrateBodies(bodies, localStart, localCount);
+        computeForces(bodies, localBegin, localEnd);
+        integrateBodies(bodies, localBegin, localEnd);
 
-        // Synchronize the updated positions across all ranks
-        MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL,
-                        bodies.data(), counts.data(), displs.data(), posType,
-                        MPI_COMM_WORLD);
+        // Synchronize the updated bodies across all ranks so that the next
+        // step (and any post-processing) sees a globally consistent state.
+        MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_BYTE, bodies.data(), byteCounts.data(), byteDispls.data(),
+                        MPI_BYTE, MPI_COMM_WORLD);
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    long localDuration = duration.count();
-    long maxDuration = 0;
-    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Simulation time: %ld ms\n", maxDuration);
+        printf("Simulation time: %ld ms\n", duration.count());
     }
 
     // Print results for external validation
-    if (printResults) {
-        // Gather velocities (positions are already globally in sync)
-        MPI_Datatype vec3ContigV, velType;
-        MPI_Type_contiguous(3, MPI_DOUBLE, &vec3ContigV);
-        MPI_Type_create_resized(vec3ContigV, 0, sizeof(Body), &velType);
-        MPI_Type_commit(&velType);
-        MPI_Type_free(&vec3ContigV);
-
-        char* velBase = reinterpret_cast<char*>(bodies.data()) + offsetof(Body, vel);
-        void* sendPtr = velBase + static_cast<size_t>(localStart) * sizeof(Body);
-        MPI_Gatherv(sendPtr, localCount, velType,
-                    velBase, counts.data(), displs.data(), velType,
-                    0, MPI_COMM_WORLD);
-        MPI_Type_free(&velType);
-
-        if (rank == 0) {
-            // Serialize body positions and velocities for hashing
-            std::vector<double> bodyData;
-            bodyData.reserve(numBodies * 6);
-            for (const auto& body : bodies) {
-                bodyData.push_back(body.pos.x);
-                bodyData.push_back(body.pos.y);
-                bodyData.push_back(body.pos.z);
-                bodyData.push_back(body.vel.x);
-                bodyData.push_back(body.vel.y);
-                bodyData.push_back(body.vel.z);
-            }
-            print_results(bodyData, "Bodies");
+    if (printResults && rank == 0) {
+        // Serialize body positions and velocities for hashing
+        std::vector<double> bodyData;
+        bodyData.reserve(numBodies * 6);
+        for (const auto& body : bodies) {
+            bodyData.push_back(body.pos.x);
+            bodyData.push_back(body.pos.y);
+            bodyData.push_back(body.pos.z);
+            bodyData.push_back(body.vel.x);
+            bodyData.push_back(body.vel.y);
+            bodyData.push_back(body.vel.z);
         }
+        print_results(bodyData, "Bodies");
     }
 
     // Validation: check that simulation produces finite, reasonable values
-    int exitCode = 0;
+    int result = 0;
     if (validate) {
         if (rank == 0) printf("Validating simulation results...\n");
 
-        const bool localValid = validateSimulationLocal(bodies, localStart, localCount);
-        int localValidInt = localValid ? 1 : 0;
-        int allValidInt = 0;
-        MPI_Allreduce(&localValidInt, &allValidInt, 1, MPI_INT, MPI_LAND, MPI_COMM_WORLD);
-
-        if (allValidInt) {
-            // Report final energy for reference
-            double finalEnergy = computeTotalEnergy(bodies, localStart, localCount, MPI_COMM_WORLD);
+        if (validateSimulation(bodies)) {
             if (rank == 0) {
+                // Report final energy for reference
+                double finalEnergy = computeTotalEnergy(bodies);
                 printf("Final energy: %.6f\n", finalEnergy);
                 printf("Validation: PASSED\n");
             }
-            exitCode = 0;
+            result = 0;
         } else {
             if (rank == 0) printf("Validation: FAILED\n");
-            exitCode = 1;
+            result = 1;
         }
     }
 
-    MPI_Type_free(&posType);
     MPI_Finalize();
-    return exitCode;
+    return result;
 }

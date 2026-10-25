@@ -11,5 +11,5 @@ add_executable(nbody nbody.cpp)
 # Enable optimizations
 target_compile_options(nbody PRIVATE -O3 -march=native -Wall -Wextra)
 
-# Link math library and MPI
+# Link math and MPI libraries
 target_link_libraries(nbody m MPI::MPI_CXX)

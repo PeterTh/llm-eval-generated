@@ -1,15 +1,25 @@
 /**
  * Room Response Simulation Benchmark
- * 
- * This is a simplified, purely sequential implementation of room impulse response
+ *
+ * This is an MPI-parallelized implementation of room impulse response
  * simulation using radiosity-based wave propagation. It models how sound/light
  * waves propagate between surfaces in a room by computing:
- * 
+ *
  * 1. Form factors (Kij) between all pairs of triangles based on visibility and geometry
  * 2. Wave propagation using radiosity equations with time delays (Tau)
  * 3. Distance estimation via cross-correlation of radiosity values
- * 
+ *
  * The implementation generates a procedural icosphere mesh to simulate a room.
+ *
+ * Parallelization strategy: the N triangles are partitioned into contiguous
+ * row blocks, one block per MPI rank. Each rank independently builds the
+ * (replicated, inexpensive) mesh/octree, then computes form factors (Kij) and
+ * time delays (Tau) only for the rows it owns, storing them in rank-local
+ * matrices (O(N^2/P) memory instead of O(N^2)). During wave propagation, each
+ * rank updates only its own rows of radiosity per timestep and the results
+ * are exchanged with MPI_Allgatherv so every rank has the full radiosity
+ * state needed for the next timestep. Distance computation is likewise
+ * partitioned by row and gathered at the end.
  */
 
 #include <algorithm>
@@ -23,6 +33,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <random>
 #include <vector>
 
 #include <mpi.h>
@@ -392,37 +403,16 @@ public:
 // Random Number Generation
 // ============================================================================
 
-// Fast, O(1)-seed counter-style RNG (SplitMix64). Unlike std::mt19937 (which has
-// expensive 624-word state initialization), this can be cheaply reseeded per
-// (triangle-pair) call, which is what allows computeKij() to be split across
-// MPI ranks / triangle pairs with an independent, reproducible random stream
-// per pair instead of a single sequential shared generator.
-class FastRng {
-    uint64_t state;
+class RandomGenerator {
+    std::mt19937 rng;
+    std::uniform_real_distribution<val_t> dist;
 public:
-    explicit FastRng(uint64_t seed) : state(seed) {}
-    val_t rand() {
-        state += 0x9E3779B97F4A7C15ULL;
-        uint64_t z = state;
-        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-        z = z ^ (z >> 31);
-        return static_cast<val_t>(z >> 40) * (1.0f / 16777216.0f);  // 24-bit uniform in [0,1)
-    }
+    explicit RandomGenerator(uint32_t seed = 42) : rng(seed), dist(0.0f, 1.0f) {}
+    val_t rand() { return dist(rng); }
 };
 
-// Derive an independent, deterministic seed for the (i, j) triangle pair so that
-// computeKij() does not depend on any shared/sequential RNG state.
-uint64_t seedForPair(uint64_t baseSeed, size_t i, size_t j) {
-    uint64_t s = baseSeed * 0x9E3779B97F4A7C15ULL;
-    s ^= static_cast<uint64_t>(i) * 0xBF58476D1CE4E5B9ULL;
-    s ^= static_cast<uint64_t>(j) * 0x94D049BB133111EBULL;
-    return s;
-}
-
 // Generate a random point inside a triangle using barycentric coordinates
-template <typename RNG>
-Vec3 randomPointInTriangle(const Triangle& t, RNG& rng) {
+Vec3 randomPointInTriangle(const Triangle& t, RandomGenerator& rng) {
     val_t u = rng.rand();
     val_t v = rng.rand();
     if (u + v > 1.0f) {
@@ -498,17 +488,13 @@ val_t cosPhi(const Vec3& v, const Vec3& normal) {
 // Compute form factor Kij between triangle i (receiver) and triangle j (emitter)
 val_t computeKij(size_t idxI, size_t idxJ,
                   const std::vector<Triangle>& triangles,
-                  const Octree& octree) {
+                  const Octree& octree,
+                  RandomGenerator& rng) {
     const Triangle& triI = triangles[idxI];
     const Triangle& triJ = triangles[idxJ];
 
     // Cull triangles facing the same direction
     if (triI.normal().dot(triJ.normal()) > 0.99f) return ZERO;
-
-    // Each triangle pair gets its own independent, deterministic RNG stream so
-    // that pairs can be computed in any order and distributed across MPI ranks
-    // without requiring a shared sequential random state.
-    FastRng rng(seedForPair(42, idxI, idxJ));
 
     val_t kij = ZERO;
 
@@ -546,6 +532,22 @@ int computeTau(const Triangle& triI, const Triangle& triJ) {
 // Room Response Simulation State
 // ============================================================================
 
+// Compute a block (contiguous-row) distribution of N items across nprocs ranks.
+// Any remainder is spread one-per-rank over the first `N % nprocs` ranks.
+void computeRowDistribution(size_t N, int nprocs, std::vector<int>& counts, std::vector<int>& displs) {
+    counts.assign(nprocs, 0);
+    displs.assign(nprocs, 0);
+    size_t base = N / static_cast<size_t>(nprocs);
+    size_t rem = N % static_cast<size_t>(nprocs);
+    size_t offset = 0;
+    for (int r = 0; r < nprocs; ++r) {
+        size_t c = base + (static_cast<size_t>(r) < rem ? 1 : 0);
+        counts[r] = static_cast<int>(c);
+        displs[r] = static_cast<int>(offset);
+        offset += c;
+    }
+}
+
 struct SimulationState {
     size_t numTriangles;
     size_t numTimesteps;
@@ -553,79 +555,52 @@ struct SimulationState {
     std::vector<Triangle> triangles;
     std::vector<val_t> areas;       // Area of each triangle
     std::vector<val_t> rho;         // Reflectivity (0.0 to 1.0)
-    std::vector<val_t> kij;         // Form factors (local row block x N matrix, row-major)
-    std::vector<int> tau;           // Time delays (local row block x N matrix, row-major)
-    std::vector<val_t> radE;        // Emission radiosity (T x N matrix, replicated on all ranks)
-    std::vector<val_t> radB;        // Reflected radiosity (T x N matrix, replicated on all ranks)
-    std::vector<val_t> distances;   // Computed distances from source (replicated on all ranks)
+    std::vector<val_t> kij;         // Form factors, LOCAL rows only (rowCount x N matrix, row-major)
+    std::vector<int> tau;           // Time delays, LOCAL rows only (rowCount x N matrix, row-major)
+    std::vector<val_t> radE;        // Emission radiosity (T x N matrix), replicated on all ranks
+    std::vector<val_t> radB;        // Reflected radiosity (T x N matrix), replicated on all ranks
+    std::vector<val_t> distances;   // Computed distances from source, replicated on all ranks
 
-    Octree octree;                  // Spatial acceleration structure
+    Octree octree;                  // Spatial acceleration structure (replicated on all ranks)
 
     size_t sourceIndex;
 
-    // MPI distributed-memory decomposition: triangles (rows of the kij/tau
-    // matrices) are partitioned in contiguous blocks across ranks. Each rank
-    // only ever stores/computes the kij/tau rows it owns, avoiding both the
-    // O(N^2) replication and O(N^2) communication that a naive "compute
-    // everything everywhere" or "gather everything" approach would incur.
+    // MPI row (triangle) decomposition: triangle i is owned by exactly one rank.
     int mpiRank = 0;
     int mpiSize = 1;
-    size_t rowStart = 0;   // first global triangle index owned by this rank
-    size_t rowCount = 0;   // number of triangle rows owned by this rank
-    std::vector<int> rowCounts;  // per-rank row counts (for Allgatherv)
-    std::vector<int> rowDispls;  // per-rank row displacements (for Allgatherv)
+    size_t rowBegin = 0;             // first global triangle index owned by this rank
+    size_t rowCount = 0;             // number of triangles owned by this rank
+    std::vector<int> rowCounts;      // per-rank row counts, for MPI_Allgatherv/Gatherv
+    std::vector<int> rowDispls;      // per-rank row displacements
 
-    // Index into the locally-owned kij/tau row block: li is the LOCAL row
-    // index (i.e. li = globalTriangleIndex - rowStart).
-    size_t idx2d(size_t li, size_t j) const { return li * numTriangles + j; }
+    // Index into the local (rowCount x N) kij/tau matrices.
+    size_t idxLocal(size_t localRow, size_t j) const { return localRow * numTriangles + j; }
     size_t idxTN(size_t t, size_t n) const { return t * numTriangles + n; }
 };
-
-// Partition [0, numTriangles) into contiguous row blocks across MPI ranks.
-void computeRowDecomposition(SimulationState& state) {
-    size_t n = state.numTriangles;
-    int size = state.mpiSize;
-    state.rowCounts.resize(size);
-    state.rowDispls.resize(size);
-
-    size_t base = n / static_cast<size_t>(size);
-    size_t rem = n % static_cast<size_t>(size);
-    size_t offset = 0;
-    for (int r = 0; r < size; ++r) {
-        size_t cnt = base + (static_cast<size_t>(r) < rem ? 1 : 0);
-        state.rowCounts[r] = static_cast<int>(cnt);
-        state.rowDispls[r] = static_cast<int>(offset);
-        offset += cnt;
-    }
-    state.rowStart = static_cast<size_t>(state.rowDispls[state.mpiRank]);
-    state.rowCount = static_cast<size_t>(state.rowCounts[state.mpiRank]);
-}
 
 // ============================================================================
 // Initialization
 // ============================================================================
 
 void initializeSimulation(SimulationState& state, int subdivisions, size_t timesteps,
-                          size_t sourceIdx, val_t reflectivity) {
-    // Generate mesh
+                          size_t sourceIdx, val_t reflectivity, int mpiRank, int mpiSize) {
+    state.mpiRank = mpiRank;
+    state.mpiSize = mpiSize;
+
+    // Generate mesh. This is deterministic (no RNG), so every rank builds an
+    // identical, replicated copy with no communication required.
     IcosphereMesh mesh(subdivisions, 10.0f);  // Radius 10 units
     state.triangles = std::move(mesh.triangles);
     state.numTriangles = state.triangles.size();
     state.numTimesteps = timesteps;
     state.sourceIndex = sourceIdx % state.numTriangles;
 
-    // Partition triangle rows across MPI ranks (kij/tau are stored distributed).
-    computeRowDecomposition(state);
-
-    if (state.mpiRank == 0) {
+    if (mpiRank == 0) {
         printf("Generated icosphere mesh with %zu triangles\n", state.numTriangles);
-        printf("MPI ranks: %d\n", state.mpiSize);
     }
 
-    // Build octree for spatial acceleration. Built identically (redundantly)
-    // on every rank: it is deterministic and cheap relative to the O(N^2)
-    // form-factor/simulation phases, so replicating it avoids a broadcast.
-    if (state.mpiRank == 0) printf("Building octree...\n");
+    // Build octree for spatial acceleration (replicated on every rank)
+    if (mpiRank == 0) printf("Building octree...\n");
     state.octree.build(state.triangles);
 
     // Initialize areas
@@ -637,10 +612,17 @@ void initializeSimulation(SimulationState& state, int subdivisions, size_t times
     // Initialize reflectivity
     state.rho.resize(state.numTriangles, reflectivity);
 
-    // Initialize matrices. kij/tau are distributed: each rank only allocates
-    // and computes its own row block (rowCount x numTriangles) rather than
-    // the full N x N matrix, which is essential for scaling to large N across
-    // a cluster (both in memory footprint and in compute).
+    // Partition triangles (rows of Kij/Tau) across ranks
+    computeRowDistribution(state.numTriangles, state.mpiSize, state.rowCounts, state.rowDispls);
+    state.rowBegin = static_cast<size_t>(state.rowDispls[state.mpiRank]);
+    state.rowCount = static_cast<size_t>(state.rowCounts[state.mpiRank]);
+
+    if (mpiRank == 0) {
+        printf("Using %d MPI rank(s), %zu triangles per rank (approx)\n",
+               mpiSize, state.numTriangles / static_cast<size_t>(mpiSize));
+    }
+
+    // Initialize matrices: Kij/Tau are rank-local (only owned rows)
     state.kij.resize(state.rowCount * state.numTriangles, ZERO);
     state.tau.resize(state.rowCount * state.numTriangles, 0);
     state.radE.resize(timesteps * state.numTriangles, ZERO);
@@ -662,18 +644,23 @@ void initializeSimulation(SimulationState& state, int subdivisions, size_t times
 void computeFormFactors(SimulationState& state) {
     if (state.mpiRank == 0) printf("Computing form factors (Kij)...\n");
 
-    // Each rank computes only its own row block. computeKij() derives an
-    // independent RNG stream per (i, j) pair, so no communication or shared
-    // state is needed here at all: this phase is embarrassingly parallel.
+    // Each triangle row gets an independent RNG stream, seeded deterministically
+    // from its global index. This makes the Monte-Carlo visibility sampling
+    // reproducible regardless of how many ranks the rows are split across
+    // (unlike a single RNG advanced sequentially over all (i,j) pairs, which
+    // cannot be partitioned across independent processes without serializing).
     for (size_t li = 0; li < state.rowCount; ++li) {
-        size_t i = state.rowStart + li;
+        size_t i = state.rowBegin + li;
+        uint32_t seed = 42u ^ (0x9E3779B9u * static_cast<uint32_t>(i + 1));
+        RandomGenerator rng(seed);
+
         for (size_t j = 0; j < state.numTriangles; ++j) {
             if (i == j) continue;
-            state.kij[state.idx2d(li, j)] = computeKij(
-                i, j, state.triangles, state.octree);
+            state.kij[state.idxLocal(li, j)] = computeKij(
+                i, j, state.triangles, state.octree, rng);
         }
         if (state.mpiRank == 0 && ((li + 1) % 100 == 0 || li + 1 == state.rowCount)) {
-            printf("  Progress: %zu/%zu triangles (rank 0 local block)\n", li + 1, state.rowCount);
+            printf("  Progress: %zu/%zu local triangles (rank 0)\n", li + 1, state.rowCount);
         }
     }
 }
@@ -682,10 +669,10 @@ void computeTimeDelays(SimulationState& state) {
     if (state.mpiRank == 0) printf("Computing time delays (Tau)...\n");
 
     for (size_t li = 0; li < state.rowCount; ++li) {
-        size_t i = state.rowStart + li;
+        size_t i = state.rowBegin + li;
         for (size_t j = 0; j < state.numTriangles; ++j) {
             if (i == j) continue;
-            state.tau[state.idx2d(li, j)] = computeTau(
+            state.tau[state.idxLocal(li, j)] = computeTau(
                 state.triangles[i], state.triangles[j]);
         }
     }
@@ -697,29 +684,27 @@ void computeTimeDelays(SimulationState& state) {
 
 void runSimulation(SimulationState& state) {
     if (state.mpiRank == 0) printf("Running wave propagation simulation...\n");
+    const size_t N = state.numTriangles;
 
     for (size_t t = 0; t < state.numTimesteps; ++t) {
-        // Each rank computes radB for only its own row block at this timestep.
-        // This is safe because tau(i,j) > 0 always (i != j implies distance >
-        // 0, so ceil(dist/speed) >= 1), meaning every read of radB below comes
-        // from a strictly earlier timestep that has already been finalized
-        // (and gathered) across all ranks.
         for (size_t li = 0; li < state.rowCount; ++li) {
-            size_t i = state.rowStart + li;
+            size_t i = state.rowBegin + li;
             val_t sumB = ZERO;
 
-            for (size_t j = 0; j < state.numTriangles; ++j) {
+            for (size_t j = 0; j < N; ++j) {
                 if (i == j) continue;
 
-                int tauij = state.tau[state.idx2d(li, j)];
+                int tauij = state.tau[state.idxLocal(li, j)];
 
                 // Skip if wave hasn't yet propagated from j to i
                 if (static_cast<int>(t) < tauij) continue;
 
-                val_t kij = state.kij[state.idx2d(li, j)];
+                val_t kij = state.kij[state.idxLocal(li, j)];
                 if (kij <= ZERO) continue;
 
-                // Get radiosity from source triangle at time when emission occurred
+                // Get radiosity from source triangle at time when emission occurred.
+                // tauij >= 1 for i != j, so srcTime < t: this always reads a
+                // timestep already finalized and exchanged across ranks.
                 size_t srcTime = t - static_cast<size_t>(tauij);
                 val_t radJ = state.radB[state.idxTN(srcTime, j)];
                 if (radJ <= ZERO) continue;
@@ -732,13 +717,10 @@ void runSimulation(SimulationState& state) {
             state.radB[state.idxTN(t, i)] = state.rho[i] * sumB + state.radE[state.idxTN(t, i)];
         }
 
-        // Exchange this timestep's newly-computed radiosity row (N floats)
-        // across all ranks so it is available as history for future
-        // timesteps. This is the only communication in the simulation phase,
-        // and its volume (O(N) per timestep) is negligible next to the
-        // O(N^2) compute per timestep.
-        MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL,
-                       &state.radB[state.idxTN(t, 0)],
+        // Exchange this timestep's freshly computed radiosity rows so every
+        // rank has the full picture before computing timestep t+1.
+        MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_FLOAT,
+                       state.radB.data() + t * N,
                        state.rowCounts.data(), state.rowDispls.data(),
                        MPI_FLOAT, MPI_COMM_WORLD);
 
@@ -755,9 +737,8 @@ void runSimulation(SimulationState& state) {
 void computeDistances(SimulationState& state) {
     if (state.mpiRank == 0) printf("Computing distances via cross-correlation...\n");
 
-    // Embarrassingly parallel over triangles: each rank handles its own row
-    // block, using the (already fully replicated) radB history.
-    for (size_t i = state.rowStart; i < state.rowStart + state.rowCount; ++i) {
+    for (size_t li = 0; li < state.rowCount; ++li) {
+        size_t i = state.rowBegin + li;
         val_t maxCorr = ZERO;
         int bestT = 0;
 
@@ -780,8 +761,8 @@ void computeDistances(SimulationState& state) {
         state.distances[i] = WAVE_SPEED * static_cast<val_t>(bestT);
     }
 
-    // Gather each rank's local distances into the fully-replicated array.
-    MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL,
+    // Gather every rank's local distances into the full, replicated array.
+    MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_FLOAT,
                    state.distances.data(),
                    state.rowCounts.data(), state.rowDispls.data(),
                    MPI_FLOAT, MPI_COMM_WORLD);
@@ -792,19 +773,11 @@ void computeDistances(SimulationState& state) {
 // ============================================================================
 
 bool validateResults(const SimulationState& state) {
-    // kij is distributed across ranks; count non-zero entries locally and
-    // reduce to a global total. This is a collective call, so it must be
-    // issued on every rank even though only rank 0 prints/decides.
-    long long localNonZeroKij = 0;
-    for (size_t i = 0; i < state.kij.size(); ++i) {
-        if (state.kij[i] > EPSILON) localNonZeroKij++;
-    }
-    long long globalNonZeroKij = 0;
-    MPI_Reduce(&localNonZeroKij, &globalNonZeroKij, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-
-    if (state.mpiRank != 0) return true;  // final decision broadcast by caller
-
-    printf("\nValidation:\n");
+    // This function makes an MPI collective call (to total the rank-local Kij
+    // non-zero counts) and so must be invoked by every rank. The distances and
+    // radB arrays are fully replicated on every rank by this point, so all
+    // other checks evaluate identically everywhere; only rank 0 prints.
+    if (state.mpiRank == 0) printf("\nValidation:\n");
 
     // Check that distances are non-negative
     bool allNonNegative = true;
@@ -817,10 +790,10 @@ bool validateResults(const SimulationState& state) {
         val_t d = state.distances[i];
         if (d < 0) {
             allNonNegative = false;
-            printf("  ERROR: Negative distance at triangle %zu: %f\n", i, d);
+            if (state.mpiRank == 0) printf("  ERROR: Negative distance at triangle %zu: %f\n", i, d);
         }
         if (!std::isfinite(d)) {
-            printf("  ERROR: Non-finite distance at triangle %zu: %f\n", i, d);
+            if (state.mpiRank == 0) printf("  ERROR: Non-finite distance at triangle %zu: %f\n", i, d);
             return false;
         }
         minDist = std::min(minDist, d);
@@ -829,13 +802,15 @@ bool validateResults(const SimulationState& state) {
         if (d > EPSILON) nonZeroCount++;
     }
 
-    printf("  Distance range: [%.4f, %.4f]\n", minDist, maxDist);
-    printf("  Average distance: %.4f\n", sumDist / static_cast<val_t>(state.numTriangles));
-    printf("  Non-zero distances: %d/%zu\n", nonZeroCount, state.numTriangles);
+    if (state.mpiRank == 0) {
+        printf("  Distance range: [%.4f, %.4f]\n", minDist, maxDist);
+        printf("  Average distance: %.4f\n", sumDist / static_cast<val_t>(state.numTriangles));
+        printf("  Non-zero distances: %d/%zu\n", nonZeroCount, state.numTriangles);
+    }
 
     // Check source distance is zero or very small
     val_t srcDist = state.distances[state.sourceIndex];
-    if (srcDist > WAVE_SPEED * 2) {
+    if (state.mpiRank == 0 && srcDist > WAVE_SPEED * 2) {
         printf("  WARNING: Source triangle distance is non-zero: %.4f\n", srcDist);
     }
 
@@ -850,20 +825,32 @@ bool validateResults(const SimulationState& state) {
         }
     }
 
-    printf("  Triangles receiving energy: %d/%zu\n", receivedEnergy, state.numTriangles);
+    if (state.mpiRank == 0) {
+        printf("  Triangles receiving energy: %d/%zu\n", receivedEnergy, state.numTriangles);
+    }
 
     if (receivedEnergy == 0) {
-        printf("  ERROR: No triangles received energy - simulation failed\n");
+        if (state.mpiRank == 0) printf("  ERROR: No triangles received energy - simulation failed\n");
         return false;
     }
 
-    // Check Kij matrix (should have some non-zero entries)
-    printf("  Non-zero form factors: %lld/%zu (%.2f%%)\n",
-           globalNonZeroKij, state.numTriangles * state.numTriangles,
-           100.0f * static_cast<val_t>(globalNonZeroKij) / static_cast<val_t>(state.numTriangles * state.numTriangles));
+    // Check Kij matrix (should have some non-zero entries). Kij is stored
+    // rank-local, so each rank sums its own share and the totals are reduced.
+    int localNonZeroKij = 0;
+    for (size_t i = 0; i < state.kij.size(); ++i) {
+        if (state.kij[i] > EPSILON) localNonZeroKij++;
+    }
+    int nonZeroKij = 0;
+    MPI_Allreduce(&localNonZeroKij, &nonZeroKij, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
 
-    if (globalNonZeroKij == 0) {
-        printf("  ERROR: All form factors are zero - visibility computation failed\n");
+    if (state.mpiRank == 0) {
+        printf("  Non-zero form factors: %d/%zu (%.2f%%)\n",
+               nonZeroKij, state.numTriangles * state.numTriangles,
+               100.0f * nonZeroKij / static_cast<val_t>(state.numTriangles * state.numTriangles));
+    }
+
+    if (nonZeroKij == 0) {
+        if (state.mpiRank == 0) printf("  ERROR: All form factors are zero - visibility computation failed\n");
         return false;
     }
 
@@ -871,7 +858,7 @@ bool validateResults(const SimulationState& state) {
         return false;
     }
 
-    printf("  Validation: PASSED\n");
+    if (state.mpiRank == 0) printf("  Validation: PASSED\n");
     return true;
 }
 
@@ -924,9 +911,9 @@ void printUsage(const char* progName) {
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
-    int rank = 0, nprocs = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
+    int mpiRank = 0, mpiSize = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank);
+    MPI_Comm_size(MPI_COMM_WORLD, &mpiSize);
 
     int targetTriangles = 320;
     int timesteps = 50;
@@ -935,8 +922,8 @@ int main(int argc, char** argv) {
     bool validate = false;
     bool printResults = false;
 
-    // Parse command line arguments (identical argv on every rank, so all
-    // ranks reach the same branch deterministically; no coordination needed).
+    // Parse command line arguments (mpirun/mpiexec give every rank identical
+    // argv, so parsing independently on each rank yields identical results).
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             targetTriangles = atoi(argv[++i]);
@@ -951,11 +938,11 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-o") == 0) {
             printResults = true;
         } else if (strcmp(argv[i], "-h") == 0) {
-            if (rank == 0) printUsage(argv[0]);
+            if (mpiRank == 0) printUsage(argv[0]);
             MPI_Finalize();
             return 0;
         } else {
-            if (rank == 0) {
+            if (mpiRank == 0) {
                 printf("Unknown option: %s\n", argv[i]);
                 printUsage(argv[0]);
             }
@@ -966,7 +953,7 @@ int main(int argc, char** argv) {
 
     int subdivisions = getSubdivisionsForTriangleCount(targetTriangles);
 
-    if (rank == 0) {
+    if (mpiRank == 0) {
         printf("Room Response Simulation Benchmark\n");
         printf("===================================\n");
         printf("Target triangles: %d (using %d subdivisions)\n", targetTriangles, subdivisions);
@@ -979,16 +966,12 @@ int main(int argc, char** argv) {
 
     // Initialize
     SimulationState state;
-    state.mpiRank = rank;
-    state.mpiSize = nprocs;
     initializeSimulation(state, subdivisions, static_cast<size_t>(timesteps),
-                         static_cast<size_t>(sourceIdx), reflectivity);
+                         static_cast<size_t>(sourceIdx), reflectivity, mpiRank, mpiSize);
 
-    if (rank == 0) printf("\n");
+    if (mpiRank == 0) printf("\n");
 
-    // Precomputation. Barriers around the timed region ensure the reported
-    // duration reflects the slowest rank (true cluster wall-clock time),
-    // not just however long rank 0 happened to take.
+    // Precomputation
     MPI_Barrier(MPI_COMM_WORLD);
     auto startPre = std::chrono::high_resolution_clock::now();
 
@@ -997,12 +980,12 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto endPre = std::chrono::high_resolution_clock::now();
-    auto preDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count();
-    long maxPreDuration = 0;
-    MPI_Reduce(&preDuration, &maxPreDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    long preDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endPre - startPre).count();
+    long preDurationMax = 0;
+    MPI_Reduce(&preDuration, &preDurationMax, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    if (rank == 0) {
-        printf("Precomputation time: %ld ms\n", maxPreDuration);
+    if (mpiRank == 0) {
+        printf("Precomputation time: %ld ms\n", preDurationMax);
         printf("\n");
     }
 
@@ -1014,12 +997,12 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto endSim = std::chrono::high_resolution_clock::now();
-    auto simDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count();
-    long maxSimDuration = 0;
-    MPI_Reduce(&simDuration, &maxSimDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    long simDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endSim - startSim).count();
+    long simDurationMax = 0;
+    MPI_Reduce(&simDuration, &simDurationMax, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    if (rank == 0) {
-        printf("Simulation time: %ld ms\n", maxSimDuration);
+    if (mpiRank == 0) {
+        printf("Simulation time: %ld ms\n", simDurationMax);
         printf("\n");
     }
 
@@ -1031,75 +1014,64 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto endDist = std::chrono::high_resolution_clock::now();
-    auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
-    long maxDistDuration = 0;
-    MPI_Reduce(&distDuration, &maxDistDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    long distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
+    long distDurationMax = 0;
+    MPI_Reduce(&distDuration, &distDurationMax, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    if (rank == 0) {
-        printf("Distance computation time: %ld ms\n", maxDistDuration);
+    if (mpiRank == 0) {
+        printf("Distance computation time: %ld ms\n", distDurationMax);
         printf("\n");
     }
 
-    // Total time
-    long totalTime = maxPreDuration + maxSimDuration + maxDistDuration;
+    // Total time (based on the slowest rank in each phase)
+    long totalTime = preDurationMax + simDurationMax + distDurationMax;
+    if (mpiRank == 0) printf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics
     size_t n = state.numTriangles;
     size_t t = state.numTimesteps;
+    double kijOps = static_cast<double>(n * n);
+    double simOps = static_cast<double>(n * n * t);
+    double distOps = static_cast<double>(n * t * t);
 
-    if (rank == 0) {
-        printf("Total computation time: %ld ms\n", totalTime);
-
-        double kijOps = static_cast<double>(n * n);
-        double simOps = static_cast<double>(n * n * t);
-        double distOps = static_cast<double>(n * t * t);
-
+    if (mpiRank == 0) {
         printf("\nPerformance:\n");
         printf("  Triangles: %zu\n", n);
         printf("  Timesteps: %zu\n", t);
-        printf("  MPI ranks: %d\n", nprocs);
+        printf("  MPI ranks: %d\n", mpiSize);
         printf("  Form factor computations: %.2e\n", kijOps);
         printf("  Simulation operations: %.2e\n", simOps);
         printf("  Distance computations: %.2e\n", distOps);
         printf("  Total time per triangle: %.4f ms\n", static_cast<double>(totalTime) / n);
 
-        // Memory usage (aggregate across the whole distributed matrix)
+        // Memory usage (aggregate problem footprint, distributed across ranks)
         size_t memKij = n * n * sizeof(val_t);
         size_t memTau = n * n * sizeof(int);
         size_t memRad = 2 * t * n * sizeof(val_t);
         size_t totalMem = memKij + memTau + memRad;
         printf("  Memory usage: %.2f MB\n", totalMem / (1024.0 * 1024.0));
-    }
 
-    // Hash (distances are fully replicated across ranks, so this is
-    // identical everywhere; only rank 0 prints it).
-    uint64_t hash = computeHash(state);
-    if (rank == 0) {
+        // Hash (distances are fully gathered/replicated on every rank)
+        uint64_t hash = computeHash(state);
         printf("  Result hash: %016lX\n", hash);
         printf("\n");
+
+        // Print results for external validation
+        if (printResults) {
+            // Convert distances to double for output
+            std::vector<double> distData(state.distances.begin(), state.distances.end());
+            print_results(distData, "Distances");
+        }
     }
 
-    // Print results for external validation
-    if (printResults && rank == 0) {
-        // Convert distances to double for output
-        std::vector<double> distData(state.distances.begin(), state.distances.end());
-        print_results(distData, "Distances");
-    }
-
-    // Validation. validateResults() performs a collective reduction, so it
-    // must be called on every rank; only rank 0 makes the final pass/fail
-    // decision, which is then broadcast so all ranks exit consistently.
-    int validPassed = 1;
+    // Validation (collective: every rank must call this)
     if (validate) {
-        bool ok = validateResults(state);
-        validPassed = ok ? 1 : 0;
+        if (!validateResults(state)) {
+            MPI_Finalize();
+            return 1;
+        }
     }
-    MPI_Bcast(&validPassed, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
     MPI_Finalize();
-
-    if (validate && !validPassed) {
-        return 1;
-    }
     return 0;
 }

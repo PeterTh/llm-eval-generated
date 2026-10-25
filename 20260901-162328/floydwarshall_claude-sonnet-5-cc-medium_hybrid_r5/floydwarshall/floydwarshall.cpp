@@ -15,14 +15,14 @@
 constexpr unsigned int INF = 1000000000;
 constexpr unsigned int MAX_DISTANCE = 200;
 
-#define CUDA_CHECK(call)                                                             \
-    do {                                                                             \
-        cudaError_t cudaCheckErr__ = (call);                                         \
-        if (cudaCheckErr__ != cudaSuccess) {                                         \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,         \
-                    cudaGetErrorString(cudaCheckErr__));                             \
-            MPI_Abort(MPI_COMM_WORLD, 1);                                            \
-        }                                                                            \
+#define CUDA_CHECK(call)                                                                 \
+    do {                                                                                 \
+        cudaError_t cudaCheckErr_ = (call);                                              \
+        if (cudaCheckErr_ != cudaSuccess) {                                              \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,             \
+                    cudaGetErrorString(cudaCheckErr_));                                  \
+            MPI_Abort(MPI_COMM_WORLD, 1);                                                \
+        }                                                                                \
     } while (0)
 
 // Index calculation for flattened 2D array
@@ -46,176 +46,230 @@ void initializeDistanceMatrix(std::vector<unsigned int>& dist, const size_t numN
 }
 
 void initializePathMatrix(std::vector<unsigned int>& path, const size_t numNodes) {
-    // Split into two disjoint (per-outer-index) parallel sweeps so that each
-    // OpenMP iteration only ever touches memory no other iteration touches:
-    // sweep 1 owns entire rows, sweep 2 owns entire columns. This reproduces
-    // the original sequential result exactly while staying race-free.
-    #pragma omp parallel for schedule(static)
     for (size_t j = 0; j < numNodes; ++j) {
         for (size_t i = 0; i < numNodes; ++i) {
             path[idx2(i, j, numNodes)] = j;
-        }
-    }
-
-    #pragma omp parallel for schedule(static)
-    for (size_t j = 0; j < numNodes; ++j) {
-        for (size_t i = 0; i < numNodes; ++i) {
             path[idx2(j, i, numNodes)] = i;
         }
         path[idx2(j, j, numNodes)] = j;
     }
 }
 
-// CUDA kernel: for a fixed intermediate node k, relax all (localRow, j) pairs
-// owned by this rank's row-block against the broadcast pivot row k.
-__global__ void fwKernel(unsigned int* __restrict__ dist,
-                          unsigned int* __restrict__ path,
-                          const unsigned int* __restrict__ pivotRow,
-                          const size_t k, const size_t localRows, const size_t n) {
+// GPU kernel performing the Floyd-Warshall relaxation for one pivot `k` across
+// a contiguous block of locally-owned rows. Row/column `k` are invariant
+// during this pass (D[k][k] == 0), so all (i,j) updates for a fixed k are
+// independent and safe to parallelize arbitrarily.
+__global__ void fwUpdateKernel(unsigned int* __restrict__ dist, unsigned int* __restrict__ path,
+                                const unsigned int* __restrict__ pivotRow, size_t localRows,
+                                size_t n, size_t k) {
     const size_t j = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t li = static_cast<size_t>(blockIdx.y) * blockDim.y + threadIdx.y;
-    if (li >= localRows || j >= n) {
-        return;
-    }
+    const size_t i = static_cast<size_t>(blockIdx.y) * blockDim.y + threadIdx.y;
 
-    const size_t base = li * n;
-    const unsigned int distIK = dist[base + k];
-    const unsigned int distKJ = pivotRow[j];
-    const unsigned int newDist = distIK + distKJ;
+    if (i < localRows && j < n) {
+        const size_t idx = i * n + j;
+        const unsigned int distIK = dist[i * n + k];
+        const unsigned int distKJ = pivotRow[j];
+        const unsigned int newDist = distIK + distKJ;
 
-    if (newDist < dist[base + j]) {
-        dist[base + j] = newDist;
-        path[base + j] = static_cast<unsigned int>(k);
-    }
-}
-
-// Computes a balanced contiguous row partition of numNodes rows across `size`
-// MPI ranks. starts[r] is the first global row owned by rank r; starts[size]
-// == numNodes.
-void computeRowPartition(const size_t numNodes, const int size, std::vector<size_t>& starts) {
-    starts.resize(static_cast<size_t>(size) + 1);
-    const size_t base = numNodes / static_cast<size_t>(size);
-    const size_t rem = numNodes % static_cast<size_t>(size);
-    size_t offset = 0;
-    for (int r = 0; r < size; ++r) {
-        starts[r] = offset;
-        offset += base + (static_cast<size_t>(r) < rem ? 1 : 0);
-    }
-    starts[size] = numNodes;
-}
-
-int ownerOfRow(const std::vector<size_t>& starts, const size_t row, const int size) {
-    int lo = 0;
-    int hi = size - 1;
-    while (lo < hi) {
-        const int mid = (lo + hi + 1) / 2;
-        if (starts[mid] <= row) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
+        if (newDist < dist[idx]) {
+            dist[idx] = newDist;
+            path[idx] = static_cast<unsigned int>(k);
         }
     }
-    return lo;
+}
+
+// Split `total` contiguous items as evenly as possible across `parts` parts.
+void computeBlockDistribution(size_t total, size_t parts, std::vector<size_t>& start,
+                               std::vector<size_t>& count) {
+    start.assign(parts, 0);
+    count.assign(parts, 0);
+    const size_t base = total / parts;
+    const size_t rem = total % parts;
+    size_t offset = 0;
+    for (size_t p = 0; p < parts; ++p) {
+        count[p] = base + (p < rem ? 1 : 0);
+        start[p] = offset;
+        offset += count[p];
+    }
+}
+
+// Locate the owner of a given global index within a contiguous block distribution.
+int findOwner(const std::vector<size_t>& start, const std::vector<size_t>& count, size_t index) {
+    for (size_t p = 0; p < start.size(); ++p) {
+        if (count[p] > 0 && index >= start[p] && index < start[p] + count[p]) {
+            return static_cast<int>(p);
+        }
+    }
+    return static_cast<int>(start.size() - 1);
 }
 
 // Hybrid MPI + OpenMP + CUDA Floyd-Warshall.
 //
-// Row-blocks of the distance/path matrices are distributed across MPI ranks
-// (one rank per accelerator, node-local rank selects the local GPU). Each
-// iteration k broadcasts the pivot row (owned by whichever rank holds global
-// row k) to every rank, which then relaxes its local row-block against that
-// pivot row entirely on its GPU. This is the classic row-broadcast
-// parallelization of Floyd-Warshall, with the O(n) work per row and O(n^2)
-// per-rank relaxation offloaded to CUDA.
-void floydWarshallDistributed(std::vector<unsigned int>& dist,
-                              std::vector<unsigned int>& path,
-                              const size_t numNodes,
-                              const int rank,
-                              const int size) {
-    // Bind this rank to a local GPU based on its node-local rank, so that
-    // multiple ranks sharing a node spread across that node's accelerators.
-    MPI_Comm localComm;
-    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &localComm);
-    int localRank = 0;
-    MPI_Comm_rank(localComm, &localRank);
-    MPI_Comm_free(&localComm);
+// Rows of the distance/path matrices are block-distributed across MPI ranks.
+// Within a rank, the local row block is further split across the CUDA
+// devices owned by that rank (assigned via node-local MPI topology), with an
+// OpenMP thread per device driving its independent CUDA stream. For each
+// pivot k, the owning rank/device extracts row k, it is broadcast to every
+// rank via MPI, and every device updates its local rows in parallel on the
+// GPU.
+void floydWarshall(std::vector<unsigned int>& dist,
+                   std::vector<unsigned int>& path,
+                   const size_t numNodes) {
+    int worldRank = 0, worldSize = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
+    MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
 
-    int deviceCount = 0;
-    cudaGetDeviceCount(&deviceCount);
-    const int device = deviceCount > 0 ? (localRank % deviceCount) : 0;
-    CUDA_CHECK(cudaSetDevice(device));
-
-    std::vector<size_t> starts;
-    computeRowPartition(numNodes, size, starts);
-    const size_t rowStart = starts[rank];
-    const size_t rowEnd = starts[static_cast<size_t>(rank) + 1];
-    const size_t localRows = rowEnd - rowStart;
-    const size_t localElems = localRows * numNodes;
-
-    unsigned int* distDev = nullptr;
-    unsigned int* pathDev = nullptr;
-    unsigned int* pivotDev = nullptr;
-    unsigned int* pivotHost = nullptr;
-
-    if (localElems > 0) {
-        CUDA_CHECK(cudaMalloc(&distDev, localElems * sizeof(unsigned int)));
-        CUDA_CHECK(cudaMalloc(&pathDev, localElems * sizeof(unsigned int)));
-        CUDA_CHECK(cudaMemcpy(distDev, dist.data() + rowStart * numNodes,
-                               localElems * sizeof(unsigned int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(pathDev, path.data() + rowStart * numNodes,
-                               localElems * sizeof(unsigned int), cudaMemcpyHostToDevice));
+    const size_t n = numNodes;
+    if (n == 0) {
+        return;
     }
-    CUDA_CHECK(cudaMalloc(&pivotDev, numNodes * sizeof(unsigned int)));
-    CUDA_CHECK(cudaHostAlloc(&pivotHost, numNodes * sizeof(unsigned int), cudaHostAllocDefault));
 
-    const dim3 block(32, 8);
-    const dim3 grid(static_cast<unsigned int>((numNodes + block.x - 1) / block.x),
-                     static_cast<unsigned int>((localRows + block.y - 1) / block.y));
+    // Row distribution across MPI ranks.
+    std::vector<size_t> rankRowStart, rankRowCount;
+    computeBlockDistribution(n, static_cast<size_t>(worldSize), rankRowStart, rankRowCount);
+    const size_t myRowStart = rankRowStart[worldRank];
+    const size_t myRowCount = rankRowCount[worldRank];
 
-    for (size_t k = 0; k < numNodes; ++k) {
-        const int owner = ownerOfRow(starts, k, size);
+    std::vector<int> sendCounts(worldSize), sendDispls(worldSize);
+    for (int r = 0; r < worldSize; ++r) {
+        sendCounts[r] = static_cast<int>(rankRowCount[r] * n);
+        sendDispls[r] = static_cast<int>(rankRowStart[r] * n);
+    }
 
-        if (rank == owner) {
-            const size_t localK = k - rowStart;
-            CUDA_CHECK(cudaMemcpy(pivotHost, distDev + localK * numNodes,
-                                   numNodes * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    std::vector<unsigned int> localDist(myRowCount * n);
+    std::vector<unsigned int> localPath(myRowCount * n);
+
+    MPI_Scatterv(worldRank == 0 ? dist.data() : nullptr, sendCounts.data(), sendDispls.data(),
+                 MPI_UNSIGNED, localDist.data(), static_cast<int>(myRowCount * n), MPI_UNSIGNED,
+                 0, MPI_COMM_WORLD);
+    MPI_Scatterv(worldRank == 0 ? path.data() : nullptr, sendCounts.data(), sendDispls.data(),
+                 MPI_UNSIGNED, localPath.data(), static_cast<int>(myRowCount * n), MPI_UNSIGNED,
+                 0, MPI_COMM_WORLD);
+
+    // Discover the CUDA devices visible on this node and partition them
+    // across the MPI ranks that share the node.
+    MPI_Comm nodeComm;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, worldRank, MPI_INFO_NULL, &nodeComm);
+    int nodeRank = 0, nodeSize = 1;
+    MPI_Comm_rank(nodeComm, &nodeRank);
+    MPI_Comm_size(nodeComm, &nodeSize);
+
+    int deviceCountOnNode = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&deviceCountOnNode));
+    if (deviceCountOnNode <= 0) {
+        fprintf(stderr, "Rank %d: no CUDA-capable devices found\n", worldRank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    std::vector<int> myDevices;
+    if (static_cast<size_t>(nodeSize) <= static_cast<size_t>(deviceCountOnNode)) {
+        std::vector<size_t> devStart, devCount;
+        computeBlockDistribution(static_cast<size_t>(deviceCountOnNode),
+                                  static_cast<size_t>(nodeSize), devStart, devCount);
+        for (size_t d = 0; d < devCount[nodeRank]; ++d) {
+            myDevices.push_back(static_cast<int>(devStart[nodeRank] + d));
         }
-
-        MPI_Bcast(pivotHost, static_cast<int>(numNodes), MPI_UNSIGNED, owner, MPI_COMM_WORLD);
-
-        if (localRows > 0) {
-            CUDA_CHECK(cudaMemcpy(pivotDev, pivotHost, numNodes * sizeof(unsigned int),
-                                   cudaMemcpyHostToDevice));
-            fwKernel<<<grid, block>>>(distDev, pathDev, pivotDev, k, localRows, numNodes);
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
-        }
-    }
-
-    if (localElems > 0) {
-        CUDA_CHECK(cudaMemcpy(dist.data() + rowStart * numNodes, distDev,
-                               localElems * sizeof(unsigned int), cudaMemcpyDeviceToHost));
-    }
-
-    std::vector<int> recvCounts(static_cast<size_t>(size));
-    std::vector<int> displs(static_cast<size_t>(size));
-    for (int r = 0; r < size; ++r) {
-        recvCounts[r] = static_cast<int>((starts[r + 1] - starts[r]) * numNodes);
-        displs[r] = static_cast<int>(starts[r] * numNodes);
-    }
-
-    if (rank == 0) {
-        MPI_Gatherv(MPI_IN_PLACE, 0, MPI_UNSIGNED, dist.data(), recvCounts.data(), displs.data(),
-                    MPI_UNSIGNED, 0, MPI_COMM_WORLD);
     } else {
-        MPI_Gatherv(dist.data() + rowStart * numNodes, static_cast<int>(localElems), MPI_UNSIGNED,
-                    nullptr, nullptr, nullptr, MPI_UNSIGNED, 0, MPI_COMM_WORLD);
+        myDevices.push_back(nodeRank % deviceCountOnNode);
+    }
+    MPI_Comm_free(&nodeComm);
+
+    const int numMyDevices = static_cast<int>(myDevices.size());
+
+    // Partition this rank's row block across its assigned GPUs.
+    std::vector<size_t> devRowStart, devRowCount;
+    computeBlockDistribution(myRowCount, static_cast<size_t>(numMyDevices), devRowStart,
+                              devRowCount);
+
+    std::vector<unsigned int*> d_dist(numMyDevices, nullptr);
+    std::vector<unsigned int*> d_path(numMyDevices, nullptr);
+    std::vector<unsigned int*> d_pivotRow(numMyDevices, nullptr);
+    std::vector<cudaStream_t> streams(numMyDevices);
+
+    #pragma omp parallel for num_threads(numMyDevices) schedule(static)
+    for (int d = 0; d < numMyDevices; ++d) {
+        CUDA_CHECK(cudaSetDevice(myDevices[d]));
+        CUDA_CHECK(cudaStreamCreate(&streams[d]));
+        CUDA_CHECK(cudaMalloc(&d_pivotRow[d], n * sizeof(unsigned int)));
+
+        const size_t rows = devRowCount[d];
+        if (rows > 0) {
+            CUDA_CHECK(cudaMalloc(&d_dist[d], rows * n * sizeof(unsigned int)));
+            CUDA_CHECK(cudaMalloc(&d_path[d], rows * n * sizeof(unsigned int)));
+            CUDA_CHECK(cudaMemcpyAsync(d_dist[d], localDist.data() + devRowStart[d] * n,
+                                       rows * n * sizeof(unsigned int), cudaMemcpyHostToDevice,
+                                       streams[d]));
+            CUDA_CHECK(cudaMemcpyAsync(d_path[d], localPath.data() + devRowStart[d] * n,
+                                       rows * n * sizeof(unsigned int), cudaMemcpyHostToDevice,
+                                       streams[d]));
+            CUDA_CHECK(cudaStreamSynchronize(streams[d]));
+        }
     }
 
-    CUDA_CHECK(cudaFreeHost(pivotHost));
-    CUDA_CHECK(cudaFree(pivotDev));
-    if (distDev) CUDA_CHECK(cudaFree(distDev));
-    if (pathDev) CUDA_CHECK(cudaFree(pathDev));
+    std::vector<unsigned int> pivotRowHost(n);
+    const dim3 blockDim(32, 8);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    for (size_t k = 0; k < n; ++k) {
+        const int ownerRank = findOwner(rankRowStart, rankRowCount, k);
+
+        if (worldRank == ownerRank) {
+            const size_t localRowIdx = k - myRowStart;
+            const int ownerDevice = findOwner(devRowStart, devRowCount, localRowIdx);
+            const size_t deviceLocalRow = localRowIdx - devRowStart[ownerDevice];
+            CUDA_CHECK(cudaSetDevice(myDevices[ownerDevice]));
+            CUDA_CHECK(cudaMemcpy(pivotRowHost.data(), d_dist[ownerDevice] + deviceLocalRow * n,
+                                   n * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        }
+
+        MPI_Bcast(pivotRowHost.data(), static_cast<int>(n), MPI_UNSIGNED, ownerRank,
+                  MPI_COMM_WORLD);
+
+        #pragma omp parallel for num_threads(numMyDevices) schedule(static)
+        for (int d = 0; d < numMyDevices; ++d) {
+            const size_t rows = devRowCount[d];
+            if (rows == 0) continue;
+
+            CUDA_CHECK(cudaSetDevice(myDevices[d]));
+            CUDA_CHECK(cudaMemcpyAsync(d_pivotRow[d], pivotRowHost.data(),
+                                       n * sizeof(unsigned int), cudaMemcpyHostToDevice,
+                                       streams[d]));
+
+            const dim3 gridDim(static_cast<unsigned int>((n + blockDim.x - 1) / blockDim.x),
+                               static_cast<unsigned int>((rows + blockDim.y - 1) / blockDim.y));
+            fwUpdateKernel<<<gridDim, blockDim, 0, streams[d]>>>(d_dist[d], d_path[d],
+                                                                  d_pivotRow[d], rows, n, k);
+            CUDA_CHECK(cudaStreamSynchronize(streams[d]));
+        }
+    }
+
+    #pragma omp parallel for num_threads(numMyDevices) schedule(static)
+    for (int d = 0; d < numMyDevices; ++d) {
+        const size_t rows = devRowCount[d];
+        if (rows == 0) continue;
+
+        CUDA_CHECK(cudaSetDevice(myDevices[d]));
+        CUDA_CHECK(cudaMemcpy(localDist.data() + devRowStart[d] * n, d_dist[d],
+                              rows * n * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(localPath.data() + devRowStart[d] * n, d_path[d],
+                              rows * n * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    }
+
+    for (int d = 0; d < numMyDevices; ++d) {
+        CUDA_CHECK(cudaSetDevice(myDevices[d]));
+        if (d_dist[d]) CUDA_CHECK(cudaFree(d_dist[d]));
+        if (d_path[d]) CUDA_CHECK(cudaFree(d_path[d]));
+        CUDA_CHECK(cudaFree(d_pivotRow[d]));
+        CUDA_CHECK(cudaStreamDestroy(streams[d]));
+    }
+
+    MPI_Gatherv(localDist.data(), static_cast<int>(myRowCount * n), MPI_UNSIGNED,
+                worldRank == 0 ? dist.data() : nullptr, sendCounts.data(), sendDispls.data(),
+                MPI_UNSIGNED, 0, MPI_COMM_WORLD);
+    MPI_Gatherv(localPath.data(), static_cast<int>(myRowCount * n), MPI_UNSIGNED,
+                worldRank == 0 ? path.data() : nullptr, sendCounts.data(), sendDispls.data(),
+                MPI_UNSIGNED, 0, MPI_COMM_WORLD);
 }
 
 bool validateResult(const std::vector<unsigned int>& dist, const size_t numNodes) {
@@ -231,13 +285,8 @@ bool validateResult(const std::vector<unsigned int>& dist, const size_t numNodes
 
     // 2. Triangle inequality: dist[i][k] + dist[k][j] >= dist[i][j]
     // Check a sample of paths to avoid O(n^3) validation time
-    const size_t iLimit = std::min(numNodes, static_cast<size_t>(10));
-    const size_t jLimit = std::min(numNodes, static_cast<size_t>(10));
-    bool valid = true;
-
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (size_t i = 0; i < iLimit; ++i) {
-        for (size_t j = 0; j < jLimit; ++j) {
+    for (size_t i = 0; i < std::min(numNodes, static_cast<size_t>(10)); ++i) {
+        for (size_t j = 0; j < std::min(numNodes, static_cast<size_t>(10)); ++j) {
             for (size_t k = 0; k < numNodes; ++k) {
                 const unsigned int distIJ = dist[idx2(j, i, numNodes)];
                 const unsigned int distIK = dist[idx2(k, i, numNodes)];
@@ -246,19 +295,16 @@ bool validateResult(const std::vector<unsigned int>& dist, const size_t numNodes
                 // Check for overflow before addition
                 if (distIK < INF && distKJ < INF) {
                     if (distIK + distKJ < distIJ) {
-                        #pragma omp critical
-                        {
-                            printf("Validation failed: triangle inequality violated at [%zu,%zu,%zu]\n",
-                                   i, j, k);
-                            valid = false;
-                        }
+                        printf("Validation failed: triangle inequality violated at [%zu,%zu,%zu]\n",
+                               i, j, k);
+                        return false;
                     }
                 }
             }
         }
     }
 
-    return valid;
+    return true;
 }
 
 void printUsage(const char* progName) {
@@ -271,17 +317,17 @@ void printUsage(const char* progName) {
 }
 
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
-    int rank = 0;
-    int size = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    int provided = 0;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+
+    int worldRank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
 
     size_t numNodes = 512;
     bool validate = false;
     bool printResults = false;
 
-    // Parse command line arguments (identical argv on every rank)
+    // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             numNodes = atoi(argv[++i]);
@@ -290,13 +336,11 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-r") == 0) {
             printResults = true;
         } else if (strcmp(argv[i], "-h") == 0) {
-            if (rank == 0) {
-                printUsage(argv[0]);
-            }
+            if (worldRank == 0) printUsage(argv[0]);
             MPI_Finalize();
             return 0;
         } else {
-            if (rank == 0) {
+            if (worldRank == 0) {
                 printf("Unknown option: %s\n", argv[i]);
                 printUsage(argv[0]);
             }
@@ -305,41 +349,41 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (rank == 0) {
+    if (worldRank == 0) {
         printf("Floyd-Warshall All-Pairs Shortest Path Benchmark\n");
         printf("Number of nodes: %zu\n", numNodes);
-        printf("MPI ranks: %d\n", size);
-        printf("OpenMP max threads: %d\n", omp_get_max_threads());
         printf("Validation: %s\n", validate ? "enabled" : "disabled");
     }
 
-    // Allocate matrices (every rank builds the full matrices identically and
-    // deterministically so that no initial-data communication is required;
-    // each rank then only computes and keeps its own row-block on its GPU)
-    std::vector<unsigned int> dist(numNodes * numNodes);
-    std::vector<unsigned int> path(numNodes * numNodes);
+    // Allocate matrices (only rank 0 holds the full matrices; other ranks
+    // only ever operate on their scattered row blocks).
+    std::vector<unsigned int> dist;
+    std::vector<unsigned int> path;
+    if (worldRank == 0) {
+        dist.resize(numNodes * numNodes);
+        path.resize(numNodes * numNodes);
 
-    // Initialize
-    if (rank == 0) {
+        // Initialize
         printf("Initializing graph...\n");
+        initializeDistanceMatrix(dist, numNodes, 1, MAX_DISTANCE);
+        initializePathMatrix(path, numNodes);
     }
-    initializeDistanceMatrix(dist, numNodes, 1, MAX_DISTANCE);
-    initializePathMatrix(path, numNodes);
 
     // Run Floyd-Warshall
-    if (rank == 0) {
+    if (worldRank == 0) {
         printf("Computing shortest paths...\n");
     }
-    MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
 
-    floydWarshallDistributed(dist, path, numNodes, rank, size);
+    floydWarshall(dist, path, numNodes);
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-    int result = 0;
-    if (rank == 0) {
+    int exitCode = 0;
+
+    if (worldRank == 0) {
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
         printf("Computation time: %ld ms\n", duration.count());
 
         // Calculate operations per second
@@ -360,15 +404,15 @@ int main(int argc, char** argv) {
 
             if (valid) {
                 printf("Validation: PASSED\n");
-                result = 0;
+                exitCode = 0;
             } else {
                 printf("Validation: FAILED\n");
-                result = 1;
+                exitCode = 1;
             }
         }
     }
 
-    MPI_Bcast(&result, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&exitCode, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Finalize();
-    return result;
+    return exitCode;
 }

@@ -4,6 +4,8 @@ project(roomsim_benchmark)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# MPI is required: this benchmark is parallelized for distributed-memory
+# clusters using MPI.
 find_package(MPI REQUIRED)
 
 add_executable(roomsim roomsim.cpp)
@@ -12,4 +14,4 @@ add_executable(roomsim roomsim.cpp)
 target_compile_options(roomsim PRIVATE -O3 -march=native -Wall -Wextra -Wpedantic)
 
 # Link math and MPI libraries
-target_link_libraries(roomsim m MPI::MPI_CXX)
+target_link_libraries(roomsim PRIVATE m MPI::MPI_CXX)
