@@ -698,6 +698,9 @@ int main(int argc, char** argv) {
     if (ndev < 1) fatal("no CUDA devices available");
     const int nthr = std::max(1, ndev / localSize);
 
+    MPI_Barrier(MPI_COMM_WORLD);
+    const double cluster_start = MPI_Wtime();
+
     // Spatial grid for neighborhood gathering (cell size >= threshold)
     const Grid grid = buildGrid(points, threshold);
 
@@ -711,14 +714,14 @@ int main(int argc, char** argv) {
     }
     
     // Perform QT clustering
-    MPI_Barrier(MPI_COMM_WORLD);
-    const double cluster_start = MPI_Wtime();
     
     const std::vector<Cluster> clusters = qtClustering(ctx, num_points, threshold, rank, nranks);
     
-    MPI_Barrier(MPI_COMM_WORLD);
     const double cluster_end = MPI_Wtime();
-    const long cluster_ms = static_cast<long>((cluster_end - cluster_start) * 1000.0);
+    const double local_cluster_seconds = cluster_end - cluster_start;
+    double cluster_seconds = 0.0;
+    MPI_Reduce(&local_cluster_seconds, &cluster_seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    const long cluster_ms = static_cast<long>(cluster_seconds * 1000.0);
 
     for (auto& g : ctx) g.destroy();
 
@@ -747,7 +750,7 @@ int main(int argc, char** argv) {
         printf("Maximum cluster size: %d\n", max_cluster_size);
         
         // Performance metrics
-        const double time_sec = (cluster_end - cluster_start);
+        const double time_sec = cluster_seconds;
         const double clusters_per_sec = clusters.size() / time_sec;
         const double points_per_sec = num_points / time_sec;
         printf("Performance: %.1f clusters/s, %.1f points/s\n", 

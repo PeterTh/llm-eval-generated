@@ -783,21 +783,23 @@ int main(int argc, char** argv) {
     std::vector<Point> points(num_points);
     generateSyntheticData(points, num_points);
 
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto cluster_start = std::chrono::high_resolution_clock::now();
     const HostGrid grid = buildGrid(points, threshold);
     Gpu gpu;
     gpuInit(gpu, points, grid, threshold);
     
     // Perform QT clustering
-    MPI_Barrier(MPI_COMM_WORLD);
-    auto cluster_start = std::chrono::high_resolution_clock::now();
     
     const std::vector<Cluster> clusters =
         qtClustering(points, grid, threshold, gpu, rank, nprocs);
     
     MPI_Barrier(MPI_COMM_WORLD);
     auto cluster_end = std::chrono::high_resolution_clock::now();
-    auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        cluster_end - cluster_start);
+    long cluster_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cluster_end - cluster_start).count();
+    MPI_Allreduce(MPI_IN_PLACE, &cluster_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
+    auto cluster_time = std::chrono::milliseconds(cluster_ms);
     
     int exitCode = 0;
     if (root) {

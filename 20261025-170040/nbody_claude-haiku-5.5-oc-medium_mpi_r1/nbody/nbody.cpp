@@ -225,9 +225,12 @@ int runBenchmark(int argc, char** argv, int rank, int size) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double t1 = MPI_Wtime();
+    const double localElapsed = t1 - t0;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&localElapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (root) {
-        printf("Simulation time: %ld ms\n", static_cast<long>((t1 - t0) * 1000.0));
+        printf("Simulation time: %ld ms\n", static_cast<long>(maxElapsed * 1000.0));
     }
     
     // Print results for external validation

@@ -501,6 +501,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long elapsedMs = duration.count();
+    MPI_Allreduce(MPI_IN_PLACE, &elapsedMs, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
+    duration = std::chrono::milliseconds(elapsedMs);
 
     // Copy results back and release device memory (untimed)
 #pragma omp parallel for num_threads(numGpus) schedule(static, 1)

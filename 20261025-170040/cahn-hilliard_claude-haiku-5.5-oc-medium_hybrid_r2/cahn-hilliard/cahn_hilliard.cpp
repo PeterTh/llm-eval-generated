@@ -436,10 +436,6 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaEventRecord(evCBnd, sComp));
         // Fill the initial ghost planes.
         exchangeHalo(d_c, slab, hC, evCBnd, evCGhost, sComm);
-        // Start the interior chemical potential for the first step.
-        if (iterations > 0 && slab.nzl > 2) {
-            launchChemicalPotential(d_c, d_mu, sp, 2, slab.nzl - 2, sComp);
-        }
     }
 
     if (root) printf("Running Cahn-Hilliard simulation...\n");
@@ -450,6 +446,10 @@ int main(int argc, char** argv) {
         double* cur = d_c;
         double* nxt = d_cn;
         const size_t nzl = slab.nzl;
+        // Start the interior chemical potential for the first step.
+        if (iterations > 0 && slab.nzl > 2) {
+            launchChemicalPotential(d_c, d_mu, sp, 2, slab.nzl - 2, sComp);
+        }
         for (int t = 0; t < iterations; ++t) {
             // (1) chemical potential on the boundary planes of the current field.
             CUDA_CHECK(cudaStreamWaitEvent(sComp, evCGhost, 0));

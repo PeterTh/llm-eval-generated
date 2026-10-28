@@ -483,8 +483,10 @@ int runBenchmark(int argc, char** argv) {
     MPI_Type_free(&pair_type);
 
     int rc = 0;
+    const double local_elapsed_s = t_end - t_start;
+    double elapsed_s = 0.0;
+    MPI_Reduce(&local_elapsed_s, &elapsed_s, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
     if (root) {
-        const double elapsed_s = t_end - t_start;
         const auto duration_ms = static_cast<long>(elapsed_s * 1000.0);
 
         printf("Computation time: %ld ms\n", duration_ms);

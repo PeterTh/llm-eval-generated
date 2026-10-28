@@ -404,6 +404,10 @@ int runBenchmark(int argc, char** argv, const int rank, const int nprocs) {
     auto cluster_end = std::chrono::high_resolution_clock::now();
     auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
         cluster_end - cluster_start);
+    const long local_cluster_time = cluster_time.count();
+    long max_cluster_time = 0;
+    MPI_Reduce(&local_cluster_time, &max_cluster_time, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    cluster_time = std::chrono::milliseconds(max_cluster_time);
 
     if (rank != 0) {
         // Non-root ranks only take part in the collective validation step

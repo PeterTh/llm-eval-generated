@@ -371,7 +371,10 @@ int main(int argc, char** argv) {
     
     MPI_Barrier(comm);
     const double t1 = MPI_Wtime();
-    const long cluster_ms = static_cast<long>((t1 - t0) * 1000.0);
+    const double local_elapsed = t1 - t0;
+    double max_elapsed = 0.0;
+    MPI_Reduce(&local_elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+    const long cluster_ms = static_cast<long>(max_elapsed * 1000.0);
     
     if (root) {
         printf("Clustering time: %ld ms\n", cluster_ms);

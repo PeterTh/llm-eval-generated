@@ -217,7 +217,9 @@ static int runBenchmark(int argc, char** argv, int rank, int size) {
     
     MPI_Barrier(comm);
     const double t1 = MPI_Wtime();
-    const double elapsed = t1 - t0;
+    const double localElapsed = t1 - t0;
+    double elapsed = 0.0;
+    MPI_Reduce(&localElapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
     
     // Gather all results on root in global order
     std::vector<double> results;

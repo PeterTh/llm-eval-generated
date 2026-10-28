@@ -361,9 +361,11 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaFree(dBodies));
     }
 
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - tStart);
+    long duration = std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - tStart).count();
+    long maxDuration = 0;
+    MPI_Reduce(&duration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (root) {
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %ld ms\n", maxDuration);
     }
 
     // Print results for external validation

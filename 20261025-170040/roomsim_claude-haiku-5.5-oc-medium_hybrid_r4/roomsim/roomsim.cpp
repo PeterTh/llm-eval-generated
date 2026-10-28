@@ -1611,6 +1611,7 @@ int main(int argc, char** argv) {
 
     computeDistances(state);
 
+    CUDA_CHECK(cudaDeviceSynchronize());
     auto endDist = std::chrono::high_resolution_clock::now();
     auto distDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startDist).count();
 
@@ -1618,7 +1619,9 @@ int main(int argc, char** argv) {
     RPRINTF("\n");
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long localTime = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startPre).count();
+    long totalTime = 0;
+    MPI_Reduce(&localTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     RPRINTF("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics

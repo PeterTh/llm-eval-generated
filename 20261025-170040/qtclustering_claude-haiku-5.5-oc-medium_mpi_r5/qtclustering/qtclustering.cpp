@@ -398,7 +398,9 @@ static int runBenchmark(int argc, char** argv, const int rank, const int nprocs)
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double cluster_end = MPI_Wtime();
-    const long cluster_ms = static_cast<long>((cluster_end - cluster_start) * 1000.0);
+    const long local_cluster_ms = static_cast<long>((cluster_end - cluster_start) * 1000.0);
+    long cluster_ms = 0;
+    MPI_Reduce(&local_cluster_ms, &cluster_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (root) {
         printf("Clustering time: %ld ms\n", cluster_ms);

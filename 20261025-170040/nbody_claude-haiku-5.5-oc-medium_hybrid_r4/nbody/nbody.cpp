@@ -406,8 +406,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    long globalDurationMs = 0;
+    MPI_Reduce(&durationMs, &globalDurationMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     if (root) {
-        printf("Simulation time: %ld ms\n", durationMs);
+        printf("Simulation time: %ld ms\n", globalDurationMs);
 
         // Print results for external validation
         if (printResults) {

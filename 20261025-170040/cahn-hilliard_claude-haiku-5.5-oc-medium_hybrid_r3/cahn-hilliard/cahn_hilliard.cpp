@@ -473,10 +473,11 @@ int main(int argc, char** argv) {
 
     CUDA_CHECK(cudaStreamSynchronize(sc));
     CUDA_CHECK(cudaStreamSynchronize(sx));
-    MPI_Barrier(comm);
-
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDuration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, comm);
+    auto duration = std::chrono::milliseconds(maxDuration);
 
     if (root) {
         printf("Computation time: %ld ms\n", duration.count());

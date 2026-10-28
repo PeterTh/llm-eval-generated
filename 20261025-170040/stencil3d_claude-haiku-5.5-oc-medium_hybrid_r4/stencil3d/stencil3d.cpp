@@ -329,11 +329,14 @@ static int runBenchmark(int argc, char** argv, const int rank, const int size) {
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-    ROOT_PRINTF("Computation time: %ld ms\n", duration.count());
+    long local_ms = duration.count();
+    long max_ms = local_ms;
+    MPI_Reduce(&local_ms, &max_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    ROOT_PRINTF("Computation time: %ld ms\n", max_ms);
 
     // Calculate performance metrics
     double cellUpdates = (double)((nx - 2) * (ny - 2) * (nz - 2)) * iterations;
-    double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;  // Million cell updates per second
+    double mcups = cellUpdates / (max_ms / 1000.0) / 1e6;  // Million cell updates per second
     ROOT_PRINTF("Performance: %.3f MCellUpdates/s\n", mcups);
 
     // Final grid lives in grid1 for an even iteration count, otherwise grid2.

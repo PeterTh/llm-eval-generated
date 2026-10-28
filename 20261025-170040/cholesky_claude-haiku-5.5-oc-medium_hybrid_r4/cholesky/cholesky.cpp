@@ -573,8 +573,12 @@ int runBenchmark(int argc, char** argv, int rank, int size) {
         return 1;
     }
 
+    const double localElapsed = t1 - t0;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&localElapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
     if (rank == 0) {
-        const long long durationMs = static_cast<long long>((t1 - t0) * 1000.0);
+        const long long durationMs = static_cast<long long>(maxElapsed * 1000.0);
         printf("Computation time: %lld ms\n", durationMs);
 
         // Calculate GFLOPS (approximately n³/3 operations for Cholesky)

@@ -243,11 +243,13 @@ static int runBenchmark(int argc, char** argv) {
                    MPI_COMM_WORLD);
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDuration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     int rc = 0;
     if (isRoot) {
-        printf("Simulation time: %ld ms\n", duration.count());
+        printf("Simulation time: %ld ms\n", maxDuration);
 
         std::vector<Body> bodies(n);
         for (size_t i = 0; i < n; ++i) {
