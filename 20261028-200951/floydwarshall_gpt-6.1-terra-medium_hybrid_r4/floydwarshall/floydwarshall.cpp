@@ -172,13 +172,15 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     auto end = std::chrono::high_resolution_clock::now();
+    double localSeconds = std::chrono::duration<double>(end-start).count();
+    double seconds = 0.0;
+    MPI_CHECK(MPI_Reduce(&localSeconds, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
     if (!local.empty()) CUDA_CHECK(cudaMemcpy(local.data(), deviceMatrix, local.size()*sizeof(unsigned int), cudaMemcpyDeviceToHost));
     MPI_CHECK(MPI_Gatherv(local.data(), counts[rank], MPI_UNSIGNED, full.data(), counts.data(), displs.data(), MPI_UNSIGNED, 0, MPI_COMM_WORLD));
     int status = 0;
     if (!rank) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end-start);
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::duration<double>(seconds));
         printf("Computation time: %ld ms\n", duration.count());
-        double seconds = std::chrono::duration<double>(end-start).count();
         printf("Performance: %.3f GOPS\n", double(n)*n*n / seconds / 1e9);
         if (printResults || validate) {
             std::vector<unsigned int> dist(n*n);

@@ -220,7 +220,10 @@ int main(int argc, char** argv) {
     CUDA(cudaDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    if (!rank) printf("Simulation time: %ld ms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+    long localElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long maxElapsed = 0;
+    MPI_Reduce(&localElapsed, &maxElapsed, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (!rank) printf("Simulation time: %ld ms\n", maxElapsed);
 
     if (validate || printResults) {
         if (ranks == 1) CUDA(cudaMemcpy(hostPos, dPos, sizeof(Vec3) * numBodies, cudaMemcpyDeviceToHost));

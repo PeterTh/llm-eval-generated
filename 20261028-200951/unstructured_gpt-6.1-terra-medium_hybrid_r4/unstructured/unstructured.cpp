@@ -117,7 +117,8 @@ int main(int argc, char** argv) {
         CUDA(cudaStreamSynchronize(stream)); std::swap(a,b);
     }
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD)); auto end = std::chrono::steady_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(end-begin).count();
+    double local_ms = std::chrono::duration<double, std::milli>(end-begin).count(), ms = 0.0;
+    MPI_CHECK(MPI_Reduce(&local_ms, &ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
     std::vector<ElementDynamic> local_data(size_t(rows)*n), all;
     CUDA(cudaMemcpy(local_data.data(), a+n, local_data.size()*sizeof(ElementDynamic), cudaMemcpyDeviceToHost));
     uint64_t local_hash = computeHash(local_data, size_t(start)*n), hash = 0;

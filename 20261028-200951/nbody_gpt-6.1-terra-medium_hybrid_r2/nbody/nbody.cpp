@@ -232,6 +232,8 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_ms = duration.count(), max_ms = 0;
+    MPI_Reduce(&local_ms, &max_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     for (int r = 0; r < ranks; ++r) {
         byteCounts[r] = counts[r] * sizeof(Body);
         byteOffsets[r] = offsets[r] * sizeof(Body);
@@ -242,7 +244,7 @@ int main(int argc, char** argv) {
     if (deviceBodies) cudaCheck(cudaFree(deviceBodies), "free bodies");
     if (devicePositions) cudaCheck(cudaFree(devicePositions), "free positions");
     if (rank != 0) { MPI_Finalize(); return 0; }
-    printf("Simulation time: %ld ms\n", duration.count());
+    printf("Simulation time: %ld ms\n", max_ms);
 
     // Print results for external validation
     if (printResults) {

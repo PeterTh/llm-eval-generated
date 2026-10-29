@@ -217,7 +217,10 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    if (!rank) printf("Simulation time: %ld ms\n", duration.count());
+    long local_duration_ms = duration.count();
+    long max_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &max_duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (!rank) printf("Simulation time: %ld ms\n", max_duration_ms);
     if (deviceAll) cudaCheck(cudaFree(deviceAll), "free global state");
     if (deviceLocal) cudaCheck(cudaFree(deviceLocal), "free local state");
     int status = 0;
