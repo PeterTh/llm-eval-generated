@@ -186,6 +186,8 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end-start);
+    long local_ms = duration.count(), max_ms = 0;
+    MPI_Reduce(&local_ms, &max_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // gather final grid to rank 0
     const std::vector<Real>& finalLocal = (iterations%2==0)? grid1 : grid2;
@@ -214,9 +216,9 @@ int main(int argc, char** argv) {
             finalGrid[idx3(x,y,0,nx,ny)] = (idx3(x,y,0,nx,ny)%19)*1.0;
             finalGrid[idx3(x,y,nz-1,nx,ny)] = (idx3(x,y,nz-1,nx,ny)%19)*1.0;
         }
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", max_ms);
         double cellUpdates = (double)((nx-2)*(ny-2)*(nz-2))*iterations;
-        double mcups = cellUpdates/(duration.count()/1000.0)/1e6;
+        double mcups = cellUpdates/(max_ms/1000.0)/1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
         if (printResults) print_results(finalGrid,"Grid");
         if (validate) {

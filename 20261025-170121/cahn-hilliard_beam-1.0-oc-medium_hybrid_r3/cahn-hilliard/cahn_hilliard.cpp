@@ -218,6 +218,9 @@ int main(int argc, char** argv) {
     }
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end-start);
+    long local_ms = duration.count();
+    long max_ms = 0;
+    MPI_Reduce(&local_ms, &max_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // gather
     std::vector<int> counts(size), displs(size);
@@ -237,9 +240,9 @@ int main(int argc, char** argv) {
     MPI_Gatherv(sendbuf.data(), nz_l*plane, MPI_DOUBLE, globalC.data(), counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     if(rank==0){
-        printf("Computation time: %ld ms\n", duration.count());
+        printf("Computation time: %ld ms\n", max_ms);
         double cellUpdates=(double)(nx*ny*nz)*iterations;
-        double mcups=cellUpdates/(duration.count()/1000.0)/1e6;
+        double mcups=cellUpdates/(max_ms/1000.0)/1e6;
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
         if(printResults) print_results(globalC, "Concentration");
         if(validate){

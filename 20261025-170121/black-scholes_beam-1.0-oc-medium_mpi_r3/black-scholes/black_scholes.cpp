@@ -214,6 +214,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    double local_time_ms = duration.count() / 1000.0;
+    double max_time_ms = 0.0;
+    MPI_Reduce(&local_time_ms, &max_time_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     std::vector<double> results;
     if (rank == 0) results.resize(numOptions);
@@ -228,9 +231,9 @@ int main(int argc, char** argv) {
 
     if (rank == 0) {
         printf("Pricing options...\n");
-        printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
-        if (duration.count() > 0)
-            printf("Options per second: %.0f\n", numOptions / (duration.count() / 1e6));
+        printf("Computation time: %.3f ms\n", max_time_ms);
+        if (max_time_ms > 0)
+            printf("Options per second: %.0f\n", numOptions / (max_time_ms / 1000.0));
 
         if (printResults) {
             print_results(results, "OptionPrices");

@@ -125,7 +125,9 @@ int main(int argc, char** argv){
     // redo gather properly not in loop above; rewrite loop below? We'll just not; instead fix:
     auto endT=std::chrono::high_resolution_clock::now();
     auto duration=std::chrono::duration_cast<std::chrono::milliseconds>(endT-startT);
-    if(rank==0) printf("Simulation time: %ld ms\n", duration.count());
+    long localDuration=duration.count(), maxDuration=0;
+    MPI_Reduce(&localDuration,&maxDuration,1,MPI_LONG,MPI_MAX,0,MPI_COMM_WORLD);
+    if(rank==0) printf("Simulation time: %ld ms\n", maxDuration);
 
     if(rank==0 && printResults){
         std::vector<double> bodyData; bodyData.reserve(numBodies*6);

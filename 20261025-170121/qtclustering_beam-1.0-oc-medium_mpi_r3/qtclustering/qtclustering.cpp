@@ -352,7 +352,12 @@ int main(int argc, char** argv) {
     if (mpi_rank != 0) {
         std::vector<Point> pts(num_points);
         generateSyntheticData(pts, num_points);
+        auto cluster_start = std::chrono::high_resolution_clock::now();
         qtClustering(pts, threshold);
+        auto cluster_end = std::chrono::high_resolution_clock::now();
+        long local_cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            cluster_end - cluster_start).count();
+        MPI_Reduce(&local_cluster_time, nullptr, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
         MPI_Finalize();
         return 0;
     }
@@ -372,8 +377,11 @@ int main(int argc, char** argv) {
     const std::vector<Cluster> clusters = qtClustering(points, threshold);
     
     auto cluster_end = std::chrono::high_resolution_clock::now();
-    auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        cluster_end - cluster_start);
+    long local_cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cluster_end - cluster_start).count();
+    long max_cluster_time;
+    MPI_Reduce(&local_cluster_time, &max_cluster_time, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    auto cluster_time = std::chrono::milliseconds(max_cluster_time);
     
     if (mpi_rank != 0) {
         MPI_Finalize();

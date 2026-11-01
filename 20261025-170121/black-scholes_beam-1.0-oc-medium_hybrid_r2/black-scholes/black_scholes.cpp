@@ -266,7 +266,9 @@ int main(int argc, char** argv) {
     cudaFree(d_type); cudaFree(d_S); cudaFree(d_K); cudaFree(d_q); cudaFree(d_r); cudaFree(d_T); cudaFree(d_vol); cudaFree(d_out);
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    double duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    double max_duration_ms = 0.0;
+    MPI_Reduce(&duration_ms, &max_duration_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // gather
     std::vector<int> counts(size), displs(size);
@@ -280,8 +282,8 @@ int main(int argc, char** argv) {
     MPI_Gatherv(localResults.data(), localN, MPI_DOUBLE, rank==0?results.data():nullptr, counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %.3f ms\n", duration.count() / 1000.0);
-        printf("Options per second: %.0f\n", numOptions / (duration.count() / 1e6));
+        printf("Computation time: %.3f ms\n", max_duration_ms);
+        printf("Options per second: %.0f\n", numOptions / (max_duration_ms / 1000.0));
     }
     
     if (rank != 0) {

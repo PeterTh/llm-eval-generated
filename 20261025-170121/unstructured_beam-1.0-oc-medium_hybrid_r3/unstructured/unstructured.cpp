@@ -155,6 +155,7 @@ void runSimulation(World& world, const int n_iters) {
     int start = rank * chunk;
     int end = (rank == size - 1) ? (int)n_elems : start + chunk;
 
+    MPI_Barrier(MPI_COMM_WORLD);
     for (int iter = 0; iter < n_iters; ++iter) {
         cudaMemcpy(d_cur, world.elements_dynamic.data(), n_elems * sizeof(ElementDynamic), cudaMemcpyHostToDevice);
         int n = end - start;

@@ -156,10 +156,13 @@ int main(int argc, char** argv) {
     MPI_Gatherv(Clocal.data(), (int)(localRows * N), MPI_DOUBLE,
                 rank == 0 ? C.data() : nullptr, counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
+    long local_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long duration = 0;
+    MPI_Reduce(&local_duration, &duration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        printf("Computation time: %ld ms\n", duration.count());
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        printf("Computation time: %ld ms\n", duration);
+        double gflops = (2.0 * N * N * N) / (duration / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
 
         if (printResults) {

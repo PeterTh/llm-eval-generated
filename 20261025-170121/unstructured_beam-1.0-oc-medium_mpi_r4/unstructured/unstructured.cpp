@@ -280,8 +280,10 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
     runSimulation(world, n_iters, rank, size);
-    MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
+    const long local_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     // gather
     int n_local = (int)world.elements_dynamic.size();
@@ -301,7 +303,6 @@ int main(int argc, char** argv) {
                 global_dyn.data(), bcounts.data(), bdispls.data(), MPI_BYTE, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
         printf("Computation time: %ld ms\n", duration_ms);
         const int n_measured_iters = std::max(n_iters - 1, 1);
         const double time_per_iter = static_cast<double>(duration_ms) / n_measured_iters;

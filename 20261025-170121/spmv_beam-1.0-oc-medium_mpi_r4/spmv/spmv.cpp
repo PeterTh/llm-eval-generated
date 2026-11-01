@@ -294,8 +294,12 @@ int main(int argc, char** argv) {
     MPI_Gatherv(localOut.data(), localRows, MPI_DOUBLE,
                 h_out.data(), recvCounts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
+    const long localDuration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long maxDuration = 0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        auto duration = std::chrono::milliseconds(maxDuration);
         printf("Computation time: %ld ms\n", duration.count());
         const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
         const double avgTime = duration.count() / static_cast<double>(iterations);

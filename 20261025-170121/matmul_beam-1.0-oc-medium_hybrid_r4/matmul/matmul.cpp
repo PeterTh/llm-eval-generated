@@ -161,10 +161,13 @@ int main(int argc, char** argv) {
     matrixMultiply(A, B, C, N, rank, size);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_ms = duration.count();
+    long max_ms = 0;
+    MPI_Reduce(&local_ms, &max_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
-        double gflops = (2.0 * N * N * N) / (duration.count() / 1000.0) / 1e9;
+        printf("Computation time: %ld ms\n", max_ms);
+        double gflops = (2.0 * N * N * N) / (max_ms / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
         if (printResults) print_results(C, "MatrixC");
         if (validate) {

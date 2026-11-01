@@ -268,6 +268,7 @@ int main(int argc, char** argv) {
     runSimulation(world, n_iters, rank, size);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    MPI_Allreduce(MPI_IN_PLACE, &duration_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     // MPI_Allgatherv in runSimulation used MPI_BYTE incorrectly; fix here? We used MPI_BYTE count in elements not bytes. Need fix function. But can't easily. Let's instead adjust: counts/displs in elements, datatype MPI_BYTE with count*16? We'll fix below by editing function.
     if (rank == 0) {

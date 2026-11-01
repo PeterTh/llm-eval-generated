@@ -248,7 +248,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    MPI_Allreduce(MPI_IN_PLACE, &duration_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
+    auto duration = std::chrono::milliseconds(duration_ms);
 
     // Gather results to rank 0
     std::vector<int> counts(size), displs(size);

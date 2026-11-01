@@ -300,12 +300,14 @@ int main(int argc, char** argv) {
     if (rank == 0) {
         h_out = h_out_all;
     }
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long max_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &max_duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", duration.count());
-        const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
-        const double avgTime = duration.count() / static_cast<double>(iterations);
+        printf("Computation time: %ld ms\n", max_duration_ms);
+        const double gflops = (2.0 * nItems * iterations) / (max_duration_ms / 1000.0) / 1e9;
+        const double avgTime = max_duration_ms / static_cast<double>(iterations);
         printf("Average time per iteration: %.3f ms\n", avgTime);
         printf("Performance: %.3f GFLOPS\n", gflops);
         if (printResults) {

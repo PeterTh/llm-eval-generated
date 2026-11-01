@@ -256,7 +256,10 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long max_duration_ms = 0;
+    MPI_Reduce(&local_duration_ms, &max_duration_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    auto duration = std::chrono::milliseconds(max_duration_ms);
 
     // Gather results to rank 0
     std::vector<int> counts(size), displs(size);

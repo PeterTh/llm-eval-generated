@@ -169,10 +169,12 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-    if (rank == 0) printf("Computation time: %ld ms\n", duration.count());
+    long max_ms = duration.count();
+    MPI_Allreduce(MPI_IN_PLACE, &max_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
+    if (rank == 0) printf("Computation time: %ld ms\n", max_ms);
 
     double cellUpdates = (double)((nx-2)*(ny-2)*(nz-2)) * iterations;
-    double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;
+    double mcups = cellUpdates / (max_ms / 1000.0) / 1e6;
     if (rank == 0) printf("Performance: %.3f MCellUpdates/s\n", mcups);
 
     const std::vector<Real>& finalLocal = (iterations % 2 == 0) ? grid1 : grid2;

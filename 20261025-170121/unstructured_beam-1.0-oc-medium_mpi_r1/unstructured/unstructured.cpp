@@ -364,6 +364,8 @@ int main(int argc, char** argv) {
     MPI_Gatherv(sendbuf.data(), local_bytes, MPI_BYTE,
                 global_buf.data(), counts.data(), displs.data(), MPI_BYTE, 0, MPI_COMM_WORLD);
 
+    MPI_Allreduce(MPI_IN_PLACE, &duration_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
+
     if (world_rank == 0) {
         World w;
         w.materials = world.materials;
