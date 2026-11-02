@@ -193,7 +193,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
-    if (!rank) printf("Simulation time: %ld ms\n", (long)duration.count());
+    long local_ms = duration.count(), global_ms = 0;
+    MPI_Reduce(&local_ms, &global_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (!rank) printf("Simulation time: %ld ms\n", global_ms);
 
     if (printResults || validate) {
         if (localCount) {

@@ -207,7 +207,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
     const double elapsed = MPI_Wtime() - start;
-    if (rank == 0) printf("Simulation time: %ld ms\n", static_cast<long>(elapsed * 1000));
+    double max_elapsed = 0;
+    MPI_Reduce(&elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) printf("Simulation time: %ld ms\n", static_cast<long>(max_elapsed * 1000));
 
     if (validate || printResults) {
         if (ranks == 1 && n) CUDA_CHECK(cudaMemcpy(host_pos, d_pos, n * sizeof(double4), cudaMemcpyDeviceToHost));
