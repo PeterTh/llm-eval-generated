@@ -1,0 +1,1834 @@
+Reading additional input from stdin...
+OpenAI Codex v0.160.1
+--------
+workdir: /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+model: gpt-6.1-terra
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 01a19a97-17cc-7470-ac2d-250bf685b9f0
+--------
+user
+Parallelize the spmv benchmark code found in ./spmv/ with a hybrid approach combining MPI, OpenMP, and CUDA as appropriate for the problem for maximum parallel performance on an accelerator cluster. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the existing benchmark and build setup first, then implement the hybrid MPI, OpenMP, and CUDA path within the existing files and check it against the original behavior.
+exec
+/bin/bash -lc "pwd && rg --files -g '"'!*build*'"' -g 'AGENTS.md' -g 'CMakeLists.txt' -g '*' spmv" in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+ succeeded in 0ms:
+/home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+spmv/CMakeLists.txt
+spmv/spmv.cpp
+
+exec
+/bin/bash -lc 'cat spmv/CMakeLists.txt && cat spmv/spmv.cpp' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+ succeeded in 0ms:
+cmake_minimum_required(VERSION 3.10)
+project(spmv_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(spmv spmv.cpp)
+
+# Enable optimizations
+target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link math library
+target_link_libraries(spmv m)
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+using index_t = uint32_t;
+
+// Constants
+constexpr double MAX_RELATIVE_ERROR = 0.02;
+
+// ****************************************************************************
+// Function: fill
+//
+// Purpose:
+//   Initialize array with random values
+//
+// Arguments:
+//   A: pointer to the array to initialize
+//   n: number of elements in the array
+//   maxVal: specifies range of random values [0, maxVal]
+//
+// ****************************************************************************
+void fill(double* A, const index_t n, const double maxVal) {
+    for (index_t i = 0; i < n; ++i) {
+        A[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+    }
+}
+
+// ****************************************************************************
+// Function: initRandomMatrix
+//
+// Purpose:
+//   Assigns random positions to a given number of elements in a square
+//   matrix. The function encodes these positions in compressed sparse
+//   row (CSR) format.
+//
+// Arguments:
+//   cols:          array for column indexes of elements (size should be = n)
+//   rowDelimiters: array of size dim+1 holding indices to rows;
+//                  last element is the index one past the last element
+//   n:             number of nonzero elements
+//   dim:           number of rows/columns in the matrix
+//
+// ****************************************************************************
+void initRandomMatrix(index_t* cols, index_t* rowDelimiters, const index_t n, const index_t dim) {
+    index_t nnzAssigned = 0;
+
+    // Figure out the probability that a nonzero should be assigned
+    double prob = static_cast<double>(n) / (static_cast<double>(dim) * static_cast<double>(dim));
+
+    // Seed random number generator
+    srand(8675309);
+
+    // Randomly decide whether entry i,j gets a value, but ensure n values are assigned
+    bool fillRemaining = false;
+    for (index_t i = 0; i < dim; ++i) {
+        rowDelimiters[i] = nnzAssigned;
+        for (index_t j = 0; j < dim; ++j) {
+            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+            index_t needToAssign = n - nnzAssigned;
+            if (numEntriesLeft <= needToAssign) {
+                fillRemaining = true;
+            }
+            double randVal = static_cast<double>(rand()) / RAND_MAX;
+            if ((nnzAssigned < n && randVal <= prob) || fillRemaining) {
+                // Assign (i,j) a value
+                cols[nnzAssigned] = j;
+                nnzAssigned++;
+            }
+        }
+    }
+    // Convention: put the number of non-zeroes at the end of the row delimiters array
+    rowDelimiters[dim] = n;
+}
+
+// ****************************************************************************
+// Function: spmvCpu
+//
+// Purpose:
+//   Computes sparse matrix-vector multiplication using CSR format
+//
+// Arguments:
+//   val: array holding the non-zero values for the matrix
+//   cols: array of column indices for each element
+//   rowDelimiters: array of size dim+1 holding indices to rows;
+//                  last element is the index one past the last element
+//   vec: dense vector of size dim to be used for multiplication
+//   dim: number of rows/columns in the matrix
+//   out: output - result from the spmv calculation
+//
+// ****************************************************************************
+void spmvCpu(const double* val, const index_t* cols, const index_t* rowDelimiters,
+             const double* vec, const index_t dim, double* out) {
+    for (index_t i = 0; i < dim; ++i) {
+        double t = 0.0;
+        for (index_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
+            const auto col = cols[j];
+            t += val[j] * vec[col];
+        }
+        out[i] = t;
+    }
+}
+
+// ****************************************************************************
+// Function: verifyResults
+//
+// Purpose:
+//   Verifies correctness of results by comparing to reference solution
+//
+// Arguments:
+//   reference: array holding the reference result vector
+//   result: array holding the result vector to verify
+//   size: number of elements per vector
+//
+// ****************************************************************************
+bool verifyResults(const double* reference, const double* result, const index_t size) {
+    for (index_t i = 0; i < size; ++i) {
+        const double ref = reference[i];
+        const double res = result[i];
+        if (std::abs(ref) < 1e-10) {
+            // For very small values, check absolute error
+            if (std::abs(res) > MAX_RELATIVE_ERROR) {
+                printf("Validation failed at index %u: reference %.10e, got %.10e\n", i, ref, res);
+                return false;
+            }
+        } else {
+            // Check relative error
+            const double relError = std::abs((res - ref) / ref);
+            if (relError > MAX_RELATIVE_ERROR) {
+                printf("Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\n",
+                       i, ref, res, relError);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Number of rows/columns in the matrix (default: 1024)\n");
+    printf("  -s <num>     Sparsity: 1 out of N entries is non-zero (default: 10)\n");
+    printf("  -i <num>     Number of iterations (default: 10)\n");
+    printf("  -m <val>     Maximum value for matrix and vector elements (default: 1.0)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    index_t numRows = 1024;
+    index_t sparsity = 10;
+    index_t iterations = 10;
+    double maxVal = 1.0;
+    bool validate = false;
+    bool printResults = false;
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            numRows = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            sparsity = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            iterations = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            maxVal = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+
+    // Calculate number of non-zero elements
+    const index_t nItems = (numRows * numRows) / sparsity;
+
+    printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+    printf("Matrix size: %u x %u\n", numRows, numRows);
+    printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+    printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
+    printf("Iterations: %u\n", iterations);
+    printf("Max value: %.2f\n", maxVal);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+
+    // Allocate and initialize data structures
+    std::vector<double> h_val(nItems);                  // Non-zero values
+    std::vector<index_t> h_cols(nItems);                // Column indices
+    std::vector<index_t> h_rowDelimiters(numRows + 1);  // Row delimiters
+    std::vector<double> h_vec(numRows);                 // Dense vector
+    std::vector<double> h_out(numRows);                 // Output vector
+
+    printf("Initializing data structures...\n");
+    fill(h_vec.data(), numRows, maxVal);
+    fill(h_val.data(), nItems, maxVal);
+    initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+
+    // For validation, compute reference solution
+    std::vector<double> h_reference;
+    if (validate) {
+        printf("Computing reference solution...\n");
+        h_reference.resize(numRows);
+        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(), 
+                h_vec.data(), numRows, h_reference.data());
+    }
+
+    // Perform SpMV computation
+    printf("Computing SpMV...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (index_t iter = 0; iter < iterations; ++iter) {
+        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+                h_vec.data(), numRows, h_out.data());
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+    printf("Computation time: %ld ms\n", duration.count());
+    
+    // Calculate performance metrics
+    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+    const double avgTime = duration.count() / static_cast<double>(iterations);
+    
+    printf("Average time per iteration: %.3f ms\n", avgTime);
+    printf("Performance: %.3f GFLOPS\n", gflops);
+    
+    // Print results for external validation
+    if (printResults) {
+        print_results(h_out, "OutputVector");
+    }
+
+    // Validation
+    if (validate) {
+        printf("Validating result...\n");
+        const bool valid = verifyResults(h_reference.data(), h_out.data(), numRows);
+
+        if (valid) {
+            printf("Validation: PASSED\n");
+            return 0;
+        } else {
+            printf("Validation: FAILED\n");
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+exec
+/bin/bash -lc 'ls -la && ls -la spmv && cat common/results_output.hpp && find .. -name AGENTS.md -print' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+ succeeded in 0ms:
+total 16
+drwxrwxrwx 4 nobody  nogroup    66 Nov  2 05:49 .
+drwx------ 3 llmtest users    4096 Nov  2 05:49 ..
+drwxrwxrwx 2 nobody  nogroup    60 Nov  2 05:49 common
+-rw-r--r-- 1 llmtest users   11786 Nov  2 05:49 output.txt
+drwxrwxrwx 2 nobody  nogroup    56 Nov  2 05:49 spmv
+total 16
+drwxrwxrwx 2 nobody nogroup   56 Nov  2 05:49 .
+drwxrwxrwx 4 nobody nogroup   66 Nov  2 05:49 ..
+-rwxrwxrwx 1 nobody nogroup  300 Nov  2 05:49 CMakeLists.txt
+-rwxrwxrwx 1 nobody nogroup 9869 Nov  2 05:49 spmv.cpp
+#pragma once
+
+#include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+#include "hash.hpp"
+
+// Kahan summation for numerically stable sum
+template <typename T>
+T kahan_sum(const std::vector<T>& data) {
+    T sum = 0.0;
+    T c = 0.0;
+    for (const auto& val : data) {
+        T y = val - c;
+        T t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    return sum;
+}
+
+// Print results for floating-point arrays
+template <typename T>
+void print_results(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute statistics
+    T sum = kahan_sum(data);
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Sum: %.17e\n", static_cast<double>(sum));
+    printf("Min: %.17e\n", static_cast<double>(min_val));
+    printf("Max: %.17e\n", static_cast<double>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %.17e\n", indices[i], static_cast<double>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+// Print results for integer arrays (uses exact hash comparison)
+template <typename T>
+void print_results_int(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Compute min/max
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Min: %lld\n", static_cast<long long>(min_val));
+    printf("Max: %lld\n", static_cast<long long>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %lld\n", indices[i], static_cast<long long>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+exec
+/bin/bash -lc 'which nvcc || true; which mpicxx || true; nvidia-smi || true; cmake --version | head -1' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+ succeeded in 97ms:
+/usr/bin/nvcc
+/usr/bin/mpicxx
+Mon Nov  2 05:49:22 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 560.35.03              Driver Version: 560.35.03      CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3090        Off |   00000000:25:00.0 Off |                  N/A |
+| 30%   30C    P8             28W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 3090        Off |   00000000:41:00.0 Off |                  N/A |
+| 30%   27C    P8             24W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA GeForce RTX 3090        Off |   00000000:81:00.0 Off |                  N/A |
+| 30%   26C    P8             26W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA GeForce RTX 3090        Off |   00000000:E1:00.0 Off |                  N/A |
+| 30%   26C    P8             27W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+cmake version 3.30.2
+
+codex
+The benchmark generates one deterministic CSR matrix and reuses it for every iteration. I’ll preserve that initialization and distribute contiguous row blocks across MPI ranks, with each rank keeping its matrix block and the shared input vector on its assigned GPU; OpenMP will parallelize host-side validation and preparation.
+exec
+/bin/bash -lc 'nvcc --version && mpicxx --showme:version && cat common/hash.hpp' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+ succeeded in 0ms:
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2023 NVIDIA Corporation
+Built on Fri_Jan__6_16:45:21_PST_2023
+Cuda compilation tools, release 12.0, V12.0.140
+Build cuda_12.0.r12.0/compiler.32267302_0
+mpicxx: Open MPI 4.1.6 (Language: C++)
+#pragma once
+
+#include <cstdint>
+
+// FNV-1a hash, 64 bit length
+class hash {
+  public:
+	using digest = uint64_t;
+
+	template <typename T>
+	void add(const T& value) {
+		const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&value);
+		for(size_t i = 0; i < sizeof(T); ++i) {
+			d = (d ^ bytes[i]) * 0x100000001b3ull;
+		}
+	}
+
+	digest get() const { return d; }
+
+  private:
+	digest d = 0xcbf29ce484222325ull;
+};
+
+exec
+/bin/bash -lc "cat > spmv/CMakeLists.txt <<'EOF'
+cmake_minimum_required(VERSION 3.18)
+project(spmv_benchmark LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+find_package(MPI REQUIRED COMPONENTS CXX)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+
+# Keep the original source and executable names while compiling the CUDA kernels.
+set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
+add_executable(spmv spmv.cpp)
+target_link_libraries(spmv PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX)
+target_compile_options(spmv PRIVATE
+    "'$<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;-Xcompiler=-fopenmp>)
+EOF
+cat > spmv/spmv.cpp <<'"'EOF'
+#include <mpi.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <climits>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include \"../common/results_output.hpp\"
+
+using index_t = uint32_t;
+constexpr double MAX_RELATIVE_ERROR = 0.02;
+
+static void cuda_check(cudaError_t error, const char* operation) {
+    if (error "'!= cudaSuccess) {
+        int rank = 0;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        fprintf(stderr, "Rank %d: %s: %s'"\\n\", rank, operation, cudaGetErrorString(error));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
+#define CUDA_CHECK(call) cuda_check((call), #call)
+
+// Preserve the original random number sequence and matrix construction.
+static void fill(double* a, index_t n, double maxVal) {
+    for (index_t i = 0; i < n; ++i)
+        a[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+}
+
+static void initRandomMatrix(index_t* cols, index_t* rows, index_t n, index_t dim) {
+    index_t assigned = 0;
+    const double prob = static_cast<double>(n) / (static_cast<double>(dim) * dim);
+    srand(8675309);
+    bool fillRemaining = false;
+    for (index_t i = 0; i < dim; ++i) {
+        rows[i] = assigned;
+        for (index_t j = 0; j < dim; ++j) {
+            const index_t left = dim * dim - (i * dim + j);
+            const index_t needed = n - assigned;
+            if (left <= needed) fillRemaining = true;
+            const double random = static_cast<double>(rand()) / RAND_MAX;
+            if ((assigned < n && random <= prob) || fillRemaining) cols[assigned++] = j;
+        }
+    }
+    rows[dim] = n;
+}
+
+// One thread per row is efficient for very short rows; a warp per row exposes
+// more memory parallelism for the longer rows typical of this benchmark.
+__global__ void spmv_short(const double* val, const index_t* cols, const index_t* rows,
+                           const double* vec, index_t nrows, double* out) {
+    for (uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         row < nrows; row += static_cast<uint64_t>(gridDim.x) * blockDim.x) {
+        double sum = 0.0;
+        for (index_t j = rows[row]; j < rows[row + 1]; ++j) sum += val[j] * vec[cols[j]];
+        out[row] = sum;
+    }
+}
+
+__global__ void spmv_warp(const double* val, const index_t* cols, const index_t* rows,
+                          const double* vec, index_t nrows, double* out) {
+    const unsigned lane = threadIdx.x & 31;
+    const uint64_t first = (static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x / 32;
+    for (uint64_t row = first; row < nrows; row += stride) {
+        double sum = 0.0;
+        const index_t end = rows[row + 1];
+        for (uint64_t j = static_cast<uint64_t>(rows[row]) + lane; j < end; j += 32)
+            sum += val[j] * vec[cols[j]];
+        for (int offset = 16; offset > 0; offset /= 2)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        if (lane == 0) out[row] = sum;
+    }
+}
+
+// MPI counts are int, while CSR arrays may contain up to UINT32_MAX items.
+template <typename T>
+static void send_array(const T* data, uint64_t count, MPI_Datatype type, int peer, int tag) {
+    while (count) {
+        const int part = static_cast<int>(std::min<uint64_t>(count, INT_MAX));
+        MPI_Send(data, part, type, peer, tag, MPI_COMM_WORLD);
+        data += part; count -= part;
+    }
+}
+template <typename T>
+static void recv_array(T* data, uint64_t count, MPI_Datatype type, int peer, int tag) {
+    while (count) {
+        const int part = static_cast<int>(std::min<uint64_t>(count, INT_MAX));
+        MPI_Recv(data, part, type, peer, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        data += part; count -= part;
+    }
+}
+template <typename T>
+static void broadcast_array(T* data, uint64_t count, MPI_Datatype type) {
+    while (count) {
+        const int part = static_cast<int>(std::min<uint64_t>(count, INT_MAX));
+        MPI_Bcast(data, part, type, 0, MPI_COMM_WORLD);
+        data += part; count -= part;
+    }
+}
+static index_t row_boundary(index_t rows, int rank, int size) {
+    return static_cast<index_t>(static_cast<uint64_t>(rows) * rank / size);
+}
+
+static void printUsage(const char* name) {
+    printf(\"Usage: %s [options]\\n\", name);
+    printf(\"Options:\\n  -n <num>     Number of rows/columns in the matrix (default: 1024)\\n\");
+    printf(\"  -s <num>     Sparsity: 1 out of N entries is non-zero (default: 10)\\n\");
+    printf(\"  -i <num>     Number of iterations (default: 10)\\n\");
+    printf(\"  -m <val>     Maximum value for matrix and vector elements (default: 1.0)\\n\");
+    printf(\"  -v           Enable validation\\n  -r           Print results for external validation\\n\");
+    printf(\"  -h           Show this help message\\n\");
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    index_t numRows = 1024, sparsity = 10, iterations = 10;
+    double maxVal = 1.0;
+    bool validate = false, printResults = false;
+    for (int i = 1; i < argc; ++i) {
+        if ("'!strcmp(argv[i], "-n") && i + 1 < argc) numRows = static_cast<index_t>(atoi(argv[++i]));
+        else if (!strcmp(argv[i], "-s") && i + 1 < argc) sparsity = static_cast<index_t>(atoi(argv[++i]));
+        else if (!strcmp(argv[i], "-i") && i + 1 < argc) iterations = static_cast<index_t>(atoi(argv[++i]));
+        else if (!strcmp(argv[i], "-m") && i + 1 < argc) maxVal = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-v")) validate = true;
+        else if (!strcmp(argv[i], "-r")) printResults = true;
+        else if (!strcmp(argv[i], "-h")) {
+            if (!rank) printUsage(argv[0]);
+            MPI_Finalize(); return 0;
+        } else {
+            if (!rank) { printf("Unknown option: %s'"\\n\", argv[i]); printUsage(argv[0]); }
+            MPI_Finalize(); return 1;
+        }
+    }
+    const uint64_t square = static_cast<uint64_t>(numRows) * numRows;
+    if ("'!numRows || !sparsity || square > std::numeric_limits<index_t>::max()) {
+        if (!rank) fprintf(stderr, "Matrix dimension and sparsity must be positive, and dimension squared must fit in 32 bits.'"\\n\");
+        MPI_Finalize(); return 1;
+    }
+    const index_t nItems = static_cast<index_t>(square / sparsity);
+    if ("'!rank) {
+        printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark'"\\n\");
+        printf(\"Matrix size: %u x %u\\n\", numRows, numRows);
+        printf(\"Sparsity: 1 out of %u entries is non-zero\\n\", sparsity);
+        printf(\"Non-zero elements: %u (%.2f%% sparse)\\n\", nItems, 100.0 * (1.0 - static_cast<double>(nItems) / square));
+        printf(\"Iterations: %u\\nMax value: %.2f\\nValidation: %s\\n\", iterations, maxVal, validate ? \"enabled\" : \"disabled\");
+        printf(\"Initializing data structures...\\n\");
+    }
+
+    // Local rank selects the GPU, respecting CUDA_VISIBLE_DEVICES and per-rank masks.
+    MPI_Comm localComm;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &localComm);
+    int localRank, deviceCount;
+    MPI_Comm_rank(localComm, &localRank);
+    CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+    if (deviceCount == 0) {
+        fprintf(stderr, \"Rank %d: no CUDA device available\\n\", rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    CUDA_CHECK(cudaSetDevice(localRank % deviceCount));
+    MPI_Comm_free(&localComm);
+
+    const index_t rowBegin = row_boundary(numRows, rank, size);
+    const index_t rowEnd = row_boundary(numRows, rank + 1, size);
+    const index_t localRows = rowEnd - rowBegin;
+    std::vector<double> vec(numRows), vals;
+    std::vector<index_t> cols, rows(static_cast<size_t>(localRows) + 1);
+    if ("'!rank) {
+        std::vector<double> allVals(nItems);
+        std::vector<index_t> allCols(nItems), allRows(static_cast<size_t>(numRows) + 1);
+        fill(vec.data(), numRows, maxVal);
+        fill(allVals.data(), nItems, maxVal);
+        initRandomMatrix(allCols.data(), allRows.data(), nItems, numRows);
+        for (int p = 1; p < size; ++p) {
+            const index_t begin = row_boundary(numRows, p, size);
+            const index_t end = row_boundary(numRows, p + 1, size);
+            const index_t base = allRows[begin], count = allRows[end] - base;
+            MPI_Send(&count, 1, MPI_UINT32_T, p, 0, MPI_COMM_WORLD);
+            send_array(allRows.data() + begin, static_cast<uint64_t>(end - begin) + 1, MPI_UINT32_T, p, 1);
+            if (count) {
+                send_array(allCols.data() + base, count, MPI_UINT32_T, p, 2);
+                send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+            }
+        }
+        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+        std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+        cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+        vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+        (void)count;
+    } else {
+        index_t count;
+        MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        recv_array(rows.data(), static_cast<uint64_t>(localRows) + 1, MPI_UINT32_T, 0, 1);
+        cols.resize(count); vals.resize(count);
+        if (count) {
+            recv_array(cols.data(), count, MPI_UINT32_T, 0, 2);
+            recv_array(vals.data(), count, MPI_DOUBLE, 0, 3);
+        }
+    }
+    broadcast_array(vec.data(), numRows, MPI_DOUBLE);
+    const index_t base = rows[0];
+    #pragma omp parallel for schedule(static) if(localRows > 4096)
+    for (uint64_t i = 0; i <= localRows; ++i) rows[i] -= base;
+
+    std::vector<double> reference;
+    if (validate) {
+        if (!rank) printf("Computing reference solution...'"\\n\");
+        reference.resize(localRows);
+        #pragma omp parallel for schedule(static) if(localRows > 256)
+        for (uint64_t i = 0; i < localRows; ++i) {
+            double sum = 0.0;
+            for (index_t j = rows[i]; j < rows[i + 1]; ++j) sum += vals[j] * vec[cols[j]];
+            reference[i] = sum;
+        }
+    }
+
+    double *dVals = nullptr, *dVec = nullptr, *dOut = nullptr;
+    index_t *dCols = nullptr, *dRows = nullptr;
+    if (localRows) {
+        CUDA_CHECK(cudaMalloc(&dRows, rows.size() * sizeof(index_t)));
+        CUDA_CHECK(cudaMalloc(&dVec, vec.size() * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&dOut, static_cast<size_t>(localRows) * sizeof(double)));
+        if ("'!vals.empty()) {
+            CUDA_CHECK(cudaMalloc(&dVals, vals.size() * sizeof(double)));
+            CUDA_CHECK(cudaMalloc(&dCols, cols.size() * sizeof(index_t)));
+            CUDA_CHECK(cudaMemcpy(dVals, vals.data(), vals.size() * sizeof(double), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(dCols, cols.data(), cols.size() * sizeof(index_t), cudaMemcpyHostToDevice));
+        }
+        CUDA_CHECK(cudaMemcpy(dRows, rows.data(), rows.size() * sizeof(index_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dVec, vec.data(), vec.size() * sizeof(double), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    if (!rank) printf("Computing SpMV...'"\\n\");
+    MPI_Barrier(MPI_COMM_WORLD);
+    const double start = MPI_Wtime();
+    if (localRows) {
+        constexpr unsigned threads = 256;
+        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+        for (index_t iter = 0; iter < iterations; ++iter) {
+            if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+            else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    const double elapsed = MPI_Wtime() - start;
+    double duration = 0;
+    MPI_Reduce(&elapsed, &duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    if ("'!rank) {
+        printf("Computation time: %ld ms'"\\n\", static_cast<long>(duration * 1000.0));
+        printf(\"Average time per iteration: %.3f ms\\n\", iterations ? duration * 1000.0 / iterations : 0.0);
+        printf(\"Performance: %.3f GFLOPS\\n\", duration > 0 ? 2.0 * nItems * iterations / duration / 1e9 : 0.0);
+    }
+    std::vector<double> out(localRows, 0.0);
+    if (localRows && (validate || printResults))
+        CUDA_CHECK(cudaMemcpy(out.data(), dOut, out.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    if (printResults) {
+        if ("'!rank) {
+            std::vector<double> allOut(numRows);
+            std::copy(out.begin(), out.end(), allOut.begin() + rowBegin);
+            for (int p = 1; p < size; ++p) {
+                const index_t begin = row_boundary(numRows, p, size), end = row_boundary(numRows, p + 1, size);
+                recv_array(allOut.data() + begin, end - begin, MPI_DOUBLE, p, 4);
+            }
+            print_results(allOut, "OutputVector");
+        } else send_array(out.data(), localRows, MPI_DOUBLE, 0, 4);
+    }
+    int valid = 1;
+    if (validate) {
+        if (!rank) printf("Validating result...'"\\n\");
+        for (index_t i = 0; i < localRows; ++i) {
+            const double ref = reference[i], res = out[i];
+            const bool bad = std::abs(ref) < 1e-10 ? std::abs(res) > MAX_RELATIVE_ERROR
+                              : std::abs((res - ref) / ref) > MAX_RELATIVE_ERROR;
+            if (bad) {
+                printf(\"Validation failed at index %u: reference %.10e, got %.10e\\n\", rowBegin + i, ref, res);
+                valid = 0; break;
+            }
+        }
+        int allValid;
+        MPI_Allreduce(&valid, &allValid, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        valid = allValid;
+        if ("'!rank) printf("Validation: %s'"\\n\", valid ? \"PASSED\" : \"FAILED\");
+    }
+    if (dVals) CUDA_CHECK(cudaFree(dVals));
+    if (dCols) CUDA_CHECK(cudaFree(dCols));
+    if (dRows) CUDA_CHECK(cudaFree(dRows));
+    if (dVec) CUDA_CHECK(cudaFree(dVec));
+    if (dOut) CUDA_CHECK(cudaFree(dOut));
+    MPI_Finalize();
+    return valid ? 0 : 1;
+}
+EOF
+cmake -S spmv -B /tmp/spmv-hybrid-build -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/spmv-hybrid-build -j 4" in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+ succeeded in 13996ms:
+-- The CXX compiler identification is GNU 13.2.0
+-- The CUDA compiler identification is NVIDIA 12.0.140
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Found OpenMP_CXX: -fopenmp (found version "4.5")
+-- Found OpenMP: TRUE (found version "4.5") found components: CXX
+-- Configuring done (9.9s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/spmv-hybrid-build
+[ 50%] Building CUDA object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CUDA executable spmv
+[100%] Built target spmv
+
+codex
+The hybrid implementation builds successfully. I’m checking single- and multi-rank runs now, including sparse and dense matrices, ranks with no assigned rows, and the original validation behavior.
+exec
+/bin/bash -lc 'git status --short && git show HEAD:spmv/spmv.cpp > /tmp/spmv-original.cpp' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+ exited 128 in 0ms:
+fatal: not a git repository (or any parent up to mount point /home/llmtest/evals/20261102-030935)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+
+exec
+/bin/bash -lc 'OMP_NUM_THREADS=2 /tmp/spmv-hybrid-build/spmv -n 1024 -v -r' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+exec
+/bin/bash -lc 'OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 OMP_NUM_THREADS=2 mpirun --oversubscribe -np 4 /tmp/spmv-hybrid-build/spmv -n 1024 -v -r' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+ succeeded in 5008ms:
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 1024 x 1024
+Sparsity: 1 out of 10 entries is non-zero
+Non-zero elements: 104857 (90.00% sparse)
+Iterations: 10
+Max value: 1.00
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 56 ms
+Average time per iteration: 5.661 ms
+Performance: 0.037 GFLOPS
+=== RESULTS ===
+Name: OutputVector
+Elements: 1024
+Sum: 2.64923178037303951e+04
+Min: 1.61287140372775610e+01
+Max: 1.37070805085584823e+02
+Sample[0]: 2.77651784395352621e+01
+Sample[256]: 2.12393609971005688e+01
+Sample[512]: 2.79785828840587527e+01
+Sample[768]: 2.85371971652506247e+01
+Sample[1023]: 1.37070805085584823e+02
+Hash: 4b5b7eedfc14b4c6
+=== END RESULTS ===
+Validating result...
+Validation: PASSED
+
+ succeeded in 5717ms:
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 1024 x 1024
+Sparsity: 1 out of 10 entries is non-zero
+Non-zero elements: 104857 (90.00% sparse)
+Iterations: 10
+Max value: 1.00
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 0 ms
+Average time per iteration: 0.039 ms
+Performance: 5.436 GFLOPS
+=== RESULTS ===
+Name: OutputVector
+Elements: 1024
+Sum: 2.64923178037303951e+04
+Min: 1.61287140372775610e+01
+Max: 1.37070805085584823e+02
+Sample[0]: 2.77651784395352621e+01
+Sample[256]: 2.12393609971005688e+01
+Sample[512]: 2.79785828840587527e+01
+Sample[768]: 2.85371971652506247e+01
+Sample[1023]: 1.37070805085584823e+02
+Hash: 4b5b7eedfc14b4c6
+=== END RESULTS ===
+Validating result...
+Validation: PASSED
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1/spmv/spmv.cpp
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..13c408048bce2df688c3a619f215224e194d8105
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -190,11 +190,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +237,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..13c408048bce2df688c3a619f215224e194d8105
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -190,11 +190,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +237,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+exec
+/bin/bash -lc 'cmake --build /tmp/spmv-hybrid-build -j 4' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..13c408048bce2df688c3a619f215224e194d8105
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -190,11 +190,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +237,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+ succeeded in 4052ms:
+[ 50%] Building CUDA object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CUDA executable spmv
+[100%] Built target spmv
+
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..13c408048bce2df688c3a619f215224e194d8105
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -190,11 +190,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +237,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+exec
+/bin/bash -lc 'OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 OMP_NUM_THREADS=2 mpirun --oversubscribe -np 4 /tmp/spmv-hybrid-build/spmv -n 3 -s 1 -v -r' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+exec
+/bin/bash -lc 'OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 OMP_NUM_THREADS=2 mpirun --oversubscribe -np 2 /tmp/spmv-hybrid-build/spmv -n 256 -s 1000000 -v -r' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+exec
+/bin/bash -lc 'OMP_NUM_THREADS=2 /tmp/spmv-hybrid-build/spmv -n 2048 -s 1024 -v -r' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+exec
+/bin/bash -lc 'OMP_NUM_THREADS=2 /tmp/spmv-hybrid-build/spmv -n 64 -i 0 -r' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..13c408048bce2df688c3a619f215224e194d8105
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -190,11 +190,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +237,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+ succeeded in 4817ms:
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 64 x 64
+Sparsity: 1 out of 10 entries is non-zero
+Non-zero elements: 409 (90.01% sparse)
+Iterations: 0
+Max value: 1.00
+Validation: disabled
+Initializing data structures...
+Computing SpMV...
+Computation time: 0 ms
+Average time per iteration: 0.000 ms
+Performance: 0.000 GFLOPS
+=== RESULTS ===
+Name: OutputVector
+Elements: 64
+Sum: 0.00000000000000000e+00
+Min: 0.00000000000000000e+00
+Max: 0.00000000000000000e+00
+Sample[0]: 0.00000000000000000e+00
+Sample[16]: 0.00000000000000000e+00
+Sample[32]: 0.00000000000000000e+00
+Sample[48]: 0.00000000000000000e+00
+Sample[63]: 0.00000000000000000e+00
+Hash: 7da144b97d054b25
+=== END RESULTS ===
+
+ succeeded in 6182ms:
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 2048 x 2048
+Sparsity: 1 out of 1024 entries is non-zero
+Non-zero elements: 4096 (99.90% sparse)
+Iterations: 10
+Max value: 1.00
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 0 ms
+Average time per iteration: 0.006 ms
+Performance: 1.369 GFLOPS
+=== RESULTS ===
+Name: OutputVector
+Elements: 2048
+Sum: 1.02564961469910077e+03
+Min: 0.00000000000000000e+00
+Max: 5.33334880218116858e+00
+Sample[0]: 1.01446813592799383e-02
+Sample[512]: 8.14441288858083617e-02
+Sample[1024]: 7.14383845318999233e-01
+Sample[1536]: 8.11089783563890498e-01
+Sample[2047]: 5.33334880218116858e+00
+Hash: 98bedc15ca2ab083
+=== END RESULTS ===
+Validating result...
+Validation: PASSED
+
+ succeeded in 7028ms:
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 256 x 256
+Sparsity: 1 out of 1000000 entries is non-zero
+Non-zero elements: 0 (100.00% sparse)
+Iterations: 10
+Max value: 1.00
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 0 ms
+Average time per iteration: 0.004 ms
+Performance: 0.000 GFLOPS
+=== RESULTS ===
+Name: OutputVector
+Elements: 256
+Sum: 0.00000000000000000e+00
+Min: 0.00000000000000000e+00
+Max: 0.00000000000000000e+00
+Sample[0]: 0.00000000000000000e+00
+Sample[64]: 0.00000000000000000e+00
+Sample[128]: 0.00000000000000000e+00
+Sample[192]: 0.00000000000000000e+00
+Sample[255]: 0.00000000000000000e+00
+Hash: 28c31cf8df2ec325
+=== END RESULTS ===
+Validating result...
+Validation: PASSED
+
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..13c408048bce2df688c3a619f215224e194d8105
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -190,11 +190,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +237,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+ succeeded in 7274ms:
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 3 x 3
+Sparsity: 1 out of 1 entries is non-zero
+Non-zero elements: 9 (0.00% sparse)
+Iterations: 10
+Max value: 1.00
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 0 ms
+Average time per iteration: 0.005 ms
+Performance: 0.004 GFLOPS
+=== RESULTS ===
+Name: OutputVector
+Elements: 3
+Sum: 3.13341615375786997e+00
+Min: 8.02151837596053685e-01
+Max: 1.18507998510360113e+00
+Sample[0]: 1.18507998510360113e+00
+Sample[0]: 1.18507998510360113e+00
+Sample[1]: 8.02151837596053685e-01
+Sample[2]: 1.14618433105821538e+00
+Sample[2]: 1.14618433105821538e+00
+Hash: f6892e34a15c7c67
+=== END RESULTS ===
+Validating result...
+Validation: PASSED
+
+codex
+The results match across one and four MPI ranks, and validation passes for dense, very sparse, and empty matrices. I also moved CUDA’s first kernel launch outside the timed section so module loading does not distort the benchmark.
+exec
+/bin/bash -lc 'OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 OMP_NUM_THREADS=2 mpirun --oversubscribe -np 4 /tmp/spmv-hybrid-build/spmv -n 2048 -s 2 -i 30 -m 2.5 -v' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+exec
+/bin/bash -lc '/tmp/spmv-hybrid-build/spmv -h' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+exec
+/bin/bash -lc 'OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 OMP_NUM_THREADS=2 mpirun --oversubscribe -np 2 /tmp/spmv-hybrid-build/spmv -n 1024 -i 0 -v' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..13c408048bce2df688c3a619f215224e194d8105
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -190,11 +190,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +237,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+ succeeded in 3943ms:
+Usage: /tmp/spmv-hybrid-build/spmv [options]
+Options:
+  -n <num>     Number of rows/columns in the matrix (default: 1024)
+  -s <num>     Sparsity: 1 out of N entries is non-zero (default: 10)
+  -i <num>     Number of iterations (default: 10)
+  -m <val>     Maximum value for matrix and vector elements (default: 1.0)
+  -v           Enable validation
+  -r           Print results for external validation
+  -h           Show this help message
+
+ succeeded in 6462ms:
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 2048 x 2048
+Sparsity: 1 out of 2 entries is non-zero
+Non-zero elements: 2097152 (50.00% sparse)
+Iterations: 30
+Max value: 2.50
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 0 ms
+Average time per iteration: 0.012 ms
+Performance: 339.768 GFLOPS
+Validating result...
+Validation: PASSED
+
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..13c408048bce2df688c3a619f215224e194d8105
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -190,11 +190,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +237,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+ exited 1 in 7343ms:
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 1024 x 1024
+Sparsity: 1 out of 10 entries is non-zero
+Non-zero elements: 104857 (90.00% sparse)
+Iterations: 0
+Max value: 1.00
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 0 ms
+Average time per iteration: 0.000 ms
+Performance: 0.000 GFLOPS
+Validation failed at index 512: reference 2.7978582884e+01, got 0.0000000000e+00
+Validating result...
+Validation failed at index 0: reference 2.7765178440e+01, got 0.0000000000e+00
+Validation: FAILED
+--------------------------------------------------------------------------
+Primary job  terminated normally, but 1 process returned
+a non-zero exit code. Per user-direction, the job has been aborted.
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+mpirun detected that one or more processes exited with non-zero status, thus causing
+the job to be terminated. The first process to do so was:
+
+  Process name: [[35535,1],0]
+  Exit code:    1
+--------------------------------------------------------------------------
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1/spmv/spmv.cpp
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..18f1b8bb54e22fcc1600a9d22ffd7804e8a1d825
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -176,6 +176,9 @@
+     if (!rank) {
+         std::vector<double> allVals(nItems);
+         std::vector<index_t> allCols(nItems), allRows(static_cast<size_t>(numRows) + 1);
++        // MPI initialization may itself use rand(); the original program starts
++        // with the C library's default seed of 1.
++        srand(1);
+         fill(vec.data(), numRows, maxVal);
+         fill(allVals.data(), nItems, maxVal);
+         initRandomMatrix(allCols.data(), allRows.data(), nItems, numRows);
+@@ -190,11 +193,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +240,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..18f1b8bb54e22fcc1600a9d22ffd7804e8a1d825
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -176,6 +176,9 @@
+     if (!rank) {
+         std::vector<double> allVals(nItems);
+         std::vector<index_t> allCols(nItems), allRows(static_cast<size_t>(numRows) + 1);
++        // MPI initialization may itself use rand(); the original program starts
++        // with the C library's default seed of 1.
++        srand(1);
+         fill(vec.data(), numRows, maxVal);
+         fill(allVals.data(), nItems, maxVal);
+         initRandomMatrix(allCols.data(), allRows.data(), nItems, numRows);
+@@ -190,11 +193,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +240,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+exec
+/bin/bash -lc 'cmake --build /tmp/spmv-hybrid-build -j 4 && OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 OMP_NUM_THREADS=2 mpirun --oversubscribe -np 2 /tmp/spmv-hybrid-build/spmv -n 512 -v -r' in /home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..18f1b8bb54e22fcc1600a9d22ffd7804e8a1d825
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -176,6 +176,9 @@
+     if (!rank) {
+         std::vector<double> allVals(nItems);
+         std::vector<index_t> allCols(nItems), allRows(static_cast<size_t>(numRows) + 1);
++        // MPI initialization may itself use rand(); the original program starts
++        // with the C library's default seed of 1.
++        srand(1);
+         fill(vec.data(), numRows, maxVal);
+         fill(allVals.data(), nItems, maxVal);
+         initRandomMatrix(allCols.data(), allRows.data(), nItems, numRows);
+@@ -190,11 +193,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +240,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..18f1b8bb54e22fcc1600a9d22ffd7804e8a1d825
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -176,6 +176,9 @@
+     if (!rank) {
+         std::vector<double> allVals(nItems);
+         std::vector<index_t> allCols(nItems), allRows(static_cast<size_t>(numRows) + 1);
++        // MPI initialization may itself use rand(); the original program starts
++        // with the C library's default seed of 1.
++        srand(1);
+         fill(vec.data(), numRows, maxVal);
+         fill(allVals.data(), nItems, maxVal);
+         initRandomMatrix(allCols.data(), allRows.data(), nItems, numRows);
+@@ -190,11 +193,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +240,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+ succeeded in 9115ms:
+[ 50%] Building CUDA object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CUDA executable spmv
+[100%] Built target spmv
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 512 x 512
+Sparsity: 1 out of 10 entries is non-zero
+Non-zero elements: 26214 (90.00% sparse)
+Iterations: 10
+Max value: 1.00
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 0 ms
+Average time per iteration: 0.004 ms
+Performance: 12.036 GFLOPS
+=== RESULTS ===
+Name: OutputVector
+Elements: 512
+Sum: 6.57941865491099361e+03
+Min: 6.24760637615923287e+00
+Max: 3.67955694367896626e+01
+Sample[0]: 1.59901891543555834e+01
+Sample[128]: 1.19494869385989446e+01
+Sample[256]: 1.57117194504407465e+01
+Sample[384]: 1.60856231248436110e+01
+Sample[511]: 3.67955694367896626e+01
+Hash: 3675e081c00ddc30
+=== END RESULTS ===
+Validating result...
+Validation: PASSED
+
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..18f1b8bb54e22fcc1600a9d22ffd7804e8a1d825
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -176,6 +176,9 @@
+     if (!rank) {
+         std::vector<double> allVals(nItems);
+         std::vector<index_t> allCols(nItems), allRows(static_cast<size_t>(numRows) + 1);
++        // MPI initialization may itself use rand(); the original program starts
++        // with the C library's default seed of 1.
++        srand(1);
+         fill(vec.data(), numRows, maxVal);
+         fill(allVals.data(), nItems, maxVal);
+         initRandomMatrix(allCols.data(), allRows.data(), nItems, numRows);
+@@ -190,11 +193,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +240,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+codex
+Implemented the hybrid benchmark in the existing [spmv.cpp](/home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1/spmv/spmv.cpp) and updated [CMakeLists.txt](/home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1/spmv/CMakeLists.txt). The executable remains `spmv`.
+
+MPI distributes matrix rows across ranks, CUDA computes each rank’s SpMV on its assigned GPU, and OpenMP parallelizes host preparation and validation. The original deterministic matrix generation is preserved; it remains serial on rank 0, which can limit initialization scalability for large matrices.
+
+The build passed, as did validation with one, two, and four MPI ranks across dense, sparse, and empty matrices. Multi-node execution was not tested.
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 1db8f5b1b171d15ca3c246dd7834e220ed7838de..18f1b8bb54e22fcc1600a9d22ffd7804e8a1d825
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -176,6 +176,9 @@
+     if (!rank) {
+         std::vector<double> allVals(nItems);
+         std::vector<index_t> allCols(nItems), allRows(static_cast<size_t>(numRows) + 1);
++        // MPI initialization may itself use rand(); the original program starts
++        // with the C library's default seed of 1.
++        srand(1);
+         fill(vec.data(), numRows, maxVal);
+         fill(allVals.data(), nItems, maxVal);
+         initRandomMatrix(allCols.data(), allRows.data(), nItems, numRows);
+@@ -190,11 +193,9 @@
+                 send_array(allVals.data() + base, count, MPI_DOUBLE, p, 3);
+             }
+         }
+-        const index_t count = allRows[rowEnd] - allRows[rowBegin];
+         std::copy_n(allRows.data() + rowBegin, static_cast<size_t>(localRows) + 1, rows.data());
+         cols.assign(allCols.begin() + allRows[rowBegin], allCols.begin() + allRows[rowEnd]);
+         vals.assign(allVals.begin() + allRows[rowBegin], allVals.begin() + allRows[rowEnd]);
+-        (void)count;
+     } else {
+         index_t count;
+         MPI_Recv(&count, 1, MPI_UINT32_T, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+@@ -239,14 +240,21 @@
+         CUDA_CHECK(cudaMemset(dOut, 0, static_cast<size_t>(localRows) * sizeof(double)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    constexpr unsigned threads = 256;
++    const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
++    const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
++    const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
++    // Exclude first-launch module loading and JIT compilation from the benchmark.
++    if (localRows && iterations) {
++        if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
++        CUDA_CHECK(cudaGetLastError());
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
+     if (!rank) printf("Computing SpMV...\n");
+     MPI_Barrier(MPI_COMM_WORLD);
+     const double start = MPI_Wtime();
+     if (localRows) {
+-        constexpr unsigned threads = 256;
+-        const bool shortRows = vals.size() <= static_cast<uint64_t>(localRows) * 8;
+-        const uint64_t work = shortRows ? localRows : static_cast<uint64_t>(localRows) * 32;
+-        const unsigned blocks = static_cast<unsigned>(std::min<uint64_t>((work + threads - 1) / threads, 65535));
+         for (index_t iter = 0; iter < iterations; ++iter) {
+             if (shortRows) spmv_short<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+             else spmv_warp<<<blocks, threads>>>(dVals, dCols, dRows, dVec, localRows, dOut);
+
+tokens used
+24,386
+Implemented the hybrid benchmark in the existing [spmv.cpp](/home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1/spmv/spmv.cpp) and updated [CMakeLists.txt](/home/llmtest/evals/20261102-030935/spmv_gpt-6.1-terra-xhigh_hybrid_r1/spmv/CMakeLists.txt). The executable remains `spmv`.
+
+MPI distributes matrix rows across ranks, CUDA computes each rank’s SpMV on its assigned GPU, and OpenMP parallelizes host preparation and validation. The original deterministic matrix generation is preserved; it remains serial on rank 0, which can limit initialization scalability for large matrices.
+
+The build passed, as did validation with one, two, and four MPI ranks across dense, sparse, and empty matrices. Multi-node execution was not tested.

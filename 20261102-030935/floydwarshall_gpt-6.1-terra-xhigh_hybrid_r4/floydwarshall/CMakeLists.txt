@@ -1,0 +1,40 @@
+cmake_minimum_required(VERSION 3.18)
+# Respect a user-supplied architecture list. Otherwise build optimized code for
+# common accelerator generations plus PTX for forward compatibility.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
+    set(FLOYD_DEFAULT_CUDA_ARCHITECTURES ON)
+endif()
+project(floydwarshall_benchmark LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+find_package(MPI REQUIRED COMPONENTS CXX)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+
+# The existing source file contains both the host program and CUDA kernels.
+set_source_files_properties(floydwarshall.cpp PROPERTIES LANGUAGE CUDA)
+add_executable(floydwarshall floydwarshall.cpp)
+if(FLOYD_DEFAULT_CUDA_ARCHITECTURES)
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+        set(floyd_cuda_architectures 75-real 75-virtual 80-real 86-real 89-real 90-real)
+    else()
+        set(floyd_cuda_architectures 60-real 60-virtual 70-real 75-real)
+        if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.0)
+            list(APPEND floyd_cuda_architectures 80-real)
+        endif()
+        if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.1)
+            list(APPEND floyd_cuda_architectures 86-real)
+        endif()
+        if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.8)
+            list(APPEND floyd_cuda_architectures 89-real 90-real)
+        endif()
+    endif()
+    set(CMAKE_CUDA_ARCHITECTURES "${floyd_cuda_architectures}" CACHE STRING "CUDA architectures" FORCE)
+    set_property(TARGET floydwarshall PROPERTY CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+target_link_libraries(floydwarshall PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX)
+target_compile_options(floydwarshall PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;-Xcompiler=${OpenMP_CXX_FLAGS}>)
