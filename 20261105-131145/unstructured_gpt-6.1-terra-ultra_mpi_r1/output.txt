@@ -1,0 +1,1260 @@
+Reading additional input from stdin...
+OpenAI Codex v0.160.1
+--------
+workdir: /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+model: gpt-6.1-terra
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: ultra
+reasoning summaries: none
+session id: 01a1ac7c-831f-78e3-a125-f344549a61d4
+--------
+user
+Parallelize the unstructured benchmark code found in ./unstructured/ with MPI for distributed memory cluster parallelism. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the benchmark’s data flow and build setup, then divide the MPI implementation and correctness review across the existing files.
+exec
+/bin/bash -lc "pwd && rg --files -g '"'!*build*'"' -g '"'!*.git*'"' | head -100" in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 0ms:
+/home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+output.txt
+common/hash.hpp
+common/results_output.hpp
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+
+exec
+/bin/bash -lc 'cat unstructured/unstructured.cpp' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 0ms:
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+// Types to represent unstructured mesh elements
+using idx_t = uint64_t;
+using val_t = double;
+
+// Maximum number of connections per element (for a 2D grid: 4 neighbors)
+constexpr int MAX_CONNECTIONS = 8;
+
+// Material properties for energy transfer
+struct Material {
+    val_t transfer_coeff;  // Energy transfer coefficient
+    val_t external_flow;   // External energy source/sink
+};
+
+// Static connectivity information for each element
+struct ElementStatic {
+    idx_t material_idx;
+    idx_t num_connections;
+    idx_t connected_idx[MAX_CONNECTIONS];     // Indices of connected elements
+    val_t connected_flux[MAX_CONNECTIONS];    // Flux coefficients for each connection
+};
+
+// Dynamic state for each element
+struct ElementDynamic {
+    val_t current_energy;
+    val_t total_flux;
+};
+
+// World state
+struct World {
+    std::vector<Material> materials;
+    std::vector<ElementStatic> elements_static;
+    std::vector<ElementDynamic> elements_dynamic;
+    std::vector<ElementDynamic> elements_dynamic_swap;
+};
+
+// Material type IDs
+constexpr idx_t DEFAULT_MAT_ID = 0;
+constexpr idx_t INFLOW_MAT_ID = 1;
+constexpr idx_t OUTFLOW_MAT_ID = 2;
+
+// Build a 2D square grid as an unstructured mesh
+// This represents computation on arbitrarily-shaped geometries
+void buildSquare2D(World& world, const int n_elems_root) {
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    // Initialize materials
+    world.materials.emplace_back(Material{0.8, 0.0});    // Default material
+    world.materials.emplace_back(Material{0.8, 0.5});    // Inflow material
+    world.materials.emplace_back(Material{0.8, -0.5});   // Outflow material
+    
+    // Allocate elements
+    world.elements_static.resize(n_elems);
+    world.elements_dynamic.resize(n_elems);
+    world.elements_dynamic_swap.resize(n_elems);
+    
+    // Initialize all elements with default material and zero energy
+    for (int i = 0; i < n_elems; ++i) {
+        world.elements_static[i].material_idx = DEFAULT_MAT_ID;
+        world.elements_static[i].num_connections = 0;
+        world.elements_dynamic[i].current_energy = 0.0;
+        world.elements_dynamic[i].total_flux = 0.0;
+    }
+    
+    // Build connectivity: each element connects to its neighbors in 2D grid
+    for (int x = 0; x < n_elems_root; ++x) {
+        for (int y = 0; y < n_elems_root; ++y) {
+            const int idx = x * n_elems_root + y;
+            ElementStatic& elem = world.elements_static[idx];
+            
+            // Connect to neighbors (up, down, left, right)
+            const int offsets[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            
+            for (int n = 0; n < 4; ++n) {
+                const int nx = x + offsets[n][0];
+                const int ny = y + offsets[n][1];
+                
+                // Check if neighbor is within bounds
+                if (nx >= 0 && nx < n_elems_root && ny >= 0 && ny < n_elems_root) {
+                    const int neighbor_idx = nx * n_elems_root + ny;
+                    elem.connected_idx[elem.num_connections] = neighbor_idx;
+                    elem.connected_flux[elem.num_connections] = 1.0;
+                    elem.num_connections++;
+                }
+            }
+        }
+    }
+    
+    // Set corner elements as inflow/outflow to create interesting dynamics
+    const int last = n_elems_root - 1;
+    world.elements_static[0 * n_elems_root + 0].material_idx = INFLOW_MAT_ID;
+    world.elements_static[0 * n_elems_root + last].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + 0].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + last].material_idx = INFLOW_MAT_ID;
+}
+
+// Compute energy flux between two elements
+inline val_t computeFlux(const Material& mat, const ElementDynamic& this_elem,
+                        val_t connection_flux, const ElementDynamic& other_elem) {
+    return (other_elem.current_energy - this_elem.current_energy) * 
+           mat.transfer_coeff * connection_flux * 0.25;
+}
+
+// Run simulation for n_iters iterations
+void runSimulation(World& world, const int n_iters) {
+    const size_t n_elems = world.elements_static.size();
+    
+    for (int iter = 0; iter < n_iters; ++iter) {
+        // Update all elements
+        for (size_t i = 0; i < n_elems; ++i) {
+            const ElementStatic& elem_static = world.elements_static[i];
+            const ElementDynamic& elem_dyn = world.elements_dynamic[i];
+            const Material& mat = world.materials[elem_static.material_idx];
+            
+            // Start with external flow
+            val_t total_flux = mat.external_flow;
+            
+            // Add flux from all connected elements
+            for (idx_t j = 0; j < elem_static.num_connections; ++j) {
+                const idx_t neighbor_idx = elem_static.connected_idx[j];
+                const ElementDynamic& neighbor_dyn = world.elements_dynamic[neighbor_idx];
+                total_flux += computeFlux(mat, elem_dyn, elem_static.connected_flux[j], neighbor_dyn);
+            }
+            
+            // Update element state
+            ElementDynamic& elem_write = world.elements_dynamic_swap[i];
+            elem_write.current_energy = elem_dyn.current_energy + total_flux;
+            elem_write.total_flux = elem_dyn.total_flux + std::abs(total_flux);
+        }
+        
+        // Swap buffers
+        std::swap(world.elements_dynamic, world.elements_dynamic_swap);
+    }
+}
+
+// Validate simulation results
+bool validateResults(const World& world) {
+    val_t energy_sum = 0.0;
+    val_t flux_sum = 0.0;
+    val_t energy_max = std::numeric_limits<val_t>::lowest();
+    val_t energy_min = std::numeric_limits<val_t>::max();
+    
+    for (const auto& elem : world.elements_dynamic) {
+        energy_sum += elem.current_energy;
+        flux_sum += elem.total_flux;
+        energy_max = std::max(elem.current_energy, energy_max);
+        energy_min = std::min(elem.current_energy, energy_min);
+    }
+    
+    printf("Validation results:\n");
+    printf("  Energy sum: %.12f\n", energy_sum);
+    printf("  Flux sum: %.2f\n", flux_sum);
+    printf("  Energy range: [%.6f, %.6f]\n", energy_min, energy_max);
+    
+    // Check for numerical issues
+    constexpr val_t energy_epsilon = 1e-8;
+    
+    if (!std::isfinite(energy_sum)) {
+        printf("  ERROR: Energy sum is not finite\n");
+        return false;
+    }
+    
+    if (std::abs(energy_sum) > energy_epsilon) {
+        printf("  WARNING: Energy sum diverged from 0 (expected conservation)\n");
+        // Don't fail validation as this can happen with external flows
+    }
+    
+    if (!std::isfinite(flux_sum)) {
+        printf("  ERROR: Flux sum is not finite\n");
+        return false;
+    }
+    
+    if (!std::isfinite(energy_max) || !std::isfinite(energy_min)) {
+        printf("  ERROR: Energy extrema are not finite\n");
+        return false;
+    }
+    
+    printf("  Validation: PASSED\n");
+    return true;
+}
+
+// Compute a simple hash of the results for verification
+uint64_t computeHash(const std::vector<ElementDynamic>& elements) {
+    uint64_t hash = 0;
+    for (size_t i = 0; i < elements.size(); ++i) {
+        // Simple hash combining energy and flux values
+        const uint64_t* e_ptr = reinterpret_cast<const uint64_t*>(&elements[i].current_energy);
+        const uint64_t* f_ptr = reinterpret_cast<const uint64_t*>(&elements[i].total_flux);
+        hash ^= (*e_ptr + i) * 0x9e3779b97f4a7c15ULL;
+        hash ^= (*f_ptr + i) * 0xbf58476d1ce4e5b9ULL;
+    }
+    return hash;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Grid size (NxN elements) (default: 512)\n");
+    printf("  -i <num>     Number of simulation iterations (default: 10)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    int n_elems_root = 512;
+    int n_iters = 10;
+    bool validate = false;
+    bool printResults = false;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            n_elems_root = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            n_iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+    
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    printf("Unstructured Mesh Energy Transfer Benchmark\n");
+    printf("============================================\n");
+    printf("Grid size: %d x %d = %d elements\n", n_elems_root, n_elems_root, n_elems);
+    printf("Iterations: %d\n", n_iters);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    printf("\n");
+    
+    // Build the unstructured mesh
+    printf("Building unstructured mesh...\n");
+    World world;
+    buildSquare2D(world, n_elems_root);
+    
+    // Calculate memory usage
+    const size_t static_mem = world.elements_static.size() * sizeof(ElementStatic);
+    const size_t dynamic_mem = world.elements_dynamic.size() * sizeof(ElementDynamic) * 2;
+    const size_t total_mem = static_mem + dynamic_mem;
+    printf("Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\n",
+           total_mem / (1024.0 * 1024.0),
+           static_mem / (1024.0 * 1024.0),
+           dynamic_mem / (1024.0 * 1024.0));
+    printf("\n");
+    
+    // Run simulation
+    printf("Running simulation...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    runSimulation(world, n_iters);
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    
+    printf("Computation time: %ld ms\n", duration_ms);
+    
+    // Calculate performance metrics
+    const int n_measured_iters = std::max(n_iters - 1, 1);
+    const double time_per_iter = static_cast<double>(duration_ms) / n_measured_iters;
+    const double giga_elems_per_sec = (n_measured_iters * n_elems) / (duration_ms / 1000.0) / 1e9;
+    
+    // Approximate FLOPS: ~22 FLOPS per element per iteration (from reference)
+    const double gflops = giga_elems_per_sec * 22.0;
+    
+    printf("Performance:\n");
+    printf("  Time per iteration: %.4f ms\n", time_per_iter);
+    printf("  Elements/sec: %.4f GigaElements/s\n", giga_elems_per_sec);
+    printf("  Performance: %.4f GFLOPS\n", gflops);
+    
+    // Compute hash for verification
+    const uint64_t hash = computeHash(world.elements_dynamic);
+    printf("  Result hash: %016lX\n", hash);
+    printf("\n");
+    
+    // Print results for external validation
+    if (printResults) {
+        std::vector<double> energyData;
+        energyData.reserve(world.elements_dynamic.size());
+        for (const auto& elem : world.elements_dynamic) {
+            energyData.push_back(elem.current_energy);
+        }
+        print_results(energyData, "ElementEnergy");
+    }
+    
+    // Validation
+    if (validate) {
+        bool valid = validateResults(world);
+        if (!valid) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+exec
+/bin/bash -lc 'cat output.txt && ls -la && command -v mpicxx || true && command -v mpirun || true' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 0ms:
+Reading additional input from stdin...
+OpenAI Codex v0.160.1
+--------
+workdir: /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+model: gpt-6.1-terra
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: ultra
+reasoning summaries: none
+session id: 01a1ac7c-831f-78e3-a125-f344549a61d4
+--------
+user
+Parallelize the unstructured benchmark code found in ./unstructured/ with MPI for distributed memory cluster parallelism. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the benchmark’s data flow and build setup, then divide the MPI implementation and correctness review across the existing files.
+exec
+/bin/bash -lc "pwd && rg --files -g '"'!*build*'"' -g '"'!*.git*'"' | head -100" in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 0ms:
+/home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+output.txt
+common/hash.hpp
+common/results_output.hpp
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+
+total 8
+drwxrwxrwx 4 nobody  nogroup   74 Nov  5 17:13 .
+drwx------ 3 llmtest users   4096 Nov  5 17:13 ..
+drwxrwxrwx 2 nobody  nogroup   60 Nov  5 17:13 common
+-rw-r--r-- 1 llmtest users   1415 Nov  5 17:13 output.txt
+drwxrwxrwx 2 nobody  nogroup   64 Nov  5 17:13 unstructured
+/usr/bin/mpicxx
+/usr/bin/mpirun
+
+exec
+/bin/bash -lc 'cat unstructured/CMakeLists.txt && cat common/results_output.hpp && cat common/hash.hpp' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 0ms:
+cmake_minimum_required(VERSION 3.10)
+project(unstructured_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(unstructured unstructured.cpp)
+
+# Enable optimizations
+target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link math library
+target_link_libraries(unstructured m)
+#pragma once
+
+#include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+#include "hash.hpp"
+
+// Kahan summation for numerically stable sum
+template <typename T>
+T kahan_sum(const std::vector<T>& data) {
+    T sum = 0.0;
+    T c = 0.0;
+    for (const auto& val : data) {
+        T y = val - c;
+        T t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    return sum;
+}
+
+// Print results for floating-point arrays
+template <typename T>
+void print_results(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute statistics
+    T sum = kahan_sum(data);
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Sum: %.17e\n", static_cast<double>(sum));
+    printf("Min: %.17e\n", static_cast<double>(min_val));
+    printf("Max: %.17e\n", static_cast<double>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %.17e\n", indices[i], static_cast<double>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+// Print results for integer arrays (uses exact hash comparison)
+template <typename T>
+void print_results_int(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Compute min/max
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Min: %lld\n", static_cast<long long>(min_val));
+    printf("Max: %lld\n", static_cast<long long>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %lld\n", indices[i], static_cast<long long>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+#pragma once
+
+#include <cstdint>
+
+// FNV-1a hash, 64 bit length
+class hash {
+  public:
+	using digest = uint64_t;
+
+	template <typename T>
+	void add(const T& value) {
+		const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&value);
+		for(size_t i = 0; i < sizeof(T); ++i) {
+			d = (d ^ bytes[i]) * 0x100000001b3ull;
+		}
+	}
+
+	digest get() const { return d; }
+
+  private:
+	digest d = 0xcbf29ce484222325ull;
+};
+
+exec
+/bin/bash -lc 'git status --short && git show HEAD:unstructured/unstructured.cpp > /tmp/unstructured_original.cpp && g++ -O3 -march=native -std=c++20 -I unstructured /tmp/unstructured_original.cpp -o /tmp/unstructured_serial' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ exited 128 in 0ms:
+fatal: not a git repository (or any parent up to mount point /home/llmtest/evals/20261105-131145)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+
+exec
+/bin/bash -lc 'cp unstructured/unstructured.cpp /tmp/unstructured_original.cpp && g++ -O3 -march=native -std=c++20 -I unstructured /tmp/unstructured_original.cpp -o /tmp/unstructured_serial' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 2359ms:
+codex
+The simulation is a synchronous neighbor update, so each rank only needs boundary energy values from the previous iteration. I’m checking that the distributed version preserves neighbor ordering, global result hashes, and the original output semantics.
+exec
+/bin/bash -lc '/tmp/unstructured_serial -n 8 -i 10 -v -r' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 0ms:
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 8 x 8 = 64 elements
+Iterations: 10
+Validation: enabled
+
+Building unstructured mesh...
+Memory usage: 0.01 MB (static: 0.01 MB, dynamic: 0.00 MB)
+
+Running simulation...
+Computation time: 0 ms
+Performance:
+  Time per iteration: 0.0000 ms
+  Elements/sec: inf GigaElements/s
+  Performance: inf GFLOPS
+  Result hash: 89C26C90BD597C50
+
+=== RESULTS ===
+Name: ElementEnergy
+Elements: 64
+Sum: 0.00000000000000000e+00
+Min: -1.80791603200000006e+00
+Max: 1.80791603200000006e+00
+Sample[0]: 1.80791603200000006e+00
+Sample[16]: 2.60484095999999998e-01
+Sample[32]: -6.13237760000000034e-02
+Sample[48]: -7.28518911999999963e-01
+Sample[63]: 1.80791603200000006e+00
+Hash: 620572c5abb73235
+=== END RESULTS ===
+Validation results:
+  Energy sum: -0.000000000000
+  Flux sum: 19.17
+  Energy range: [-1.807916, 1.807916]
+  Validation: PASSED
+
+2026-11-05T16:13:59.967235Z ERROR codex_core::tools::router: error=collab spawn failed: agent thread limit reached
+exec
+/bin/bash -lc 'cat unstructured/CMakeLists.txt && wc -l unstructured/unstructured.cpp' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 0ms:
+cmake_minimum_required(VERSION 3.10)
+project(unstructured_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(MPI REQUIRED COMPONENTS CXX)
+
+add_executable(unstructured unstructured.cpp)
+
+# Enable optimizations
+target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link MPI and the math library.
+target_link_libraries(unstructured PRIVATE MPI::MPI_CXX m)
+314 unstructured/unstructured.cpp
+
+codex
+The build now requires MPI and retains the existing executable name. The implementation is using distributed element ownership and exchanging only the remote energies needed by each rank; I’m preparing comparisons against the original serial program across uneven partitions and small grids.
+exec
+/bin/bash -lc 'wc -l unstructured/unstructured.cpp && ls -l unstructured' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 0ms:
+314 unstructured/unstructured.cpp
+total 16
+-rwxrwxrwx 1 nobody nogroup   417 Nov  5 17:13 CMakeLists.txt
+-rwxrwxrwx 1 nobody nogroup 11717 Nov  5 17:13 unstructured.cpp
+
+collab: Wait
+exec
+/bin/bash -lc 'wc -l unstructured/unstructured.cpp' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 0ms:
+314 unstructured/unstructured.cpp
+
+collab: Wait
+codex
+The serial reference is built, and the comparison will cover both state hashes and the ordered external-validation output. I’m also reviewing the communication setup for ranks that own very few or no elements.
+collab: Wait
+exec
+/bin/bash -lc 'cat unstructured/unstructured.cpp' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 0ms:
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
+#include <mpi.h>
+
+#include "../common/results_output.hpp"
+
+using idx_t = uint64_t;
+using val_t = double;
+constexpr int MAX_CONNECTIONS = 8;
+
+struct Material {
+    val_t transfer_coeff;
+    val_t external_flow;
+};
+struct ElementStatic {
+    idx_t material_idx;
+    idx_t num_connections;
+    idx_t connected_idx[MAX_CONNECTIONS];
+    val_t connected_flux[MAX_CONNECTIONS];
+};
+struct ElementDynamic {
+    val_t current_energy;
+    val_t total_flux;
+};
+struct World {
+    std::vector<Material> materials;
+    std::vector<ElementStatic> elements_static;
+    // The elements following the owned range are halo entries. Only their energy is used.
+    std::vector<ElementDynamic> elements_dynamic;
+    std::vector<ElementDynamic> elements_dynamic_swap;
+    idx_t global_begin = 0;
+    std::vector<int> recv_counts, recv_displs, send_counts, send_displs;
+    std::vector<idx_t> send_indices;
+    std::vector<val_t> send_buffer;
+    std::vector<MPI_Datatype> recv_types;
+    std::vector<std::pair<size_t, size_t>> interior_ranges;
+    std::vector<size_t> boundary;
+};
+constexpr idx_t DEFAULT_MAT_ID = 0;
+constexpr idx_t INFLOW_MAT_ID = 1;
+constexpr idx_t OUTFLOW_MAT_ID = 2;
+
+// Contiguous ownership preserves global element order and also works when a
+// rank owns less than a complete row of the grid.
+static idx_t partitionBegin(idx_t total, int rank, int size) {
+    return (total / size) * rank + std::min<idx_t>(total % size, rank);
+}
+static int ownerOf(idx_t index, idx_t total, int size) {
+    const idx_t q = total / size, r = total % size;
+    const idx_t large_end = (q + 1) * r;
+    return index < large_end ? static_cast<int>(index / (q + 1))
+                             : static_cast<int>(r + (index - large_end) / q);
+}
+
+void buildSquare2D(World& world, int n, int rank, int size) {
+    const idx_t total = static_cast<idx_t>(n) * n;
+    const idx_t begin = partitionBegin(total, rank, size);
+    const idx_t end = partitionBegin(total, rank + 1, size);
+    const size_t local = static_cast<size_t>(end - begin);
+    world.global_begin = begin;
+    world.materials = {{0.8, 0.0}, {0.8, 0.5}, {0.8, -0.5}};
+    world.elements_static.resize(local);
+    std::vector<std::vector<idx_t>> requests(size);
+    for (size_t i = 0; i < local; ++i) {
+        const idx_t global = begin + i;
+        const idx_t x = global / n, y = global % n;
+        ElementStatic& elem = world.elements_static[i];
+        elem.material_idx = DEFAULT_MAT_ID;
+        // Preserve the original assignment order, including the single-cell case.
+        if (x == 0 && y == 0) elem.material_idx = INFLOW_MAT_ID;
+        if (x == 0 && y == static_cast<idx_t>(n - 1)) elem.material_idx = OUTFLOW_MAT_ID;
+        if (x == static_cast<idx_t>(n - 1) && y == 0) elem.material_idx = OUTFLOW_MAT_ID;
+        if (x == static_cast<idx_t>(n - 1) && y == static_cast<idx_t>(n - 1)) elem.material_idx = INFLOW_MAT_ID;
+        elem.num_connections = 0;
+        auto add = [&](idx_t neighbor) {
+            elem.connected_idx[elem.num_connections] = neighbor;
+            elem.connected_flux[elem.num_connections++] = 1.0;
+            if (neighbor < begin || neighbor >= end)
+                requests[ownerOf(neighbor, total, size)].push_back(neighbor);
+        };
+        if (x + 1 < static_cast<idx_t>(n)) add(global + n);
+        if (x > 0) add(global - n);
+        if (y + 1 < static_cast<idx_t>(n)) add(global + 1);
+        if (y > 0) add(global - 1);
+    }
+    world.recv_counts.resize(size);
+    world.recv_displs.resize(size);
+    world.send_counts.resize(size);
+    world.send_displs.resize(size);
+    std::vector<idx_t> remote_indices;
+    for (int p = 0; p < size; ++p) {
+        auto& indices = requests[p];
+        std::sort(indices.begin(), indices.end());
+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+        world.recv_displs[p] = static_cast<int>(remote_indices.size());
+        world.recv_counts[p] = static_cast<int>(indices.size());
+        remote_indices.insert(remote_indices.end(), indices.begin(), indices.end());
+    }
+    MPI_Alltoall(world.recv_counts.data(), 1, MPI_INT, world.send_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+    int nsend = 0;
+    for (int p = 0; p < size; ++p) {
+        world.send_displs[p] = nsend;
+        nsend += world.send_counts[p];
+    }
+    world.send_indices.resize(nsend);
+    MPI_Alltoallv(remote_indices.data(), world.recv_counts.data(), world.recv_displs.data(), MPI_UINT64_T,
+                  world.send_indices.data(), world.send_counts.data(), world.send_displs.data(), MPI_UINT64_T,
+                  MPI_COMM_WORLD);
+    for (auto& index : world.send_indices) index -= begin;
+    world.send_buffer.resize(nsend);
+    world.elements_dynamic.resize(local + remote_indices.size());
+    world.elements_dynamic_swap.resize(local + remote_indices.size());
+    world.recv_types.resize(size, MPI_DATATYPE_NULL);
+    for (int p = 0; p < size; ++p) {
+        if (world.recv_counts[p]) {
+            // The receive lands directly in the energy fields of the halo slots.
+            MPI_Type_vector(world.recv_counts[p], 1, sizeof(ElementDynamic) / sizeof(val_t), MPI_DOUBLE,
+                            &world.recv_types[p]);
+            MPI_Type_commit(&world.recv_types[p]);
+        }
+    }
+    size_t range_start = 0;
+    for (size_t i = 0; i < local; ++i) {
+        auto& elem = world.elements_static[i];
+        bool boundary = false;
+        for (idx_t j = 0; j < elem.num_connections; ++j) {
+            const idx_t neighbor = elem.connected_idx[j];
+            if (neighbor >= begin && neighbor < end) {
+                elem.connected_idx[j] = neighbor - begin;
+            } else {
+                const int p = ownerOf(neighbor, total, size);
+                const auto& indices = requests[p];
+                const auto pos = std::lower_bound(indices.begin(), indices.end(), neighbor) - indices.begin();
+                elem.connected_idx[j] = local + world.recv_displs[p] + pos;
+                boundary = true;
+            }
+        }
+        if (boundary) {
+            if (range_start < i) world.interior_ranges.emplace_back(range_start, i);
+            world.boundary.push_back(i);
+            range_start = i + 1;
+        }
+    }
+    if (range_start < local) world.interior_ranges.emplace_back(range_start, local);
+}
+
+inline val_t computeFlux(const Material& mat, const ElementDynamic& this_elem,
+                        val_t connection_flux, const ElementDynamic& other_elem) {
+    return (other_elem.current_energy - this_elem.current_energy) *
+           mat.transfer_coeff * connection_flux * 0.25;
+}
+
+void runSimulation(World& world, int n_iters, int size) {
+    std::vector<MPI_Request> requests;
+    requests.reserve(2 * size);
+    const size_t local = world.elements_static.size();
+    auto update = [&](size_t i) {
+        const ElementStatic& elem_static = world.elements_static[i];
+        const ElementDynamic& elem_dyn = world.elements_dynamic[i];
+        const Material& mat = world.materials[elem_static.material_idx];
+        val_t total_flux = mat.external_flow;
+        for (idx_t j = 0; j < elem_static.num_connections; ++j) {
+            const ElementDynamic& neighbor_dyn = world.elements_dynamic[elem_static.connected_idx[j]];
+            total_flux += computeFlux(mat, elem_dyn, elem_static.connected_flux[j], neighbor_dyn);
+        }
+        ElementDynamic& elem_write = world.elements_dynamic_swap[i];
+        elem_write.current_energy = elem_dyn.current_energy + total_flux;
+        elem_write.total_flux = elem_dyn.total_flux + std::abs(total_flux);
+    };
+    for (int iter = 0; iter < n_iters; ++iter) {
+        requests.clear();
+        for (int p = 0; p < size; ++p) {
+            if (world.recv_counts[p]) {
+                MPI_Request req;
+                MPI_Irecv(&world.elements_dynamic[local + world.recv_displs[p]].current_energy,
+                          1, world.recv_types[p], p, 0, MPI_COMM_WORLD, &req);
+                requests.push_back(req);
+            }
+        }
+        for (size_t i = 0; i < world.send_indices.size(); ++i)
+            world.send_buffer[i] = world.elements_dynamic[world.send_indices[i]].current_energy;
+        for (int p = 0; p < size; ++p) {
+            if (world.send_counts[p]) {
+                MPI_Request req;
+                MPI_Isend(world.send_buffer.data() + world.send_displs[p], world.send_counts[p],
+                          MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &req);
+                requests.push_back(req);
+            }
+        }
+        for (const auto& range : world.interior_ranges)
+            for (size_t i = range.first; i < range.second; ++i) update(i);
+        if (!requests.empty()) MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+        for (size_t i : world.boundary) update(i);
+        std::swap(world.elements_dynamic, world.elements_dynamic_swap);
+    }
+}
+
+bool validateResults(const std::vector<ElementDynamic>& elements) {
+    val_t energy_sum = 0.0, flux_sum = 0.0;
+    val_t energy_max = std::numeric_limits<val_t>::lowest();
+    val_t energy_min = std::numeric_limits<val_t>::max();
+    for (const auto& elem : elements) {
+        energy_sum += elem.current_energy;
+        flux_sum += elem.total_flux;
+        energy_max = std::max(elem.current_energy, energy_max);
+        energy_min = std::min(elem.current_energy, energy_min);
+    }
+    printf("Validation results:\n");
+    printf("  Energy sum: %.12f\n", energy_sum);
+    printf("  Flux sum: %.2f\n", flux_sum);
+    printf("  Energy range: [%.6f, %.6f]\n", energy_min, energy_max);
+    if (!std::isfinite(energy_sum)) { printf("  ERROR: Energy sum is not finite\n"); return false; }
+    if (std::abs(energy_sum) > 1e-8)
+        printf("  WARNING: Energy sum diverged from 0 (expected conservation)\n");
+    if (!std::isfinite(flux_sum)) { printf("  ERROR: Flux sum is not finite\n"); return false; }
+    if (!std::isfinite(energy_max) || !std::isfinite(energy_min)) {
+        printf("  ERROR: Energy extrema are not finite\n"); return false;
+    }
+    printf("  Validation: PASSED\n");
+    return true;
+}
+
+uint64_t computeHash(const World& world) {
+    uint64_t hash = 0;
+    for (size_t i = 0; i < world.elements_static.size(); ++i) {
+        uint64_t energy, flux;
+        std::memcpy(&energy, &world.elements_dynamic[i].current_energy, sizeof(energy));
+        std::memcpy(&flux, &world.elements_dynamic[i].total_flux, sizeof(flux));
+        const uint64_t global = world.global_begin + i;
+        hash ^= (energy + global) * 0x9e3779b97f4a7c15ULL;
+        hash ^= (flux + global) * 0xbf58476d1ce4e5b9ULL;
+    }
+    return hash;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Grid size (NxN elements) (default: 512)\n");
+    printf("  -i <num>     Number of simulation iterations (default: 10)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    int n_elems_root = 512, n_iters = 10;
+    bool validate = false, printResults = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_elems_root = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) n_iters = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-v") == 0) validate = true;
+        else if (strcmp(argv[i], "-r") == 0) printResults = true;
+        else if (strcmp(argv[i], "-h") == 0) {
+            if (rank == 0) printUsage(argv[0]);
+            MPI_Finalize(); return 0;
+        } else {
+            if (rank == 0) { printf("Unknown option: %s\n", argv[i]); printUsage(argv[0]); }
+            MPI_Finalize(); return 1;
+        }
+    }
+    if (n_elems_root <= 0 || static_cast<int64_t>(n_elems_root) * n_elems_root > std::numeric_limits<int>::max()) {
+        if (rank == 0) printf("Grid size must be positive and its square must fit in an int\n");
+        MPI_Finalize(); return 1;
+    }
+    const int n_elems = n_elems_root * n_elems_root;
+    if (rank == 0) {
+        printf("Unstructured Mesh Energy Transfer Benchmark\n");
+        printf("============================================\n");
+        printf("Grid size: %d x %d = %d elements\n", n_elems_root, n_elems_root, n_elems);
+        printf("Iterations: %d\n", n_iters);
+        printf("Validation: %s\n\n", validate ? "enabled" : "disabled");
+        printf("Building unstructured mesh...\n");
+    }
+    World world;
+    buildSquare2D(world, n_elems_root, rank, size);
+    if (rank == 0) {
+        const size_t static_mem = static_cast<size_t>(n_elems) * sizeof(ElementStatic);
+        const size_t dynamic_mem = static_cast<size_t>(n_elems) * sizeof(ElementDynamic) * 2;
+        printf("Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\n\n",
+               (static_mem + dynamic_mem) / (1024.0 * 1024.0),
+               static_mem / (1024.0 * 1024.0), dynamic_mem / (1024.0 * 1024.0));
+        printf("Running simulation...\n");
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    const double start = MPI_Wtime();
+    runSimulation(world, n_iters, size);
+    const double local_time = MPI_Wtime() - start;
+    double elapsed = 0;
+    MPI_Reduce(&local_time, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    uint64_t local_hash = computeHash(world), hash = 0;
+    MPI_Reduce(&local_hash, &hash, 1, MPI_UINT64_T, MPI_BXOR, 0, MPI_COMM_WORLD);
+    if (rank == 0) {
+        const long duration_ms = static_cast<long>(elapsed * 1000.0);
+        printf("Computation time: %ld ms\n", duration_ms);
+        const int n_measured_iters = std::max(n_iters - 1, 1);
+        const double time_per_iter = static_cast<double>(duration_ms) / n_measured_iters;
+        const double giga_elems_per_sec = (static_cast<double>(n_measured_iters) * n_elems) / (duration_ms / 1000.0) / 1e9;
+        printf("Performance:\n");
+        printf("  Time per iteration: %.4f ms\n", time_per_iter);
+        printf("  Elements/sec: %.4f GigaElements/s\n", giga_elems_per_sec);
+        printf("  Performance: %.4f GFLOPS\n", giga_elems_per_sec * 22.0);
+        printf("  Result hash: %016lX\n\n", static_cast<unsigned long>(hash));
+    }
+    int valid = 1;
+    if (validate || printResults) {
+        std::vector<int> counts(size), displs(size);
+        for (int p = 0; p < size; ++p) {
+            counts[p] = static_cast<int>(partitionBegin(n_elems, p + 1, size) - partitionBegin(n_elems, p, size));
+            displs[p] = static_cast<int>(partitionBegin(n_elems, p, size));
+        }
+        std::vector<ElementDynamic> all;
+        if (rank == 0) all.resize(n_elems);
+        MPI_Datatype dynamic_type;
+        MPI_Type_contiguous(2, MPI_DOUBLE, &dynamic_type);
+        MPI_Type_commit(&dynamic_type);
+        MPI_Gatherv(world.elements_dynamic.data(), static_cast<int>(world.elements_static.size()), dynamic_type,
+                    all.data(), counts.data(), displs.data(), dynamic_type, 0, MPI_COMM_WORLD);
+        MPI_Type_free(&dynamic_type);
+        if (rank == 0) {
+            if (printResults) {
+                std::vector<double> energyData;
+                energyData.reserve(all.size());
+                for (const auto& elem : all) energyData.push_back(elem.current_energy);
+                print_results(energyData, "ElementEnergy");
+            }
+            if (validate) valid = validateResults(all) ? 1 : 0;
+        }
+        MPI_Bcast(&valid, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    }
+    for (auto& type : world.recv_types) if (type != MPI_DATATYPE_NULL) MPI_Type_free(&type);
+    MPI_Finalize();
+    return valid ? 0 : 1;
+}
+
+exec
+/bin/bash -lc 'cmake -S unstructured -B /tmp/unstructured-build && cmake --build /tmp/unstructured-build -j' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 8028ms:
+-- The C compiler identification is GNU 13.2.0
+-- The CXX compiler identification is GNU 13.2.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Configuring done (3.3s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/unstructured-build
+[ 50%] Building CXX object CMakeFiles/unstructured.dir/unstructured.cpp.o
+[100%] Linking CXX executable unstructured
+[100%] Built target unstructured
+
+exec
+/bin/bash -lc 'mpirun --allow-run-as-root --oversubscribe -np 4 /tmp/unstructured-build/unstructured -n 8 -i 10 -v -r' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 2810ms:
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 8 x 8 = 64 elements
+Iterations: 10
+Validation: enabled
+
+Building unstructured mesh...
+Memory usage: 0.01 MB (static: 0.01 MB, dynamic: 0.00 MB)
+
+Running simulation...
+Computation time: 0 ms
+Performance:
+  Time per iteration: 0.0000 ms
+  Elements/sec: inf GigaElements/s
+  Performance: inf GFLOPS
+  Result hash: 89C26C90BD597C50
+
+=== RESULTS ===
+Name: ElementEnergy
+Elements: 64
+Sum: 0.00000000000000000e+00
+Min: -1.80791603200000006e+00
+Max: 1.80791603200000006e+00
+Sample[0]: 1.80791603200000006e+00
+Sample[16]: 2.60484095999999998e-01
+Sample[32]: -6.13237760000000034e-02
+Sample[48]: -7.28518911999999963e-01
+Sample[63]: 1.80791603200000006e+00
+Hash: 620572c5abb73235
+=== END RESULTS ===
+Validation results:
+  Energy sum: -0.000000000000
+  Flux sum: 19.17
+  Energy range: [-1.807916, 1.807916]
+  Validation: PASSED
+
+codex
+The first distributed run matches the serial program’s result hash, full external result summary, and validation output. The implementation also handles ranks with no owned cells; I’m checking broader partition shapes and tightening per-iteration communication overhead.
+collab: Wait
+exec
+/bin/bash -lc 'cmake --build /tmp/unstructured-build -j && mpirun --allow-run-as-root --oversubscribe -np 4 /tmp/unstructured-build/unstructured -n 512 -i 100 -v -r' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 6994ms:
+[ 50%] Building CXX object CMakeFiles/unstructured.dir/unstructured.cpp.o
+[100%] Linking CXX executable unstructured
+[100%] Built target unstructured
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 512 x 512 = 262144 elements
+Iterations: 100
+Validation: enabled
+
+Building unstructured mesh...
+Memory usage: 44.00 MB (static: 36.00 MB, dynamic: 8.00 MB)
+
+Running simulation...
+Computation time: 67 ms
+Performance:
+  Time per iteration: 0.6806 ms
+  Elements/sec: 0.3852 GigaElements/s
+  Performance: 8.4735 GFLOPS
+  Result hash: 868AEDC55BF6F400
+
+=== RESULTS ===
+Name: ElementEnergy
+Elements: 262144
+Sum: 0.00000000000000000e+00
+Min: -3.56433614319549630e+00
+Max: 3.56433614319549630e+00
+Sample[0]: 3.56433614319549630e+00
+Sample[65536]: 0.00000000000000000e+00
+Sample[131072]: 0.00000000000000000e+00
+Sample[196608]: 0.00000000000000000e+00
+Sample[262143]: 3.56433614319549630e+00
+Hash: 47145a7fabbbdb51
+=== END RESULTS ===
+Validation results:
+  Energy sum: 0.000000000000
+  Flux sum: 200.00
+  Energy range: [-3.564336, 3.564336]
+  Validation: PASSED
+
+exec
+/bin/bash -lc "rg --files unstructured && rg -n 'peers|elapsed|MPI_' unstructured/unstructured.cpp" in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 0ms:
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+41:    std::vector<int> recv_peers, send_peers;
+44:    std::vector<MPI_Datatype> recv_types;
+108:    MPI_Alltoall(world.recv_counts.data(), 1, MPI_INT, world.send_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+115:    MPI_Alltoallv(remote_indices.data(), world.recv_counts.data(), world.recv_displs.data(), MPI_UINT64_T,
+116:                  world.send_indices.data(), world.send_counts.data(), world.send_displs.data(), MPI_UINT64_T,
+117:                  MPI_COMM_WORLD);
+122:    world.recv_types.resize(size, MPI_DATATYPE_NULL);
+125:            world.recv_peers.push_back(p);
+127:            MPI_Type_vector(world.recv_counts[p], 1, sizeof(ElementDynamic) / sizeof(val_t), MPI_DOUBLE,
+129:            MPI_Type_commit(&world.recv_types[p]);
+131:        if (world.send_counts[p]) world.send_peers.push_back(p);
+165:    std::vector<MPI_Request> requests;
+166:    requests.reserve(world.recv_peers.size() + world.send_peers.size());
+183:        for (int p : world.recv_peers) {
+184:            MPI_Request req;
+185:            MPI_Irecv(&world.elements_dynamic[local + world.recv_displs[p]].current_energy,
+186:                      1, world.recv_types[p], p, 0, MPI_COMM_WORLD, &req);
+191:        for (int p : world.send_peers) {
+192:            MPI_Request req;
+193:            MPI_Isend(world.send_buffer.data() + world.send_displs[p], world.send_counts[p],
+194:                      MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &req);
+199:        if (!requests.empty()) MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+254:    MPI_Init(&argc, &argv);
+256:    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+257:    MPI_Comm_size(MPI_COMM_WORLD, &size);
+267:            MPI_Finalize(); return 0;
+270:            MPI_Finalize(); return 1;
+275:        MPI_Finalize(); return 1;
+296:    MPI_Barrier(MPI_COMM_WORLD);
+297:    const double start = MPI_Wtime();
+299:    const double local_time = MPI_Wtime() - start;
+300:    double elapsed = 0;
+301:    MPI_Reduce(&local_time, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+303:    MPI_Reduce(&local_hash, &hash, 1, MPI_UINT64_T, MPI_BXOR, 0, MPI_COMM_WORLD);
+305:        const long duration_ms = static_cast<long>(elapsed * 1000.0);
+308:        const double time_per_iter = elapsed * 1000.0 / n_measured_iters;
+309:        const double giga_elems_per_sec = elapsed > 0.0
+310:            ? (static_cast<double>(n_measured_iters) * n_elems) / elapsed / 1e9 : 0.0;
+326:        MPI_Datatype dynamic_type;
+327:        MPI_Type_contiguous(2, MPI_DOUBLE, &dynamic_type);
+328:        MPI_Type_commit(&dynamic_type);
+329:        MPI_Gatherv(world.elements_dynamic.data(), static_cast<int>(world.elements_static.size()), dynamic_type,
+330:                    all.data(), counts.data(), displs.data(), dynamic_type, 0, MPI_COMM_WORLD);
+331:        MPI_Type_free(&dynamic_type);
+341:        MPI_Bcast(&valid, 1, MPI_INT, 0, MPI_COMM_WORLD);
+343:    for (auto& type : world.recv_types) if (type != MPI_DATATYPE_NULL) MPI_Type_free(&type);
+344:    MPI_Finalize();
+
+collab: Wait
+codex
+The serial comparisons now pass across 17 cases, including uneven decompositions, zero iterations, and more ranks than cells. Both hashes and the complete ordered result summaries match; I’m finishing the build and edge-case checks.
+exec
+/bin/bash -lc '/tmp/unstructured_serial -n 512 -i 100 -v -r | tail -22' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+exec
+/bin/bash -lc 'mpirun --allow-run-as-root --oversubscribe -np 4 /tmp/unstructured-build/unstructured -h' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 157ms:
+  Elements/sec: 0.1114 GigaElements/s
+  Performance: 2.4504 GFLOPS
+  Result hash: 868AEDC55BF6F400
+
+=== RESULTS ===
+Name: ElementEnergy
+Elements: 262144
+Sum: 0.00000000000000000e+00
+Min: -3.56433614319549630e+00
+Max: 3.56433614319549630e+00
+Sample[0]: 3.56433614319549630e+00
+Sample[65536]: 0.00000000000000000e+00
+Sample[131072]: 0.00000000000000000e+00
+Sample[196608]: 0.00000000000000000e+00
+Sample[262143]: 3.56433614319549630e+00
+Hash: 47145a7fabbbdb51
+=== END RESULTS ===
+Validation results:
+  Energy sum: 0.000000000000
+  Flux sum: 200.00
+  Energy range: [-3.564336, 3.564336]
+  Validation: PASSED
+
+ succeeded in 3139ms:
+Usage: /tmp/unstructured-build/unstructured [options]
+Options:
+  -n <num>     Grid size (NxN elements) (default: 512)
+  -i <num>     Number of simulation iterations (default: 10)
+  -v           Enable validation
+  -r           Print results for external validation
+  -h           Show this help message
+
+2026-11-05T16:16:51.248207Z ERROR codex_core::tools::router: error=apply_patch verification failed: Failed to find expected lines in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1/unstructured/unstructured.cpp:
+#include <limits>
+#include <vector>
+exec
+/bin/bash -lc 'head -15 unstructured/unstructured.cpp' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 0ms:
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <utility>
+#include <vector>
+#include <mpi.h>
+
+#include "../common/results_output.hpp"
+
+using idx_t = uint64_t;
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1/unstructured/unstructured.cpp
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 4b2868d53d61d697a444e3d15b593737015b0ce4..11dd8ca16ae6e7a16e2c835b28ccfa63b029542a
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -1,5 +1,4 @@
+ #include <algorithm>
+-#include <chrono>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
+
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 4b2868d53d61d697a444e3d15b593737015b0ce4..11dd8ca16ae6e7a16e2c835b28ccfa63b029542a
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -1,5 +1,4 @@
+ #include <algorithm>
+-#include <chrono>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
+
+exec
+/bin/bash -lc 'cmake --build /tmp/unstructured-build -j' in /home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1
+ succeeded in 3788ms:
+[ 50%] Building CXX object CMakeFiles/unstructured.dir/unstructured.cpp.o
+[100%] Linking CXX executable unstructured
+[100%] Built target unstructured
+
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 4b2868d53d61d697a444e3d15b593737015b0ce4..11dd8ca16ae6e7a16e2c835b28ccfa63b029542a
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -1,5 +1,4 @@
+ #include <algorithm>
+-#include <chrono>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
+
+codex
+Implemented MPI parallelism in [unstructured.cpp](/home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1/unstructured/unstructured.cpp) and updated [CMakeLists.txt](/home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1/unstructured/CMakeLists.txt) to require MPI. The executable remains `unstructured`.
+
+Ranks own distributed portions of the mesh and exchange boundary energies with nonblocking MPI communication. Result hashing is distributed, while requested validation output is gathered in the original element order.
+
+The build passed. Seventeen comparisons against the original serial program matched both result hashes and external result summaries, including uneven partitions, zero iterations, and more ranks than cells. A 512 × 512, 100-iteration run also matched the serial results.
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 4b2868d53d61d697a444e3d15b593737015b0ce4..11dd8ca16ae6e7a16e2c835b28ccfa63b029542a
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -1,5 +1,4 @@
+ #include <algorithm>
+-#include <chrono>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
+
+tokens used
+33,808
+Implemented MPI parallelism in [unstructured.cpp](/home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1/unstructured/unstructured.cpp) and updated [CMakeLists.txt](/home/llmtest/evals/20261105-131145/unstructured_gpt-6.1-terra-ultra_mpi_r1/unstructured/CMakeLists.txt) to require MPI. The executable remains `unstructured`.
+
+Ranks own distributed portions of the mesh and exchange boundary energies with nonblocking MPI communication. Result hashing is distributed, while requested validation output is gathered in the original element order.
+
+The build passed. Seventeen comparisons against the original serial program matched both result hashes and external result summaries, including uneven partitions, zero iterations, and more ranks than cells. A 512 × 512, 100-iteration run also matched the serial results.
