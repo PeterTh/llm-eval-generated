@@ -956,11 +956,13 @@ int main(int argc, char** argv) {
         for (val_t k : state.kij) if (k > EPSILON) ++localNonZeroKij;
         MPI_Reduce(&localNonZeroKij, &nonZeroKij, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
     }
+    long localTotalTime = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startPre).count();
+    long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     int exitCode = 0;
     if (mpiRank == 0) {
 
         // Total time
-        long totalTime = preDuration + simDuration + distDuration;
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

@@ -949,9 +949,11 @@ int main(int argc, char** argv) {
 
     if (mpiRank == 0) printf("Distance computation time: %ld ms\n\n", distDuration);
 
+    // Total time
+    long totalTime = preDuration + simDuration + distDuration;
+    MPI_Allreduce(MPI_IN_PLACE, &totalTime, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
+
     if (mpiRank == 0) {
-        // Total time
-        long totalTime = preDuration + simDuration + distDuration;
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

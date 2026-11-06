@@ -243,9 +243,11 @@ int main(int argc, char** argv) {
     cudaCheck(cudaDeviceSynchronize(), "finish simulation");
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
+    long localDuration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long duration = 0;
+    MPI_Reduce(&localDuration, &duration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        printf("Simulation time: %ld ms\n", static_cast<long>(duration.count()));
+        printf("Simulation time: %ld ms\n", duration);
     }
 
     int status = 0;

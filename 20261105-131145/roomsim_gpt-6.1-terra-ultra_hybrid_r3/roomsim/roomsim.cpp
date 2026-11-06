@@ -1251,11 +1251,14 @@ int main(int argc, char** argv) {
                    MPI_SUM, 0, MPI_COMM_WORLD);
     }
 
+    long localTime = std::chrono::duration_cast<std::chrono::milliseconds>(endDist - startPre).count();
+    long totalTime = 0;
+    MPI_Reduce(&localTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     // Only the root rank reports and validates the assembled result.
     if (mpiRank != 0) return 0;
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
     printf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics

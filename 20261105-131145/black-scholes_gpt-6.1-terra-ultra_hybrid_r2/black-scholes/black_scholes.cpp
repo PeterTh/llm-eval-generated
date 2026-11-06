@@ -308,11 +308,6 @@ int main(int argc, char** argv) {
         if (w.ok) w.ok = cudaOK(cudaMemcpyToSymbol(deviceTestOptions, testOptions.data(),
                                                     sizeof(OptionInput) * testOptions.size()),
                                   "copying test options", w.device);
-        if (w.ok) {
-            preparePricingConstants<<<1, 7>>>();
-            w.ok = cudaOK(cudaGetLastError(), "launching constants kernel", w.device);
-            if (w.ok) w.ok = cudaOK(cudaDeviceSynchronize(), "preparing pricing constants", w.device);
-        }
         if (w.ok && w.count) w.ok = cudaOK(cudaMalloc(&w.buffer, std::min(w.count, chunkSize) * sizeof(double)),
                                            "allocating output", w.device);
     }
@@ -328,6 +323,11 @@ int main(int argc, char** argv) {
     for (int k = 0; k < static_cast<int>(work.size()); ++k) {
         DeviceWork& w = work[k];
         w.ok = cudaOK(cudaSetDevice(w.device), "selecting device", w.device);
+        if (w.ok) {
+            preparePricingConstants<<<1, 7>>>();
+            w.ok = cudaOK(cudaGetLastError(), "launching constants kernel", w.device);
+            if (w.ok) w.ok = cudaOK(cudaDeviceSynchronize(), "preparing pricing constants", w.device);
+        }
         for (size_t offset = 0; w.ok && offset < w.count;) {
             const size_t count = std::min(chunkSize, w.count - offset);
             constexpr unsigned threads = 256;
