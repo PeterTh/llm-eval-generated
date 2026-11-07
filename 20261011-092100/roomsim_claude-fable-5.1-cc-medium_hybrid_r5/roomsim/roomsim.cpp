@@ -1680,7 +1680,10 @@ int main(int argc, char** argv) {
 
     // Random stream reproduction machinery (characteristic polynomial + self test)
     MTJump jumper;
+    auto startRng = std::chrono::high_resolution_clock::now();
     jumper.init();
+    long rngDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::high_resolution_clock::now() - startRng).count();
     selfTestRng(jumper);
 
     // Initialize
@@ -1729,7 +1732,8 @@ int main(int argc, char** argv) {
     ROOT_PRINTF("\n");
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long totalTime = rngDuration + preDuration + simDuration + distDuration;
+    MPI_Allreduce(MPI_IN_PLACE, &totalTime, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
     ROOT_PRINTF("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics

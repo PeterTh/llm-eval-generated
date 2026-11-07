@@ -422,7 +422,10 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(comm);
     const double tEnd = MPI_Wtime();
-    const long durationMs = static_cast<long>((tEnd - tStart) * 1000.0);
+    const double elapsedSeconds = tEnd - tStart;
+    double maxElapsedSeconds = 0.0;
+    MPI_Reduce(&elapsedSeconds, &maxElapsedSeconds, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+    const long durationMs = static_cast<long>(maxElapsedSeconds * 1000.0);
 
     if (rank == 0) {
         printf("Computation time: %ld ms\n", durationMs);

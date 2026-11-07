@@ -1233,7 +1233,10 @@ static double phaseTimerStart() {
 
 static long phaseTimerStopMs(double start) {
     MPI_Barrier(MPI_COMM_WORLD);
-    return static_cast<long>((MPI_Wtime() - start) * 1000.0);
+    double localMs = (MPI_Wtime() - start) * 1000.0;
+    double globalMs = 0.0;
+    MPI_Allreduce(&localMs, &globalMs, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    return static_cast<long>(globalMs);
 }
 
 int main(int argc, char** argv) {

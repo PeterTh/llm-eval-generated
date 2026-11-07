@@ -418,6 +418,7 @@ int main(int argc, char** argv) {
             MPI_Barrier(MPI_COMM_WORLD);
             start = std::chrono::high_resolution_clock::now();
         }
+#pragma omp barrier
 
         for (int step = 0; step < numSteps; ++step) {
             if (S.nLocal > 0) {
@@ -478,8 +479,12 @@ int main(int argc, char** argv) {
         }
     }
 
+    long localTimeMs = (long)std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    long maxTimeMs = 0;
+    MPI_Reduce(&localTimeMs, &maxTimeMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     if (isRoot) {
-        printf("Simulation time: %ld ms\n", (long)std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+        printf("Simulation time: %ld ms\n", maxTimeMs);
 
 #pragma omp parallel for schedule(static)
         for (long k = 0; k < (long)n; ++k) {

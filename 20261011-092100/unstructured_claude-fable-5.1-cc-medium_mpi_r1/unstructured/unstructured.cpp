@@ -548,6 +548,7 @@ int main(int argc, char** argv) {
     MPI_Barrier(comm);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    MPI_Allreduce(MPI_IN_PLACE, &duration_ms, 1, MPI_LONG, MPI_MAX, comm);
 
     // Compute hash for verification (exact XOR-reduction of per-rank partial hashes)
     const uint64_t local_hash = computeHash(world.elements_dynamic, world.n_owned, world.global_begin);

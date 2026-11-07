@@ -779,12 +779,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    long localElapsedMs = (long)duration.count();
+    long maxElapsedMs = 0;
+    MPI_Reduce(&localElapsedMs, &maxElapsedMs, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", (long)duration.count());
+        printf("Computation time: %ld ms\n", maxElapsedMs);
 
         // Calculate GFLOPS (approximately n³/3 operations for Cholesky)
         double ops = (double)n * n * n / 3.0;
-        double gflops = ops / (duration.count() / 1000.0) / 1e9;
+        double gflops = ops / (maxElapsedMs / 1000.0) / 1e9;
         printf("Performance: %.3f GFLOPS\n", gflops);
     }
 

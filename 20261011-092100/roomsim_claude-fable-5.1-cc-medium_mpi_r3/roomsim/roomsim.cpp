@@ -1016,13 +1016,14 @@ void printUsage(const char* progName) {
     printf("  -h           Show this help message\n");
 }
 
-// Barrier-synchronised wall clock in milliseconds (all ranks)
-static long syncedMillis(double start) {
+// Accumulate local work seconds and report maximum phase milliseconds on rank 0.
+static long syncedMillis(double start, double& localTotal) {
+    double elapsed = MPI_Wtime() - start;
+    localTotal += elapsed;
     MPI_Barrier(MPI_COMM_WORLD);
-    double now = MPI_Wtime();
-    double elapsed = now - start;
-    MPI_Bcast(&elapsed, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    return static_cast<long>(elapsed * 1000.0);
+    double maxElapsed = 0.0;
+    MPI_Reduce(&elapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    return static_cast<long>(maxElapsed * 1000.0);
 }
 
 int main(int argc, char** argv) {
@@ -1088,12 +1089,13 @@ int main(int argc, char** argv) {
 
     // Precomputation
     MPI_Barrier(MPI_COMM_WORLD);
+    double localTotal = 0.0;
     double startPre = MPI_Wtime();
 
     computeTimeDelays(state);
     computeFormFactors(state);
 
-    long preDuration = syncedMillis(startPre);
+    long preDuration = syncedMillis(startPre, localTotal);
 
     if (rank == 0) {
         printf("Precomputation time: %ld ms\n", preDuration);
@@ -1105,7 +1107,7 @@ int main(int argc, char** argv) {
 
     runSimulation(state);
 
-    long simDuration = syncedMillis(startSim);
+    long simDuration = syncedMillis(startSim, localTotal);
 
     if (rank == 0) {
         printf("Simulation time: %ld ms\n", simDuration);
@@ -1117,7 +1119,7 @@ int main(int argc, char** argv) {
 
     computeDistances(state);
 
-    long distDuration = syncedMillis(startDist);
+    long distDuration = syncedMillis(startDist, localTotal);
 
     if (rank == 0) {
         printf("Distance computation time: %ld ms\n", distDuration);
@@ -1125,7 +1127,9 @@ int main(int argc, char** argv) {
     }
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    double maxTotal = 0.0;
+    MPI_Reduce(&localTotal, &maxTotal, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    long totalTime = static_cast<long>(maxTotal * 1000.0);
 
     if (rank == 0) {
         printf("Total computation time: %ld ms\n", totalTime);

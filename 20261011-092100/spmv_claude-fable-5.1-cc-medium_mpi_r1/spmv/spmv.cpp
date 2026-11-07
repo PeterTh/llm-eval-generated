@@ -330,7 +330,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    MPI_Allreduce(MPI_IN_PLACE, &elapsed_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
+    auto duration = std::chrono::milliseconds(elapsed_ms);
 
     // Collect the distributed result on the root
     MPI_Gatherv(l_out.data(), static_cast<int>(localRows), MPI_DOUBLE,

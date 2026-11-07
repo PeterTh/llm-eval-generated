@@ -1392,7 +1392,13 @@ int main(int argc, char** argv) {
     rprintf("\n");
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    const double localPhaseTimes[3] = {endPre - startPre, endSim - startSim, endDist - startDist};
+    double globalPhaseTimes[3] = {};
+    MPI_Reduce(localPhaseTimes, globalPhaseTimes, 3, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    long totalTime = 0;
+    if (g_rank == 0) {
+        totalTime = toMs(globalPhaseTimes[0] + globalPhaseTimes[1] + globalPhaseTimes[2]);
+    }
     rprintf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics

@@ -213,7 +213,10 @@ int main(int argc, char** argv) {
                 0, MPI_COMM_WORLD);
     
     const double end = MPI_Wtime();
-    const long durationMs = static_cast<long>((end - start) * 1000.0);
+    const double localDuration = end - start;
+    double maxDuration = 0.0;
+    MPI_Reduce(&localDuration, &maxDuration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    const long durationMs = static_cast<long>(maxDuration * 1000.0);
 
     int exitCode = 0;
     if (isRoot) {

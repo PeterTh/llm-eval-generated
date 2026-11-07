@@ -1094,6 +1094,10 @@ int main(int argc, char** argv) {
     double endDist = MPI_Wtime();
     long distDuration = phaseMillis(startDist, endDist);
 
+    double localTotalSeconds = (endPre - startPre) + (endSim - startSim) + (endDist - startDist);
+    double maxTotalSeconds = 0.0;
+    MPI_Reduce(&localTotalSeconds, &maxTotalSeconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
     int exitCode = 0;
 
     if (rank == 0) {
@@ -1101,7 +1105,7 @@ int main(int argc, char** argv) {
         printf("\n");
 
         // Total time
-        long totalTime = preDuration + simDuration + distDuration;
+        long totalTime = phaseMillis(0.0, maxTotalSeconds);
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

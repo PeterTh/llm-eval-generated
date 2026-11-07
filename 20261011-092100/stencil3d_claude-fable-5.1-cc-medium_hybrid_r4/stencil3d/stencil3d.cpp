@@ -419,6 +419,9 @@ int main(int argc, char** argv) {
     MPI_CHECK(MPI_Barrier(comm));
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localElapsedMs = duration.count();
+    long maxElapsedMs = 0;
+    MPI_CHECK(MPI_Reduce(&localElapsedMs, &maxElapsedMs, 1, MPI_LONG, MPI_MAX, 0, comm));
 
     // After the loop `in` points at the buffer holding the final state
     // (same parity rule as the original: even iterations -> grid1).
@@ -426,10 +429,10 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(hostGrid.data(), dFinal, localSize * sizeof(Real), cudaMemcpyDeviceToHost));
 
     if (rank == 0) {
-        printf("Computation time: %ld ms\n", (long)duration.count());
+        printf("Computation time: %ld ms\n", maxElapsedMs);
         // Calculate performance metrics
         double cellUpdates = (double)((nx - 2) * (ny - 2) * (nz - 2)) * iterations;
-        double mcups = cellUpdates / (duration.count() / 1000.0) / 1e6;  // Million cell updates per second
+        double mcups = cellUpdates / (maxElapsedMs / 1000.0) / 1e6;  // Million cell updates per second
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

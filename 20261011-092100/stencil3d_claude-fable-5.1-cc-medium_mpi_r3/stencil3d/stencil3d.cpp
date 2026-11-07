@@ -456,16 +456,18 @@ int main(int argc, char** argv) {
         }
     }
 
-    MPI_Barrier(d.cart);
     const double end = MPI_Wtime();
-    const long durationMs = static_cast<long>((end - start) * 1000.0);
+    const double localElapsed = end - start;
+    double maxElapsed = 0.0;
+    MPI_Allreduce(&localElapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, d.cart);
+    const long durationMs = static_cast<long>(maxElapsed * 1000.0);
 
     if (isRoot) {
         printf("Computation time: %ld ms\n", durationMs);
 
         // Calculate performance metrics
         double cellUpdates = (double)((nx-2) * (ny-2) * (nz-2)) * iterations;
-        double mcups = cellUpdates / ((end - start)) / 1e6;  // Million cell updates per second
+        double mcups = cellUpdates / maxElapsed / 1e6;  // Million cell updates per second
         printf("Performance: %.3f MCellUpdates/s\n", mcups);
     }
 

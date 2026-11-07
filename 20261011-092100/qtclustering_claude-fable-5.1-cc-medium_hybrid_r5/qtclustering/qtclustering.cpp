@@ -1927,10 +1927,13 @@ int main(int argc, char** argv) {
 
     const std::vector<Cluster> clusters = qtClustering(points, threshold, gpus, fixed_shift, mpi_rank, mpi_size);
 
-    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     auto cluster_end = std::chrono::high_resolution_clock::now();
-    auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        cluster_end - cluster_start);
+    const long local_cluster_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cluster_end - cluster_start).count();
+    long max_cluster_ms = 0;
+    MPI_CHECK(MPI_Reduce(&local_cluster_ms, &max_cluster_ms, 1, MPI_LONG, MPI_MAX,
+                         0, MPI_COMM_WORLD));
+    auto cluster_time = std::chrono::milliseconds(max_cluster_ms);
 
     for (auto& g : gpus) destroyGpuContext(g);
 

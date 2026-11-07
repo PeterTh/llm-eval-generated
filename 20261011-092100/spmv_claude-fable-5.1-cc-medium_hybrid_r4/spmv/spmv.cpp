@@ -527,6 +527,9 @@ int main(int argc, char** argv) {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long localDuration = duration.count(), maxDuration = 0;
+    MPI_CHECK(MPI_Reduce(&localDuration, &maxDuration, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD));
+    if (isRoot) duration = std::chrono::milliseconds(maxDuration);
 
     // ---- Fetch local result -------------------------------------------------
     std::vector<double> h_out(localRows);  // Local output block

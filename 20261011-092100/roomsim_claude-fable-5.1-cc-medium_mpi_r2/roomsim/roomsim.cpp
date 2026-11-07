@@ -1232,7 +1232,10 @@ int main(int argc, char** argv) {
     rootPrintf("\n");
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    double localTotalSeconds = endDist - startPre;
+    double maxTotalSeconds = 0.0;
+    MPI_Reduce(&localTotalSeconds, &maxTotalSeconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    long totalTime = toMs(maxTotalSeconds);
     rootPrintf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics

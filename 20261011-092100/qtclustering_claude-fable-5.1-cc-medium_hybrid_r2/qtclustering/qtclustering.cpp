@@ -1286,17 +1286,20 @@ int main(int argc, char** argv) {
     std::vector<Point> points(num_points);
     generateSyntheticData(points, num_points);
 
-    setupGpu(gpu, points, threshold);
-
     // Perform QT clustering
     MPI_Barrier(MPI_COMM_WORLD);
     auto cluster_start = std::chrono::high_resolution_clock::now();
 
+    setupGpu(gpu, points, threshold);
+
     const std::vector<Cluster> clusters = qtClustering(points, gpu, rank, nranks);
 
     auto cluster_end = std::chrono::high_resolution_clock::now();
-    auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        cluster_end - cluster_start);
+    const long local_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cluster_end - cluster_start).count();
+    long max_time_ms = 0;
+    MPI_Reduce(&local_time_ms, &max_time_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    const std::chrono::milliseconds cluster_time(max_time_ms);
 
     teardownGpu(gpu);
 

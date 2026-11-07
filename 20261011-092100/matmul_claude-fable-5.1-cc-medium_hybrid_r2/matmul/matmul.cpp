@@ -394,6 +394,10 @@ int main(int argc, char** argv) {
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    long local_ms = duration.count();
+    long max_ms = 0;
+    MPI_CHECK(MPI_Reduce(&local_ms, &max_ms, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD));
+    duration = std::chrono::milliseconds(max_ms);
 
     if (root) {
         printf("Computation time: %ld ms\n", static_cast<long>(duration.count()));

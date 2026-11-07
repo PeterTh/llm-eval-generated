@@ -306,7 +306,10 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(comm);
     const double end = MPI_Wtime();
-    const long durationMs = static_cast<long>((end - start) * 1000.0);
+    const double elapsed = end - start;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&elapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+    const long durationMs = static_cast<long>(maxElapsed * 1000.0);
 
     if (rank == 0) printf("Simulation time: %ld ms\n", durationMs);
 

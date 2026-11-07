@@ -513,7 +513,9 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(d.comm);
     const double tEnd = MPI_Wtime();
-    const long durationMs = static_cast<long>((tEnd - tStart) * 1000.0);
+    const long localDurationMs = static_cast<long>((tEnd - tStart) * 1000.0);
+    long durationMs = 0;
+    MPI_Reduce(&localDurationMs, &durationMs, 1, MPI_LONG, MPI_MAX, 0, d.comm);
 
     if (d.rank == 0) {
         printf("Computation time: %ld ms\n", durationMs);

@@ -1951,12 +1951,17 @@ int main(int argc, char** argv) {
     double endDist = wallTime();
     long distDuration = static_cast<long>((endDist - startDist) * 1000.0);
 
+    double localTotalSeconds = (endPre - startPre) + (endSim - startSim) +
+                               (endDist - startDist);
+    double totalSeconds = 0.0;
+    MPI_Reduce(&localTotalSeconds, &totalSeconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
     if (rank == 0) {
         printf("Distance computation time: %ld ms\n", distDuration);
         printf("\n");
 
         // Total time
-        long totalTime = preDuration + simDuration + distDuration;
+        long totalTime = static_cast<long>(totalSeconds * 1000.0);
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

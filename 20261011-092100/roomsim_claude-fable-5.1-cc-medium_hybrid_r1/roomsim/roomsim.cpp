@@ -1811,7 +1811,9 @@ int main(int argc, char** argv) {
     computeFormFactors(state);
 
     double endPre = wallTimeMs(MPI_COMM_WORLD);
-    long preDuration = static_cast<long>(endPre - startPre);
+    double preElapsedMs = endPre - startPre;
+    MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, &preElapsedMs, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD));
+    long preDuration = static_cast<long>(preElapsedMs);
 
     if (rank == 0) {
         printf("Precomputation time: %ld ms\n", preDuration);
@@ -1824,7 +1826,9 @@ int main(int argc, char** argv) {
     runSimulation(state);
 
     double endSim = wallTimeMs(MPI_COMM_WORLD);
-    long simDuration = static_cast<long>(endSim - startSim);
+    double simElapsedMs = endSim - startSim;
+    MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, &simElapsedMs, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD));
+    long simDuration = static_cast<long>(simElapsedMs);
 
     if (rank == 0) {
         printf("Simulation time: %ld ms\n", simDuration);
@@ -1837,7 +1841,9 @@ int main(int argc, char** argv) {
     computeDistances(state);
 
     double endDist = wallTimeMs(MPI_COMM_WORLD);
-    long distDuration = static_cast<long>(endDist - startDist);
+    double distElapsedMs = endDist - startDist;
+    MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, &distElapsedMs, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD));
+    long distDuration = static_cast<long>(distElapsedMs);
 
     if (rank == 0) {
         printf("Distance computation time: %ld ms\n", distDuration);

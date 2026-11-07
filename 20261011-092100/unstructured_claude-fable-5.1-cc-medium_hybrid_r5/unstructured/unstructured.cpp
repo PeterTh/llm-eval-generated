@@ -731,6 +731,7 @@ int main(int argc, char** argv) {
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     auto end = std::chrono::high_resolution_clock::now();
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, &duration_ms, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD));
 
     // Fetch results
     downloadState(sim, world.elements_dynamic);

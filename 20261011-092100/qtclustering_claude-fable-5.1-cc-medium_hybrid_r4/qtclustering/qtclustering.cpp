@@ -750,8 +750,8 @@ int main(int argc, char** argv) {
     ctx.init(local_rank % num_devices, num_points);
     
     // Perform QT clustering
-    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     auto cluster_start = std::chrono::high_resolution_clock::now();
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     
     const std::vector<Cluster> clusters = qtClustering(points, threshold, ctx, MPI_COMM_WORLD);
     

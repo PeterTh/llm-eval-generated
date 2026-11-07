@@ -1261,6 +1261,7 @@ struct SimulationState {
 
     // mt19937 jump-ahead arithmetic (a constant of mt19937, prepared during initialization)
     PolyMod rngMod;
+    double rngPreparationSeconds = 0.0;
 
     // Active-pair bookkeeping for the form factor phase
     std::vector<uint32_t> mask;     // local rows x maskWordsPerRow
@@ -1311,7 +1312,10 @@ void initializeSimulation(SimulationState& state, int subdivisions, size_t times
         }
         #pragma omp section
         {
+            auto rngStart = std::chrono::steady_clock::now();
             state.rngMod.init(mt19937AnnihilatorPolynomial());
+            state.rngPreparationSeconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - rngStart).count();
         }
     }
     state.numTriangles = static_cast<int>(state.triangles.size());
@@ -1910,7 +1914,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
     double endPre = wallSeconds();
-    long preDuration = static_cast<long>((endPre - startPre) * 1000.0);
+    long preDuration = static_cast<long>((endPre - startPre + state.rngPreparationSeconds) * 1000.0);
+    MPI_Allreduce(MPI_IN_PLACE, &preDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     if (rank == 0) {
         printf("Precomputation time: %ld ms\n", preDuration);
@@ -1926,6 +1931,7 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double endSim = wallSeconds();
     long simDuration = static_cast<long>((endSim - startSim) * 1000.0);
+    MPI_Allreduce(MPI_IN_PLACE, &simDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     if (rank == 0) {
         printf("Simulation time: %ld ms\n", simDuration);
@@ -1941,6 +1947,7 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double endDist = wallSeconds();
     long distDuration = static_cast<long>((endDist - startDist) * 1000.0);
+    MPI_Allreduce(MPI_IN_PLACE, &distDuration, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
 
     if (rank == 0) {
         printf("Distance computation time: %ld ms\n", distDuration);

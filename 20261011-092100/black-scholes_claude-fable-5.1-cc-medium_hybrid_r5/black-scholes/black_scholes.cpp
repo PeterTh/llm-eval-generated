@@ -462,7 +462,9 @@ int main(int argc, char** argv) {
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    long long duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    MPI_Allreduce(MPI_IN_PLACE, &duration_us, 1, MPI_LONG_LONG_INT, MPI_MAX, MPI_COMM_WORLD);
+    auto duration = std::chrono::microseconds(duration_us);
 
     int exitCode = 0;
     if (rank == 0) {
