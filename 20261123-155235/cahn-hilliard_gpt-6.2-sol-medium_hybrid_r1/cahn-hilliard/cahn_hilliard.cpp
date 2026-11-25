@@ -562,11 +562,11 @@ int simulate(Extent grid, Extent ranks, int iterations, bool validate, bool prin
     checkCuda(cudaMemcpy(concentration, host.get(), bytes, cudaMemcpyHostToDevice));
     checkCuda(cudaDeviceSynchronize());
     if (!validate && !printResults) host.reset();
-    stencils.prepare(concentration, mu, iterations);
 
     if (rank == 0) printf("Running Cahn-Hilliard simulation...\n");
     MPI_Barrier(cart);
     const double start = MPI_Wtime();
+    stencils.prepare(concentration, mu, iterations);
     for (int step = 0; step < iterations; ++step) {
         stencils.step(concentration, mu);
     }

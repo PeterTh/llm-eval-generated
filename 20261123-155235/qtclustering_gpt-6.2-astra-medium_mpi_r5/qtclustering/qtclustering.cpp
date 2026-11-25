@@ -306,11 +306,13 @@ static int runBenchmark(int argc, char** argv, int rank, int ranks) {
     auto cluster_start = std::chrono::steady_clock::now();
     
     const std::vector<Cluster> clusters = qtClustering(points, threshold, rank, ranks);
-    if (rank != 0) return 0;
-    
     auto cluster_end = std::chrono::steady_clock::now();
+    const double local_time_sec = std::chrono::duration<double>(cluster_end - cluster_start).count();
+    double time_sec = 0.0;
+    MPI_Reduce(&local_time_sec, &time_sec, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank != 0) return 0;
     auto cluster_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        cluster_end - cluster_start);
+        std::chrono::duration<double>(time_sec));
     
     printf("Clustering time: %ld ms\n", cluster_time.count());
     printf("Clusters found: %zu\n", clusters.size());
@@ -335,7 +337,7 @@ static int runBenchmark(int argc, char** argv, int rank, int ranks) {
     printf("Maximum cluster size: %d\n", max_cluster_size);
     
     // Performance metrics
-    const double time_sec = std::chrono::duration<double>(cluster_end - cluster_start).count();
+
     const double clusters_per_sec = clusters.size() / time_sec;
     const double points_per_sec = num_points / time_sec;
     printf("Performance: %.1f clusters/s, %.1f points/s\n", 

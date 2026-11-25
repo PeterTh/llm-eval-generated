@@ -296,8 +296,10 @@ static int run(int argc, char** argv, int rank, int ranks) {
     MPI_Barrier(MPI_COMM_WORLD);
     double start = MPI_Wtime();
     const auto clusters = qtClustering(points, threshold, rank, ranks);
+    const double local_time_sec = MPI_Wtime() - start;
+    double time_sec = 0.0;
+    MPI_Reduce(&local_time_sec, &time_sec, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank != 0) return 0;
-    const double time_sec = MPI_Wtime() - start;
     printf("Clustering time: %ld ms\n", static_cast<long>(time_sec * 1000));
     printf("Clusters found: %zu\n", clusters.size());
     

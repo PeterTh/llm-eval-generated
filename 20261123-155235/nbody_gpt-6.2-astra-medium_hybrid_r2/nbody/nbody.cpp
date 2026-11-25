@@ -276,7 +276,9 @@ int run(int argc, char** argv, int rank, int ranks) {
         check(cudaDeviceSynchronize());
     }
     MPI_Barrier(MPI_COMM_WORLD);
-    if (rank == 0) printf("Simulation time: %lld ms\n", (long long)((MPI_Wtime() - start) * 1000));
+    double elapsed = MPI_Wtime() - start, maxElapsed = 0.0;
+    MPI_Reduce(&elapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) printf("Simulation time: %lld ms\n", (long long)(maxElapsed * 1000));
 
     std::vector<double> energies(validate ? count : 0);
     #pragma omp parallel for num_threads(threads)

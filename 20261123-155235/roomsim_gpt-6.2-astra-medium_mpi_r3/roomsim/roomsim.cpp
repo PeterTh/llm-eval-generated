@@ -856,6 +856,9 @@ int main(int argc, char** argv) {
     if (rank == 0) printf("Computing distances via cross-correlation...\n");
     computeDistances(state);
     double endDist = MPI_Wtime();
+    double elapsed = endDist - start;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&elapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     uint64_t totals[2] = {};
     if (validate) {
@@ -878,7 +881,7 @@ int main(int argc, char** argv) {
         printf("Distance computation time: %ld ms\n", distDuration);
 
         // Total time
-        long totalTime = preDuration + simDuration + distDuration;
+        long totalTime = static_cast<long>(maxElapsed * 1000);
         printf("Total computation time: %ld ms\n", totalTime);
 
         // Performance metrics

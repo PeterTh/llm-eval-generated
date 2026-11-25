@@ -369,7 +369,9 @@ int runBenchmark(int argc, char** argv, const int rank, const int ranks) {
     const double start = MPI_Wtime();
     const std::vector<Cluster> clusters = qtClustering(points, threshold, rank, ranks);
     MPI_Barrier(MPI_COMM_WORLD);
-    const double time_sec = MPI_Wtime() - start;
+    const double local_time_sec = MPI_Wtime() - start;
+    double time_sec = 0.0;
+    MPI_Reduce(&local_time_sec, &time_sec, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank != 0) return 0;
 
     printf("Clustering time: %ld ms\n", static_cast<long>(time_sec * 1000.0));

@@ -1222,10 +1222,14 @@ int runBenchmark(int argc, char** argv, int worldRank, int worldSize) {
         MPI_Reduce(counts, globalCounts, 2, MPI_UINT64_T, MPI_SUM, 0, comm);
     }
 
+    const double localElapsed = MPI_Wtime() - startPre;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&localElapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+
     int result = 0;
     if (root) {
         const long distDuration = static_cast<long>((MPI_Wtime() - startDist) * 1000);
-        const long totalTime = preDuration + simDuration + distDuration;
+        const long totalTime = static_cast<long>(maxElapsed * 1000);
         const double pairs = static_cast<double>(n) * n;
         const size_t matrixBytes = static_cast<size_t>(n) * n * (sizeof(val_t) + sizeof(uint8_t));
         const size_t historyEntries = static_cast<size_t>(n) * timesteps +

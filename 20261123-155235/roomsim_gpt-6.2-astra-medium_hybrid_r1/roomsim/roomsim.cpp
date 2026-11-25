@@ -984,9 +984,11 @@ int benchmark(int argc, char** argv, int rank, int ranks) {
     MPI_Barrier(MPI_COMM_WORLD);
     double sim = MPI_Wtime();
     computeDistances(part, history, state, rank, validate);
-    if (rank) return 0;
     double end = MPI_Wtime();
-    double totalTime = (end - start) * 1000;
+    double localMs = (end - start) * 1000;
+    double totalTime = 0;
+    MPI_Reduce(&localMs, &totalTime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank) return 0;
     printf("Precomputation time: %.3f ms\n", (pre - start) * 1000);
     printf("Simulation time: %.3f ms\n", (sim - pre) * 1000);
     printf("Distance computation time: %.3f ms\n", (end - sim) * 1000);

@@ -1016,9 +1016,10 @@ int runBenchmark(int subdivisions, int timesteps, int sourceIdx, val_t reflectiv
 
     std::array<uint64_t, 2> validationCounts{};
     if (validate) validationCounts = collectValidationCounts(state, rows);
+    const long localTotalTime = preDuration + simDuration + distDuration;
+    long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, comm);
     if (!root) return 0;
-
-    const long totalTime = preDuration + simDuration + distDuration;
     printf("Distance computation time: %ld ms\n\n", distDuration);
     printf("Total computation time: %ld ms\n", totalTime);
 

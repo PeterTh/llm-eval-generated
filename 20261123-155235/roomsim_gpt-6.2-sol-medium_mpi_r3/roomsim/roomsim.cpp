@@ -1107,9 +1107,11 @@ int main(int argc, char** argv) {
     auto distances = computeDistances(state);
     long distDuration = std::chrono::duration_cast<Milliseconds>(Clock::now() - startDist).count();
 
+    long localTotalTime = std::chrono::duration_cast<Milliseconds>(Clock::now() - startPre).count();
+    long totalTime = 0;
+    MPI_Reduce(&localTotalTime, &totalTime, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {
         printf("Distance computation time: %ld ms\n\n", distDuration);
-        long totalTime = preDuration + simDuration + distDuration;
         printf("Total computation time: %ld ms\n", totalTime);
 
         size_t n = state.numTriangles();

@@ -1363,10 +1363,13 @@ int runBenchmark(int argc, char** argv, int rank, int ranks) {
     start = MPI_Wtime();
     computeDistances(sim, validate);
     long distDuration = static_cast<long>((MPI_Wtime() - start) * 1000);
+    long localDurations[3] = {preDuration, simDuration, distDuration};
+    long globalDurations[3];
+    MPI_Reduce(localDurations, globalDurations, 3, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     int valid = 1;
     if (rank == 0) {
         printf("Distance computation time: %ld ms\n\n", distDuration);
-        long totalTime = preDuration + simDuration + distDuration;
+        long totalTime = globalDurations[0] + globalDurations[1] + globalDurations[2];
         printf("Total computation time: %ld ms\n", totalTime);
 
         size_t n = sim.n;

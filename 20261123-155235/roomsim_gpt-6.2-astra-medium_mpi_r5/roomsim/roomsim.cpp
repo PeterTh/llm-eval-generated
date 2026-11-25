@@ -852,6 +852,9 @@ int benchmark(int argc, char** argv, SimulationState& state) {
     double simEnd = MPI_Wtime();
     computeDistances(state);
     double distEnd = MPI_Wtime();
+    double localElapsed = distEnd - start;
+    double maxElapsed = 0.0;
+    MPI_Reduce(&localElapsed, &maxElapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     uint64_t totals[2] = {};
     if (validate) {
@@ -872,7 +875,7 @@ int benchmark(int argc, char** argv, SimulationState& state) {
     printf("Distance computation time: %ld ms\n", distDuration);
 
     // Total time
-    long totalTime = preDuration + simDuration + distDuration;
+    long totalTime = static_cast<long>(maxElapsed * 1000);
     printf("Total computation time: %ld ms\n", totalTime);
 
     // Performance metrics

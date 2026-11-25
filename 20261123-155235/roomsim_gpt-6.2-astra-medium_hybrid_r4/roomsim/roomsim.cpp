@@ -1002,9 +1002,12 @@ int main(int argc, char** argv) {
     double sim = MPI_Wtime();
     computeDistances(state, validate);
     double end = MPI_Wtime();
+    double localSeconds = end - start;
+    double maxSeconds = 0.0;
+    MPI_Reduce(&localSeconds, &maxSeconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     int status = 0;
     if (!state.rank) {
-        double totalTime = (end - start) * 1000;
+        double totalTime = maxSeconds * 1000;
         printf("Precomputation time: %.2f ms\n", (pre - start) * 1000);
         printf("Simulation time: %.2f ms\n", (sim - pre) * 1000);
         printf("Distance computation time: %.2f ms\n", (end - sim) * 1000);
