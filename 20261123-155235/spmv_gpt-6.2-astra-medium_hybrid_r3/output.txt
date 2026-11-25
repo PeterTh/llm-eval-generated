@@ -1,0 +1,1692 @@
+Reading additional input from stdin...
+OpenAI Codex v0.171.0
+--------
+workdir: /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+model: gpt-6.2-astra
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a20e30-fd14-7001-b8d4-6972a54c7196
+--------
+user
+Parallelize the spmv benchmark code found in ./spmv/ with a hybrid approach combining MPI, OpenMP, and CUDA as appropriate for the problem for maximum parallel performance on an accelerator cluster. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the benchmark, its build configuration, and the available toolchain before choosing how to distribute the work across ranks, CPU threads, and GPUs.
+exec
+/bin/bash -lc 'which nvcc mpicxx cmake nvidia-smi; git status --short' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ exited 128 in 0ms:
+/usr/bin/nvcc
+/usr/bin/mpicxx
+/usr/bin/cmake
+/usr/bin/nvidia-smi
+fatal: not a git repository (or any parent up to mount point /home/llmtest/evals/20261123-155235)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+
+exec
+/bin/bash -lc 'pwd; rg --files --hidden -g "!.git"' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 0ms:
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+output.txt
+common/hash.hpp
+common/results_output.hpp
+spmv/CMakeLists.txt
+spmv/spmv.cpp
+
+exec
+/bin/bash -lc 'cat spmv/spmv.cpp spmv/CMakeLists.txt' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 0ms:
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+using index_t = uint32_t;
+
+// Constants
+constexpr double MAX_RELATIVE_ERROR = 0.02;
+
+// ****************************************************************************
+// Function: fill
+//
+// Purpose:
+//   Initialize array with random values
+//
+// Arguments:
+//   A: pointer to the array to initialize
+//   n: number of elements in the array
+//   maxVal: specifies range of random values [0, maxVal]
+//
+// ****************************************************************************
+void fill(double* A, const index_t n, const double maxVal) {
+    for (index_t i = 0; i < n; ++i) {
+        A[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+    }
+}
+
+// ****************************************************************************
+// Function: initRandomMatrix
+//
+// Purpose:
+//   Assigns random positions to a given number of elements in a square
+//   matrix. The function encodes these positions in compressed sparse
+//   row (CSR) format.
+//
+// Arguments:
+//   cols:          array for column indexes of elements (size should be = n)
+//   rowDelimiters: array of size dim+1 holding indices to rows;
+//                  last element is the index one past the last element
+//   n:             number of nonzero elements
+//   dim:           number of rows/columns in the matrix
+//
+// ****************************************************************************
+void initRandomMatrix(index_t* cols, index_t* rowDelimiters, const index_t n, const index_t dim) {
+    index_t nnzAssigned = 0;
+
+    // Figure out the probability that a nonzero should be assigned
+    double prob = static_cast<double>(n) / (static_cast<double>(dim) * static_cast<double>(dim));
+
+    // Seed random number generator
+    srand(8675309);
+
+    // Randomly decide whether entry i,j gets a value, but ensure n values are assigned
+    bool fillRemaining = false;
+    for (index_t i = 0; i < dim; ++i) {
+        rowDelimiters[i] = nnzAssigned;
+        for (index_t j = 0; j < dim; ++j) {
+            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+            index_t needToAssign = n - nnzAssigned;
+            if (numEntriesLeft <= needToAssign) {
+                fillRemaining = true;
+            }
+            double randVal = static_cast<double>(rand()) / RAND_MAX;
+            if ((nnzAssigned < n && randVal <= prob) || fillRemaining) {
+                // Assign (i,j) a value
+                cols[nnzAssigned] = j;
+                nnzAssigned++;
+            }
+        }
+    }
+    // Convention: put the number of non-zeroes at the end of the row delimiters array
+    rowDelimiters[dim] = n;
+}
+
+// ****************************************************************************
+// Function: spmvCpu
+//
+// Purpose:
+//   Computes sparse matrix-vector multiplication using CSR format
+//
+// Arguments:
+//   val: array holding the non-zero values for the matrix
+//   cols: array of column indices for each element
+//   rowDelimiters: array of size dim+1 holding indices to rows;
+//                  last element is the index one past the last element
+//   vec: dense vector of size dim to be used for multiplication
+//   dim: number of rows/columns in the matrix
+//   out: output - result from the spmv calculation
+//
+// ****************************************************************************
+void spmvCpu(const double* val, const index_t* cols, const index_t* rowDelimiters,
+             const double* vec, const index_t dim, double* out) {
+    for (index_t i = 0; i < dim; ++i) {
+        double t = 0.0;
+        for (index_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
+            const auto col = cols[j];
+            t += val[j] * vec[col];
+        }
+        out[i] = t;
+    }
+}
+
+// ****************************************************************************
+// Function: verifyResults
+//
+// Purpose:
+//   Verifies correctness of results by comparing to reference solution
+//
+// Arguments:
+//   reference: array holding the reference result vector
+//   result: array holding the result vector to verify
+//   size: number of elements per vector
+//
+// ****************************************************************************
+bool verifyResults(const double* reference, const double* result, const index_t size) {
+    for (index_t i = 0; i < size; ++i) {
+        const double ref = reference[i];
+        const double res = result[i];
+        if (std::abs(ref) < 1e-10) {
+            // For very small values, check absolute error
+            if (std::abs(res) > MAX_RELATIVE_ERROR) {
+                printf("Validation failed at index %u: reference %.10e, got %.10e\n", i, ref, res);
+                return false;
+            }
+        } else {
+            // Check relative error
+            const double relError = std::abs((res - ref) / ref);
+            if (relError > MAX_RELATIVE_ERROR) {
+                printf("Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\n",
+                       i, ref, res, relError);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Number of rows/columns in the matrix (default: 1024)\n");
+    printf("  -s <num>     Sparsity: 1 out of N entries is non-zero (default: 10)\n");
+    printf("  -i <num>     Number of iterations (default: 10)\n");
+    printf("  -m <val>     Maximum value for matrix and vector elements (default: 1.0)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    index_t numRows = 1024;
+    index_t sparsity = 10;
+    index_t iterations = 10;
+    double maxVal = 1.0;
+    bool validate = false;
+    bool printResults = false;
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            numRows = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            sparsity = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            iterations = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            maxVal = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+
+    // Calculate number of non-zero elements
+    const index_t nItems = (numRows * numRows) / sparsity;
+
+    printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+    printf("Matrix size: %u x %u\n", numRows, numRows);
+    printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+    printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
+    printf("Iterations: %u\n", iterations);
+    printf("Max value: %.2f\n", maxVal);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+
+    // Allocate and initialize data structures
+    std::vector<double> h_val(nItems);                  // Non-zero values
+    std::vector<index_t> h_cols(nItems);                // Column indices
+    std::vector<index_t> h_rowDelimiters(numRows + 1);  // Row delimiters
+    std::vector<double> h_vec(numRows);                 // Dense vector
+    std::vector<double> h_out(numRows);                 // Output vector
+
+    printf("Initializing data structures...\n");
+    fill(h_vec.data(), numRows, maxVal);
+    fill(h_val.data(), nItems, maxVal);
+    initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+
+    // For validation, compute reference solution
+    std::vector<double> h_reference;
+    if (validate) {
+        printf("Computing reference solution...\n");
+        h_reference.resize(numRows);
+        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(), 
+                h_vec.data(), numRows, h_reference.data());
+    }
+
+    // Perform SpMV computation
+    printf("Computing SpMV...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (index_t iter = 0; iter < iterations; ++iter) {
+        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+                h_vec.data(), numRows, h_out.data());
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+    printf("Computation time: %ld ms\n", duration.count());
+    
+    // Calculate performance metrics
+    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+    const double avgTime = duration.count() / static_cast<double>(iterations);
+    
+    printf("Average time per iteration: %.3f ms\n", avgTime);
+    printf("Performance: %.3f GFLOPS\n", gflops);
+    
+    // Print results for external validation
+    if (printResults) {
+        print_results(h_out, "OutputVector");
+    }
+
+    // Validation
+    if (validate) {
+        printf("Validating result...\n");
+        const bool valid = verifyResults(h_reference.data(), h_out.data(), numRows);
+
+        if (valid) {
+            printf("Validation: PASSED\n");
+            return 0;
+        } else {
+            printf("Validation: FAILED\n");
+            return 1;
+        }
+    }
+
+    return 0;
+}
+cmake_minimum_required(VERSION 3.10)
+project(spmv_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(spmv spmv.cpp)
+
+# Enable optimizations
+target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link math library
+target_link_libraries(spmv m)
+
+exec
+/bin/bash -lc 'cat common/*.hpp; head -c 2000 output.txt; nvidia-smi -L; nvcc --version; mpicxx --showme; cmake --version' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 0ms:
+#pragma once
+
+#include <cstdint>
+
+// FNV-1a hash, 64 bit length
+class hash {
+  public:
+	using digest = uint64_t;
+
+	template <typename T>
+	void add(const T& value) {
+		const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&value);
+		for(size_t i = 0; i < sizeof(T); ++i) {
+			d = (d ^ bytes[i]) * 0x100000001b3ull;
+		}
+	}
+
+	digest get() const { return d; }
+
+  private:
+	digest d = 0xcbf29ce484222325ull;
+};
+#pragma once
+
+#include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+#include "hash.hpp"
+
+// Kahan summation for numerically stable sum
+template <typename T>
+T kahan_sum(const std::vector<T>& data) {
+    T sum = 0.0;
+    T c = 0.0;
+    for (const auto& val : data) {
+        T y = val - c;
+        T t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    return sum;
+}
+
+// Print results for floating-point arrays
+template <typename T>
+void print_results(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute statistics
+    T sum = kahan_sum(data);
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Sum: %.17e\n", static_cast<double>(sum));
+    printf("Min: %.17e\n", static_cast<double>(min_val));
+    printf("Max: %.17e\n", static_cast<double>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %.17e\n", indices[i], static_cast<double>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+// Print results for integer arrays (uses exact hash comparison)
+template <typename T>
+void print_results_int(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Compute min/max
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Min: %lld\n", static_cast<long long>(min_val));
+    printf("Max: %lld\n", static_cast<long long>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %lld\n", indices[i], static_cast<long long>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+Reading additional input from stdin...
+OpenAI Codex v0.171.0
+--------
+workdir: /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+model: gpt-6.2-astra
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a20e30-fd14-7001-b8d4-6972a54c7196
+--------
+user
+Parallelize the spmv benchmark code found in ./spmv/ with a hybrid approach combining MPI, OpenMP, and CUDA as appropriate for the problem for maximum parallel performance on an accelerator cluster. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the benchmark, its build configuration, and the available toolchain before choosing how to distribute the work across ranks, CPU threads, and GPUs.
+exec
+/bin/bash -lc 'which nvcc mpicxx cmake nvidia-smi; git status --short' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ exited 128 in 0ms:
+/usr/bin/nvcc
+/usr/bin/mpicxx
+/usr/bin/cmake
+/usr/bin/nvidia-smi
+fatal: not a git repository (or any parent up to mount point /home/llmtest/evals/20261123-155235)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+
+exec
+/bin/bash -lc 'pwd; rg --files --hidden -g "!.git"' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 0ms:
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+output.txt
+common/hash.hpp
+common/results_output.hpp
+spmv/CMakeLists.txt
+spmv/spmv.cpp
+
+GPU 0: NVIDIA GeForce RTX 3090 (UUID: GPU-4f1989a7-c63d-513a-9f64-f15a2b645711)
+GPU 1: NVIDIA GeForce RTX 3090 (UUID: GPU-1473665e-4215-7a01-796d-d609ffdd4df2)
+GPU 2: NVIDIA GeForce RTX 3090 (UUID: GPU-328fd8bf-ca8e-af00-f146-7df4ccc209b8)
+GPU 3: NVIDIA GeForce RTX 3090 (UUID: GPU-c9989076-aaa3-27d9-281a-f4b3094e29f9)
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2023 NVIDIA Corporation
+Built on Fri_Jan__6_16:45:21_PST_2023
+Cuda compilation tools, release 12.0, V12.0.140
+Build cuda_12.0.r12.0/compiler.32267302_0
+g++ -I/usr/lib/x86_64-linux-gnu/openmpi/include -I/usr/lib/x86_64-linux-gnu/openmpi/include/openmpi -L/usr/lib/x86_64-linux-gnu/openmpi/lib -lmpi_cxx -lmpi
+cmake version 3.30.2
+
+CMake suite maintained and supported by Kitware (kitware.com/cmake).
+
+exec
+/bin/bash -lc 'b=$(mktemp -d)
+echo "$b"
+g++ -O3 -march=native spmv/spmv.cpp -o "$b/original"
+objdump -dC "$b/original" | sed -n '"'/"'^.*<spmvCpu(double const.*, double'"\\*)>:/,/"'^$/p'"' | tail -45
+\""'$b/original" -r | tail -2
+nproc' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 768ms:
+/tmp/tmp.4orLLgYXBk
+    1f01:	00 
+    1f02:	48 89 f3             	mov    %rsi,%rbx
+    1f05:	48 89 d5             	mov    %rdx,%rbp
+    1f08:	49 89 ca             	mov    %rcx,%r10
+    1f0b:	45 31 c0             	xor    %r8d,%r8d
+    1f0e:	66 90                	xchg   %ax,%ax
+    1f10:	42 8b 44 05 00       	mov    0x0(%rbp,%r8,1),%eax
+    1f15:	42 8b 4c 05 04       	mov    0x4(%rbp,%r8,1),%ecx
+    1f1a:	39 c8                	cmp    %ecx,%eax
+    1f1c:	73 52                	jae    1f70 <spmvCpu(double const*, unsigned int const*, unsigned int const*, double const*, unsigned int, double*)+0x90>
+    1f1e:	ff c9                	dec    %ecx
+    1f20:	48 8d 3c 83          	lea    (%rbx,%rax,4),%rdi
+    1f24:	49 8d 34 c3          	lea    (%r11,%rax,8),%rsi
+    1f28:	c5 f1 57 c9          	vxorpd %xmm1,%xmm1,%xmm1
+    1f2c:	29 c1                	sub    %eax,%ecx
+    1f2e:	31 c0                	xor    %eax,%eax
+    1f30:	8b 14 87             	mov    (%rdi,%rax,4),%edx
+    1f33:	c4 c1 7b 10 04 d2    	vmovsd (%r10,%rdx,8),%xmm0
+    1f39:	48 89 c2             	mov    %rax,%rdx
+    1f3c:	c5 fb 59 04 c6       	vmulsd (%rsi,%rax,8),%xmm0,%xmm0
+    1f41:	48 ff c0             	inc    %rax
+    1f44:	c5 f3 58 c8          	vaddsd %xmm0,%xmm1,%xmm1
+    1f48:	48 39 d1             	cmp    %rdx,%rcx
+    1f4b:	75 e3                	jne    1f30 <spmvCpu(double const*, unsigned int const*, unsigned int const*, double const*, unsigned int, double*)+0x50>
+    1f4d:	c4 81 7b 11 0c 44    	vmovsd %xmm1,(%r12,%r8,2)
+    1f53:	49 83 c0 04          	add    $0x4,%r8
+    1f57:	4d 39 c1             	cmp    %r8,%r9
+    1f5a:	75 b4                	jne    1f10 <spmvCpu(double const*, unsigned int const*, unsigned int const*, double const*, unsigned int, double*)+0x30>
+    1f5c:	5b                   	pop    %rbx
+    1f5d:	5d                   	pop    %rbp
+    1f5e:	41 5c                	pop    %r12
+    1f60:	c3                   	ret
+    1f61:	66 66 2e 0f 1f 84 00 	data16 cs nopw 0x0(%rax,%rax,1)
+    1f68:	00 00 00 00 
+    1f6c:	0f 1f 40 00          	nopl   0x0(%rax)
+    1f70:	c5 f1 57 c9          	vxorpd %xmm1,%xmm1,%xmm1
+    1f74:	c4 81 7b 11 0c 44    	vmovsd %xmm1,(%r12,%r8,2)
+    1f7a:	49 83 c0 04          	add    $0x4,%r8
+    1f7e:	4d 39 c1             	cmp    %r8,%r9
+    1f81:	75 8d                	jne    1f10 <spmvCpu(double const*, unsigned int const*, unsigned int const*, double const*, unsigned int, double*)+0x30>
+    1f83:	eb d7                	jmp    1f5c <spmvCpu(double const*, unsigned int const*, unsigned int const*, double const*, unsigned int, double*)+0x7c>
+    1f85:	c3                   	ret
+    1f86:	66 2e 0f 1f 84 00 00 	cs nopw 0x0(%rax,%rax,1)
+    1f8d:	00 00 00 
+
+Hash: 878c45f3660143ae
+=== END RESULTS ===
+256
+
+codex
+The benchmark’s matrix generator uses a fixed random stream and forces entries near the end to hit an exact nonzero count. I’ll preserve both properties while generating row partitions locally, so rank zero doesn’t have to build and distribute the full matrix.
+exec
+/bin/bash -lc "cat > spmv/CMakeLists.txt <<'EOF'
+cmake_minimum_required(VERSION 3.20)
+project(spmv_benchmark LANGUAGES CXX CUDA)
+
+find_package(MPI REQUIRED COMPONENTS CXX)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+
+set_source_files_properties(spmv.cpp PROPERTIES LANGUAGE CUDA)
+add_executable(spmv spmv.cpp)
+set_target_properties(spmv PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+target_compile_options(spmv PRIVATE -O3
+    "'$<$<CUDA_COMPILER_ID:NVIDIA>:-Xcompiler=${OpenMP_CXX_FLAGS}>
+    $<$<CUDA_COMPILER_ID:Clang>:${OpenMP_CXX_FLAGS}>)
+target_link_libraries(spmv PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX)
+EOF
+python3 - <<'"'PY'
+p='spmv/spmv.cpp'
+s=open(p).read()
+usage=s[s.index('void printUsage'):s.index('int main')]
+args=s[s.index('    index_t numRows'):s.index('    // Calculate number')]
+open(p,'w').write('''#include <mpi.h>
+#include <cuda_runtime.h>
+#include <omp.h>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include \"../common/results_output.hpp\"
+
+using index_t = uint32_t;
+using wide = uint64_t;
+
+static void check(cudaError_t status) {
+    if (status "'!= cudaSuccess) {
+        int rank;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        fprintf(stderr, "Rank %d: %s'"\\\\n\", rank, cudaGetErrorString(status));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
+
+// The Linux libc rand() sequence is a lagged additive generator. Advancing
+// by a polynomial in its shift operator lets each worker start at the exact
+// position the serial generator would have reached, without replaying it.
+class RandomStream {
+    using State = std::array<uint32_t, 31>;
+    State state{};
+    unsigned head = 0;
+
+    static State multiply(const State& a, const State& b) {
+        uint32_t product[61]{};
+        for (int i = 0; i < 31; ++i)
+            for (int j = 0; j < 31; ++j)
+                product[i + j] += a[i] * b[j];
+        // s[i+31] = s[i+28] + s[i], with arithmetic modulo 2"'^32.
+        for (int i = 60; i >= 31; --i) {
+            product[i - 3] += product[i];
+            product[i - 31] += product[i];
+        }
+        State result;
+        std::copy_n(product, 31, result.begin());
+        return result;
+    }
+
+    uint32_t step() {
+        unsigned lag = head < 3 ? head + 28 : head - 3;
+        uint32_t value = (state[head] += state[lag]);
+        if (++head == 31) head = 0;
+        return value;
+    }
+
+public:
+    explicit RandomStream(uint32_t seed) {
+        // Put the oldest word first (libc starts its write pointer at 3).
+        for (int i = 0; i < 31; ++i) {
+            state[(i + 28) % 31] = seed;
+            seed = (wide(seed) * 16807) % 2147483647;
+        }
+        for (int i = 0; i < 310; ++i) step();
+    }
+
+    uint32_t next() { return step() >> 1; }
+
+    void skip(wide distance) {
+        if (!distance) return;
+        static const auto powers = [] {
+            std::array<State, 64> table{};
+            table[0][1] = 1;
+            for (int i = 1; i < 64; ++i)
+                table[i] = multiply(table[i-1], table[i-1]);
+            return table;
+        }();
+        State coefficients{};
+        coefficients[0] = 1;
+        for (int i = 0; distance; distance >>= 1, ++i)
+            if (distance & 1) coefficients = multiply(coefficients, powers[i]);
+
+        State advanced{};
+        for (int j = 0; j < 31; ++j) {
+            for (int i = 0; i < 31; ++i)
+                advanced[i] += coefficients[i] * state[(head + i) % 31];
+            step();
+        }
+        state = advanced;
+        head = 0;
+    }
+};
+
+struct Matrix {
+    std::vector<wide> offsets;
+    std::vector<index_t> columns;
+    std::vector<double> values;
+};
+
+static Matrix initialize(index_t first, index_t rows, index_t dim, wide nnz,
+                         double maximum, std::vector<double>& vec) {
+    const wide cells = wide(dim) * dim;
+    const double probability = cells ? double(nnz) / double(cells) : 0;
+    // Match rand() / RAND_MAX <= probability, including boundary rounding.
+    uint32_t cutoff = uint32_t(probability * 2147483647.0);
+    if (double(cutoff) / 2147483647.0 > probability) --cutoff;
+    if (double(cutoff + 1u) / 2147483647.0 <= probability) ++cutoff;
+    Matrix a;
+    a.offsets.resize(size_t(rows) + 1);
+    constexpr unsigned tile = 32;
+    const int blocks = int((wide(rows) + tile - 1) / tile);
+    #pragma omp parallel for schedule(static)
+    for (int b = 0; b < blocks; ++b) {
+        index_t begin = index_t(b) * tile;
+        RandomStream random(8675309);
+        random.skip(wide(first + begin) * dim);
+        for (wide r = begin; r < std::min<wide>(rows, wide(begin) + tile); ++r) {
+            wide count = 0;
+            if (nnz == cells) count = dim;
+            else if (nnz)
+                for (index_t j = 0; j < dim; ++j) count += random.next() <= cutoff;
+            a.offsets[r + 1] = count;
+        }
+    }
+    for (size_t r = 0; r < rows; ++r) a.offsets[r + 1] += a.offsets[r];
+    wide preceding = 0;
+    MPI_Exscan(&a.offsets.back(), &preceding, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    if (!first) preceding = 0;
+    // At any row boundary the serial count is bounded by the quota and
+    // by the number of cells still available to satisfy it.
+    auto assigned = [&](wide observed, wide processed) {
+        wide remaining = cells - processed;
+        return std::max(std::min(observed, nnz), nnz > remaining ? nnz - remaining : 0);
+    };
+    const wide base = assigned(preceding, wide(first) * dim);
+    for (size_t r = 0; r <= rows; ++r)
+        a.offsets[r] = assigned(preceding + a.offsets[r], (first + r) * dim) - base;
+    a.columns.resize(a.offsets.back());
+    a.values.resize(a.offsets.back());
+
+    #pragma omp parallel
+    {
+        int thread = omp_get_thread_num(), team = omp_get_num_threads();
+        size_t begin = wide(rows) * thread / team, end = wide(rows) * (thread + 1) / team;
+        RandomStream position(8675309);
+        position.skip((wide(first) + begin) * dim);
+        RandomStream value(1);
+        value.skip(wide(dim) + base + a.offsets[begin]);
+        for (size_t r = begin; r < end; ++r) {
+            wide write = a.offsets[r], stop = a.offsets[r+1];
+            wide left = nnz - base - write;
+            wide remaining = cells - (first + r) * dim;
+            for (index_t j = 0; j < dim && write < stop; ++j) {
+                bool take = position.next() <= cutoff || left == remaining;
+                if (take) {
+                    a.columns[write] = j;
+                    a.values[write++] = maximum * (value.next() / 2147483648.0);
+                    --left;
+                }
+                --remaining;
+                // Consume the unused draws before the next row.
+                if (write == stop && r + 1 < end && base + write < nnz)
+                    for (index_t k = j + 1; k < dim; ++k) position.next();
+            }
+            if (a.offsets[r] == stop && r + 1 < end && base + stop < nnz)
+                for (index_t k = 0; k < dim; ++k) position.next();
+        }
+        size_t vbegin = wide(dim) * thread / team, vend = wide(dim) * (thread + 1) / team;
+        RandomStream vectorRandom(1);
+        vectorRandom.skip(vbegin);
+        for (size_t i = vbegin; i < vend; ++i)
+            vec[i] = maximum * (vectorRandom.next() / 2147483648.0);
+    }
+    return a;
+}
+
+template<class T>
+static T* upload(const std::vector<T>& host) {
+    if (host.empty()) return nullptr;
+    T* device;
+    check(cudaMalloc(&device, host.size() * sizeof(T)));
+    check(cudaMemcpy(device, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice));
+    return device;
+}
+
+// Slice the matrix into warps of rows and interleave entries by their
+// position in each row. Adjacent lanes then load adjacent values/indices
+// while each lane retains the original summation order.
+__global__ void spmvKernel(const wide* slices, const index_t* lengths,
+                           const index_t* columns, const double* values,
+                           const double* vec, index_t rows, double* out) {
+    index_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    wide pos = slices[r / 32] + r % 32;
+    double sum = 0;
+    for (index_t k = 0; k < lengths[r]; ++k, pos += 32)
+        sum = __dadd_rn(sum, __dmul_rn(values[pos], vec[columns[pos]]));
+    out[r] = sum;
+}
+
+'"''' + usage + '''static int run(int argc, char** argv, int rank, int ranks) {
+''' + args.replace('printUsage(argv[0]);','if ("'!rank) printUsage(argv[0]);'"').replace('printf(\"Unknown','if ("'!rank) printf("Unknown'"'))
+PY" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 0ms:
+exec
+/bin/bash -lc "python3 - <<'PY'
+p='spmv/spmv.cpp'
+s=open(p).read()
+i=s.index('    constexpr unsigned tile')
+j=s.index('            wide count',i)
+s=s[:i]+'''    #pragma omp parallel
+    {
+        int thread = omp_get_thread_num(), team = omp_get_num_threads();
+        size_t begin = wide(rows) * thread / team, end = wide(rows) * (thread + 1) / team;
+        RandomStream random(8675309);
+        random.skip((wide(first) + begin) * dim);
+        for (size_t r = begin; r < end; ++r) {
+'''+s[j:]
+i=s.index('            for (index_t j = 0; j < dim && write')
+j=s.index('        }\\n        size_t vbegin',i)
+s=s[:i]+'''            if ("'!left) break;
+            for (index_t j = 0; j < dim; ++j) {
+                if (left == remaining || position.next() <= cutoff) {
+                    a.columns[write] = j;
+                    a.values[write++] = maximum * (value.next() / 2147483648.0);
+                    if (!--left) break;
+                }
+                --remaining;
+            }
+'"'''+s[j:]
+s=s.replace('wide write = a.offsets[r], stop = a.offsets[r+1];','wide write = a.offsets[r];')
+open(p,'w').write(s)
+PY
+cat >> spmv/spmv.cpp <<'EOF'
+    if ("'!sparsity || numRows > std::numeric_limits<int>::max()) {
+        if (!rank) fprintf(stderr, "Invalid matrix dimension or sparsity'"\\n\");
+        return 1;
+    }
+    const wide cells = wide(numRows) * numRows;
+    const wide nnz = cells / sparsity;
+    if ("'!rank) {
+        printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark'"\\n\");
+        printf(\"Matrix size: %u x %u\\n\", numRows, numRows);
+        printf(\"Sparsity: 1 out of %u entries is non-zero\\n\", sparsity);
+        printf(\"Non-zero elements: %llu (%.2f%% sparse)\\n\",
+               static_cast<unsigned long long>(nnz), cells ? 100.0 * (1.0 - double(nnz) / cells) : 100.0);
+        printf(\"Iterations: %u\\nMax value: %.2f\\nValidation: %s\\n\", iterations, maxVal,
+               validate ? \"enabled\" : \"disabled\");
+        printf(\"Initializing data structures...\\n\");
+    }
+
+    MPI_Comm node;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &node);
+    int localRank, devices;
+    MPI_Comm_rank(node, &localRank);
+    MPI_Comm_free(&node);
+    check(cudaGetDeviceCount(&devices));
+    if ("'!devices) {
+        fprintf(stderr, "Rank %d requires a CUDA device'"\\n\", rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    check(cudaSetDevice(localRank % devices));
+
+    auto boundary = [&](int i) { return index_t(wide(numRows) * i / ranks); };
+    const index_t first = boundary(rank), rows = boundary(rank + 1) - first;
+    std::vector<double> vec(numRows), result(rows), reference(validate ? rows : 0);
+    auto matrix = initialize(first, rows, numRows, nnz, maxVal, vec);
+    if (validate) {
+        if ("'!rank) printf("Computing reference solution...'"\\n\");
+        #pragma omp parallel for schedule(static)
+        for (index_t r = 0; r < rows; ++r) {
+            double sum = 0;
+            for (wide j = matrix.offsets[r]; j < matrix.offsets[r + 1]; ++j)
+                sum += matrix.values[j] * vec[matrix.columns[j]];
+            reference[r] = sum;
+        }
+    }
+
+    const index_t slices = (rows + 31) / 32;
+    std::vector<wide> offsets(size_t(slices) + 1);
+    std::vector<index_t> lengths(rows);
+    for (index_t s = 0; s < slices; ++s) {
+        index_t longest = 0;
+        for (index_t r = s * 32; r < std::min(rows, (s + 1) * 32); ++r) {
+            lengths[r] = matrix.offsets[r + 1] - matrix.offsets[r];
+            longest = std::max(longest, lengths[r]);
+        }
+        offsets[s + 1] = offsets[s] + wide(longest) * 32;
+    }
+    std::vector<double> packedValues(offsets.back());
+    std::vector<index_t> packedColumns(offsets.back());
+    #pragma omp parallel for schedule(static)
+    for (index_t s = 0; s < slices; ++s) {
+        for (index_t r = s * 32; r < std::min(rows, (s + 1) * 32); ++r) {
+            wide pos = offsets[s] + r % 32;
+            for (wide j = matrix.offsets[r]; j < matrix.offsets[r + 1]; ++j, pos += 32) {
+                packedValues[pos] = matrix.values[j];
+                packedColumns[pos] = matrix.columns[j];
+            }
+        }
+    }
+
+    matrix = {};
+    auto dOffsets = upload(offsets);
+    auto dLengths = upload(lengths);
+    auto dValues = upload(packedValues);
+    auto dColumns = upload(packedColumns);
+    auto dVec = upload(vec);
+    double* dOut = nullptr;
+    if (rows) check(cudaMalloc(&dOut, rows * sizeof(double)));
+    if ("'!rank) printf("Computing SpMV...'"\\n\");
+    check(cudaDeviceSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+    double start = MPI_Wtime();
+    if (rows && iterations) {
+        for (index_t iter = 0; iter < iterations; ++iter)
+            spmvKernel<<<(rows + 127) / 128, 128>>>(dOffsets, dLengths, dColumns, dValues,
+                                                    dVec, rows, dOut);
+        check(cudaGetLastError());
+        check(cudaDeviceSynchronize());
+    }
+    double elapsed = MPI_Wtime() - start, seconds;
+    MPI_Reduce(&elapsed, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    if ("'!rank) {
+        printf("Computation time: %.3f ms'"\\n\", seconds * 1000);
+        printf(\"Average time per iteration: %.3f ms\\n\", iterations ? seconds * 1000 / iterations : 0);
+        printf(\"Performance: %.3f GFLOPS\\n\", seconds ? 2e-9 * nnz * iterations / seconds : 0);
+    }
+
+    if (rows && iterations && (validate || printResults))
+        check(cudaMemcpy(result.data(), dOut, rows * sizeof(double), cudaMemcpyDeviceToHost));
+    check(cudaFree(dOut));
+    check(cudaFree(dVec));
+    check(cudaFree(dColumns));
+    check(cudaFree(dValues));
+    check(cudaFree(dLengths));
+    check(cudaFree(dOffsets));
+    if (printResults) {
+        std::vector<int> counts, displacements;
+        std::vector<double> full;
+        if ("'!rank) {
+            full.resize(numRows);
+            counts.resize(ranks);
+            displacements.resize(ranks);
+            for (int i = 0; i < ranks; ++i) {
+                counts[i] = boundary(i + 1) - boundary(i);
+                displacements[i] = boundary(i);
+            }
+        }
+        MPI_Gatherv(result.data(), rows, MPI_DOUBLE, full.data(), counts.data(),
+                    displacements.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        if (!rank) print_results(full, "OutputVector");
+    }
+    if (validate) {
+        index_t bad = numRows;
+        #pragma omp parallel for reduction(min:bad)
+        for (index_t r = 0; r < rows; ++r) {
+            double ref = reference[r], res = result[r];
+            double error = std::abs(ref) < 1e-10 ? std::abs(res) : std::abs((res - ref) / ref);
+            if (!(error <= 0.02)) bad = std::min(bad, first + r);
+        }
+        index_t globalBad;
+        MPI_Allreduce(&bad, &globalBad, 1, MPI_UINT32_T, MPI_MIN, MPI_COMM_WORLD);
+        if (!rank) printf("Validating result...'"\\n\");
+        if (globalBad >= first && globalBad - first < rows)
+            printf(\"Validation failed at index %u: reference %.10e, got %.10e\\n\", globalBad,
+                   reference[globalBad-first], result[globalBad-first]);
+        if ("'!rank) printf("Validation: %s'"\\n\", globalBad == numRows ? \"PASSED\" : \"FAILED\");
+        return globalBad "'!= numRows;
+    }
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    int provided, rank, ranks;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+    if (provided < MPI_THREAD_FUNNELED) MPI_Abort(MPI_COMM_WORLD, 1);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+    int status = run(argc, argv, rank, ranks);
+    MPI_Finalize();
+    return status;
+}
+EOF
+cmake -S spmv -B /tmp/tmp.4orLLgYXBk/build && cmake --build /tmp/tmp.4orLLgYXBk/build -j4' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 15071ms:
+-- The CXX compiler identification is GNU 13.2.0
+-- The CUDA compiler identification is NVIDIA 12.0.140
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Found OpenMP_CXX: -fopenmp (found version "4.5")
+-- Found OpenMP: TRUE (found version "4.5") found components: CXX
+-- Configuring done (10.1s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/tmp.4orLLgYXBk/build
+[ 50%] Building CUDA object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CUDA executable spmv
+[100%] Built target spmv
+
+exec
+/bin/bash -lc "export OMP_NUM_THREADS=3 OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+python3 - <<'PY'
+import subprocess as s
+b='/tmp/tmp.4orLLgYXBk'
+for p, args in [(4,[]),(2,['-n','125','-s','5','-m','-3.14']),(4,['-n','2','-s','1']),(3,['-n','17','-s','999']),(2,['-n','0']),(2,['-s','1','-i','0'])]:
+    args+=['-r','-v']
+    ref=s.run([b+'/original',*args],capture_output=True,text=True)
+    run=s.run(['mpirun','--bind-to','none','-np',str(p),b+'/build/spmv',*args],capture_output=True,text=True)
+    print(p,args,run.returncode,run.stdout[-200:],run.stderr[:300],flush=True)
+    assert run.returncode==ref.returncode and run.stdout.partition('=== RESULTS ===')[2].partition('=== END RESULTS ===')[0]==ref.stdout.partition('=== RESULTS ===')[2].partition('=== END RESULTS ===')[0]
+PY" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ exited 1 in 5954ms:
+4 ['-r', '-v'] 0 e+01
+Sample[512]: 3.12467600342863037e+01
+Sample[768]: 2.33160310251966187e+01
+Sample[1023]: 1.25093400096941849e+02
+Hash: 06562ab9bc347ae3
+=== END RESULTS ===
+Validating result...
+Validation: PASSED
+ 
+Traceback (most recent call last):
+  File "<stdin>", line 8, in <module>
+AssertionError
+
+exec
+/bin/bash -lc '/tmp/tmp.4orLLgYXBk/original -v -r | tail -15
+OMP_NUM_THREADS=1 /tmp/tmp.4orLLgYXBk/build/spmv -r -v |tail -15
+/tmp/tmp.4orLLgYXBk/original -n 4 -s 1 -r |tail -12
+OMP_NUM_THREADS=1 /tmp/tmp.4orLLgYXBk/build/spmv -n 4 -s 1 -r |tail -12' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 9275ms:
+=== RESULTS ===
+Name: OutputVector
+Elements: 1024
+Sum: 2.64923178037303951e+04
+Min: 1.61287140372775646e+01
+Max: 1.37070805085584794e+02
+Sample[0]: 2.77651784395352692e+01
+Sample[256]: 2.12393609971005759e+01
+Sample[512]: 2.79785828840587563e+01
+Sample[768]: 2.85371971652506211e+01
+Sample[1023]: 1.37070805085584794e+02
+Hash: 878c45f3660143ae
+=== END RESULTS ===
+Validating result...
+Validation: PASSED
+=== RESULTS ===
+Name: OutputVector
+Elements: 1024
+Sum: 2.64211596732354628e+04
+Min: 1.47464351061167580e+01
+Max: 1.31735989930724514e+02
+Sample[0]: 2.99701231954100926e+01
+Sample[256]: 2.04929980245762309e+01
+Sample[512]: 2.63363465998486852e+01
+Sample[768]: 2.42749305986110890e+01
+Sample[1023]: 1.31735989930724514e+02
+Hash: ded23a4c751f2b93
+=== END RESULTS ===
+Validating result...
+Validation: PASSED
+Name: OutputVector
+Elements: 4
+Sum: 6.44629302796717507e+00
+Min: 1.32782417440979739e+00
+Max: 1.98618116458489702e+00
+Sample[0]: 1.71976374131789589e+00
+Sample[1]: 1.32782417440979739e+00
+Sample[2]: 1.98618116458489702e+00
+Sample[3]: 1.41252394765458456e+00
+Sample[3]: 1.41252394765458456e+00
+Hash: 0d5125582b4dd65d
+=== END RESULTS ===
+Name: OutputVector
+Elements: 4
+Sum: 1.60603179622477832e+00
+Min: 0.00000000000000000e+00
+Max: 9.34511919637789568e-01
+Sample[0]: 0.00000000000000000e+00
+Sample[1]: 9.34511919637789568e-01
+Sample[2]: 4.46602688487246990e-01
+Sample[3]: 2.24917188099741788e-01
+Sample[3]: 2.24917188099741788e-01
+Hash: 702b83431d8d0532
+=== END RESULTS ===
+
+exec
+/bin/bash -lc "sed -n '25,178p' spmv/spmv.cpp
+g++ -std=c++17 -x c++ -o /tmp/tmp.4orLLgYXBk/random - <<EOF
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <array>
+#include <algorithm>
+using wide=uint64_t;
+"'$(sed -n '"'/"'^class RandomStream/,/''^};/p'"' spmv/spmv.cpp)
+int main(){RandomStream a(1),b(1); b.skip(4); for(int i=0;i<20;++i) printf(\"%d %u %u\\n\",rand(),a.next(),b.next());}
+EOF
+/tmp/tmp.4orLLgYXBk/random" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 140ms:
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
+
+// The Linux libc rand() sequence is a lagged additive generator. Advancing
+// by a polynomial in its shift operator lets each worker start at the exact
+// position the serial generator would have reached, without replaying it.
+class RandomStream {
+    using State = std::array<uint32_t, 31>;
+    State state{};
+    unsigned head = 0;
+
+    static State multiply(const State& a, const State& b) {
+        uint32_t product[61]{};
+        for (int i = 0; i < 31; ++i)
+            for (int j = 0; j < 31; ++j)
+                product[i + j] += a[i] * b[j];
+        // s[i+31] = s[i+28] + s[i], with arithmetic modulo 2^32.
+        for (int i = 60; i >= 31; --i) {
+            product[i - 3] += product[i];
+            product[i - 31] += product[i];
+        }
+        State result;
+        std::copy_n(product, 31, result.begin());
+        return result;
+    }
+
+    uint32_t step() {
+        unsigned lag = head < 3 ? head + 28 : head - 3;
+        uint32_t value = (state[head] += state[lag]);
+        if (++head == 31) head = 0;
+        return value;
+    }
+
+public:
+    explicit RandomStream(uint32_t seed) {
+        // Put the oldest word first (libc starts its write pointer at 3).
+        for (int i = 0; i < 31; ++i) {
+            state[(i + 28) % 31] = seed;
+            seed = (wide(seed) * 16807) % 2147483647;
+        }
+        for (int i = 0; i < 310; ++i) step();
+    }
+
+    uint32_t next() { return step() >> 1; }
+
+    void skip(wide distance) {
+        if (!distance) return;
+        static const auto powers = [] {
+            std::array<State, 64> table{};
+            table[0][1] = 1;
+            for (int i = 1; i < 64; ++i)
+                table[i] = multiply(table[i-1], table[i-1]);
+            return table;
+        }();
+        State coefficients{};
+        coefficients[0] = 1;
+        for (int i = 0; distance; distance >>= 1, ++i)
+            if (distance & 1) coefficients = multiply(coefficients, powers[i]);
+
+        State advanced{};
+        for (int j = 0; j < 31; ++j) {
+            for (int i = 0; i < 31; ++i)
+                advanced[i] += coefficients[i] * state[(head + i) % 31];
+            step();
+        }
+        state = advanced;
+        head = 0;
+    }
+};
+
+struct Matrix {
+    std::vector<wide> offsets;
+    std::vector<index_t> columns;
+    std::vector<double> values;
+};
+
+static Matrix initialize(index_t first, index_t rows, index_t dim, wide nnz,
+                         double maximum, std::vector<double>& vec) {
+    const wide cells = wide(dim) * dim;
+    const double probability = cells ? double(nnz) / double(cells) : 0;
+    // Match rand() / RAND_MAX <= probability, including boundary rounding.
+    uint32_t cutoff = uint32_t(probability * 2147483647.0);
+    if (double(cutoff) / 2147483647.0 > probability) --cutoff;
+    if (double(cutoff + 1u) / 2147483647.0 <= probability) ++cutoff;
+    Matrix a;
+    a.offsets.resize(size_t(rows) + 1);
+    #pragma omp parallel
+    {
+        int thread = omp_get_thread_num(), team = omp_get_num_threads();
+        size_t begin = wide(rows) * thread / team, end = wide(rows) * (thread + 1) / team;
+        RandomStream random(8675309);
+        random.skip((wide(first) + begin) * dim);
+        for (size_t r = begin; r < end; ++r) {
+            wide count = 0;
+            if (nnz == cells) count = dim;
+            else if (nnz)
+                for (index_t j = 0; j < dim; ++j) count += random.next() <= cutoff;
+            a.offsets[r + 1] = count;
+        }
+    }
+    for (size_t r = 0; r < rows; ++r) a.offsets[r + 1] += a.offsets[r];
+    wide preceding = 0;
+    MPI_Exscan(&a.offsets.back(), &preceding, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    if (!first) preceding = 0;
+    // At any row boundary the serial count is bounded by the quota and
+    // by the number of cells still available to satisfy it.
+    auto assigned = [&](wide observed, wide processed) {
+        wide remaining = cells - processed;
+        return std::max(std::min(observed, nnz), nnz > remaining ? nnz - remaining : 0);
+    };
+    const wide base = assigned(preceding, wide(first) * dim);
+    for (size_t r = 0; r <= rows; ++r)
+        a.offsets[r] = assigned(preceding + a.offsets[r], (first + r) * dim) - base;
+    a.columns.resize(a.offsets.back());
+    a.values.resize(a.offsets.back());
+
+    #pragma omp parallel
+    {
+        int thread = omp_get_thread_num(), team = omp_get_num_threads();
+        size_t begin = wide(rows) * thread / team, end = wide(rows) * (thread + 1) / team;
+        RandomStream position(8675309);
+        position.skip((wide(first) + begin) * dim);
+        RandomStream value(1);
+        value.skip(wide(dim) + base + a.offsets[begin]);
+        for (size_t r = begin; r < end; ++r) {
+            wide write = a.offsets[r];
+            wide left = nnz - base - write;
+            wide remaining = cells - (first + r) * dim;
+            if (!left) break;
+            for (index_t j = 0; j < dim; ++j) {
+                if (left == remaining || position.next() <= cutoff) {
+                    a.columns[write] = j;
+                    a.values[write++] = maximum * (value.next() / 2147483648.0);
+                    if (!--left) break;
+                }
+                --remaining;
+            }
+        }
+        size_t vbegin = wide(dim) * thread / team, vend = wide(dim) * (thread + 1) / team;
+        RandomStream vectorRandom(1);
+        vectorRandom.skip(vbegin);
+        for (size_t i = vbegin; i < vend; ++i)
+            vec[i] = maximum * (vectorRandom.next() / 2147483648.0);
+    }
+    return a;
+}
+
+template<class T>
+static T* upload(const std::vector<T>& host) {
+    if (host.empty()) return nullptr;
+    T* device;
+    check(cudaMalloc(&device, host.size() * sizeof(T)));
+    check(cudaMemcpy(device, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice));
+1804289383 1804289383 0
+846930886 846930886 0
+1681692777 1681692777 0
+1714636915 1714636915 0
+1957747793 1957747793 1224713219
+424238335 424238335 0
+719885386 719885386 0
+1649760492 1649760492 1224713219
+596516649 596516649 0
+1189641421 1189641421 0
+1025202362 1025202362 1224713219
+1350490027 1350490027 0
+783368690 783368690 0
+1102520059 1102520059 1224713219
+2044897763 2044897763 0
+1967513926 1967513926 0
+1365180540 1365180540 1224713219
+1540383426 1540383426 0
+304089172 304089172 0
+1303455736 1303455736 1224713219
+
+exec
+/bin/bash -lc "sed -i 's/advanced\\[i\\] +=/advanced[j] +=/;s/The Linux libc/The glibc/' spmv/spmv.cpp
+cmake --build /tmp/tmp.4orLLgYXBk/build -j4 && OMP_NUM_THREADS=3 mpirun --allow-run-as-root --bind-to none -np 4 /tmp/tmp.4orLLgYXBk/build/spmv -v -r |tail -18" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 10762ms:
+[ 50%] Building CUDA object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CUDA executable spmv
+[100%] Built target spmv
+Computation time: 0.614 ms
+Average time per iteration: 0.061 ms
+Performance: 3.413 GFLOPS
+=== RESULTS ===
+Name: OutputVector
+Elements: 1024
+Sum: 2.64923178037303951e+04
+Min: 1.61287140372775646e+01
+Max: 1.37070805085584794e+02
+Sample[0]: 2.77651784395352692e+01
+Sample[256]: 2.12393609971005759e+01
+Sample[512]: 2.79785828840587563e+01
+Sample[768]: 2.85371971652506211e+01
+Sample[1023]: 1.37070805085584794e+02
+Hash: 878c45f3660143ae
+=== END RESULTS ===
+Validating result...
+Validation: PASSED
+
+exec
+/bin/bash -lc "export OMP_NUM_THREADS=3 OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+python3 - <<'PY'
+import subprocess as s
+b='/tmp/tmp.4orLLgYXBk'
+for p, args in [(2,['-n','125','-s','5','-m','-3.14']),(4,['-n','2','-s','1']),(3,['-n','17','-s','999']),(2,['-n','0']),(2,['-s','1','-i','0']),(1,['-n','2049','-s','10','-i','100'])]:
+    args+=['-r','-v']
+    ref=s.run([b+'/original',*args],capture_output=True,text=True)
+    run=s.run(['mpirun','--bind-to','none','-np',str(p),b+'/build/spmv',*args],capture_output=True,text=True)
+    equal=run.stdout.partition('=== RESULTS ===')[2].partition('=== END RESULTS ===')[0]==ref.stdout.partition('=== RESULTS ===')[2].partition('=== END RESULTS ===')[0]
+    print(p,args,'equal',equal,'return codes',run.returncode,ref.returncode,flush=True)
+    assert run.returncode==ref.returncode and equal
+PY" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 32679ms:
+2 ['-n', '125', '-s', '5', '-m', '-3.14', '-r', '-v'] equal True return codes 0 0
+4 ['-n', '2', '-s', '1', '-r', '-v'] equal True return codes 0 0
+3 ['-n', '17', '-s', '999', '-r', '-v'] equal True return codes 0 0
+2 ['-n', '0', '-r', '-v'] equal True return codes 0 0
+2 ['-s', '1', '-i', '0', '-r', '-v'] equal True return codes 1 1
+1 ['-n', '2049', '-s', '10', '-i', '100', '-r', '-v'] equal True return codes 0 0
+
+codex
+The four-GPU run now matches the original benchmark’s output hash. Tests also match for uneven row partitions, ranks with no rows, and matrices with no nonzeros. I’ll check the remaining edge cases and measure the GPU kernel on larger inputs.
+exec
+/bin/bash -lc 'OMP_NUM_THREADS=4 /tmp/tmp.4orLLgYXBk/build/spmv -n 4096 -i 100 -s 8 -v | tail -5
+OMP_NUM_THREADS=4 /tmp/tmp.4orLLgYXBk/build/spmv -n 1024 -i 1000 -v |tail -5' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 9322ms:
+Computation time: 32.459 ms
+Average time per iteration: 0.325 ms
+Performance: 12.922 GFLOPS
+Validating result...
+Validation: PASSED
+Computation time: 38.314 ms
+Average time per iteration: 0.038 ms
+Performance: 5.474 GFLOPS
+Validating result...
+Validation: PASSED
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+p='spmv/spmv.cpp'
+s=open(p).read()
+i=s.index('// Slice the matrix')
+j=s.index('void printUsage',i)
+s=s[:i]+'''// Neighboring lanes load a group of consecutive CSR entries together. A
+// shuffle broadcasts each product in column order to preserve the serial sum.
+template<int lanes>
+__global__ void spmvKernel(const wide* offsets, const index_t* columns,
+                           const double* values, const double* vec, index_t rows,
+                           double* out) {
+    wide tid = wide(blockIdx.x) * blockDim.x + threadIdx.x;
+    index_t r = tid / lanes;
+    if (r >= rows) return;
+    unsigned lane = threadIdx.x % lanes;
+    unsigned mask = (0xffffffffu >> (32 - lanes)) << ((threadIdx.x % 32) - lane);
+    wide j = offsets[r], end = offsets[r + 1];
+    double sum = 0;
+    for (; end - j >= lanes; j += lanes) {
+        double product = __dmul_rn(values[j + lane], vec[columns[j + lane]]);
+        #pragma unroll
+        for (int i = 0; i < lanes; ++i)
+            sum = __dadd_rn(sum, __shfl_sync(mask, product, i, lanes));
+    }
+    if (j < end) {
+        double product = j + lane < end ? __dmul_rn(values[j + lane], vec[columns[j + lane]]) : 0;
+        for (int i = 0; i < int(end - j); ++i)
+            sum = __dadd_rn(sum, __shfl_sync(mask, product, i, lanes));
+    }
+    if ("'!lane) out[r] = sum;
+}
+
+'"'''+s[j:]
+i=s.index('    const index_t slices')
+j=s.index('    auto dVec',i)
+s=s[:i]+'''    auto dOffsets = upload(matrix.offsets);
+    auto dValues = upload(matrix.values);
+    auto dColumns = upload(matrix.columns);
+    matrix = {};
+'''+s[j:]
+i=s.index('        for (index_t iter')
+j=s.index('        check(cudaGetLastError',i)
+s=s[:i]+'''        constexpr int lanes = 8, threads = 128;
+        const unsigned blocks = (wide(rows) * lanes + threads - 1) / threads;
+        for (index_t iter = 0; iter < iterations; ++iter)
+            spmvKernel<lanes><<<blocks, threads>>>(dOffsets, dColumns, dValues, dVec, rows, dOut);
+'''+s[j:]
+s=s.replace('    check(cudaFree(dLengths));\\n','')
+s=s.replace('    check(cudaDeviceSynchronize());\\n    MPI_Barrier', '''    cudaFuncAttributes attributes;
+    check(cudaFuncGetAttributes(&attributes, spmvKernel<8>));
+    check(cudaDeviceSynchronize());
+    MPI_Barrier''')
+open(p,'w').write(s)
+PY
+cmake --build /tmp/tmp.4orLLgYXBk/build -j4 && OMP_NUM_THREADS=4 /tmp/tmp.4orLLgYXBk/build/spmv -n 4096 -i 100 -s 8 -v | tail -5
+OMP_NUM_THREADS=4 /tmp/tmp.4orLLgYXBk/build/spmv -n 1024 -i 1000 -v |tail -5" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 14317ms:
+[ 50%] Building CUDA object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CUDA executable spmv
+[100%] Built target spmv
+Computation time: 32.433 ms
+Average time per iteration: 0.324 ms
+Performance: 12.932 GFLOPS
+Validating result...
+Validation: PASSED
+Computation time: 33.415 ms
+Average time per iteration: 0.033 ms
+Performance: 6.276 GFLOPS
+Validating result...
+Validation: PASSED
+
+exec
+/bin/bash -lc "sed -i 's/spmvKernel<8>/spmvKernel<32>/;s/constexpr int lanes = 8/constexpr int lanes = 32/' spmv/spmv.cpp
+cmake --build /tmp/tmp.4orLLgYXBk/build -j4 && OMP_NUM_THREADS=4 /tmp/tmp.4orLLgYXBk/build/spmv -n 4096 -i 100 -s 8 -v | tail -5
+OMP_NUM_THREADS=4 /tmp/tmp.4orLLgYXBk/build/spmv -n 1024 -i 1000 -v |tail -5" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+exec
+/bin/bash -lc "cat /tmp/tmp.4orLLgYXBk/build/CMakeFiles/spmv.dir/flags.make; sed -n '198,440p' spmv/spmv.cpp" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 0ms:
+# CMAKE generated file: DO NOT EDIT!
+# Generated by "Unix Makefiles" Generator, CMake Version 3.30
+
+# compile CUDA with /usr/bin/nvcc
+CUDA_DEFINES = 
+
+CUDA_INCLUDES = --options-file CMakeFiles/spmv.dir/includes_CUDA.rsp
+
+CUDA_FLAGS = -std=c++17 "--generate-code=arch=compute_52,code=[compute_52,sm_52]" -O3 -Xcompiler=-fopenmp
+
+        for (int i = 0; i < lanes; ++i)
+            sum = __dadd_rn(sum, __shfl_sync(mask, product, i, lanes));
+    }
+    if (j < end) {
+        double product = j + lane < end ? __dmul_rn(values[j + lane], vec[columns[j + lane]]) : 0;
+        for (int i = 0; i < int(end - j); ++i)
+            sum = __dadd_rn(sum, __shfl_sync(mask, product, i, lanes));
+    }
+    if (!lane) out[r] = sum;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Number of rows/columns in the matrix (default: 1024)\n");
+    printf("  -s <num>     Sparsity: 1 out of N entries is non-zero (default: 10)\n");
+    printf("  -i <num>     Number of iterations (default: 10)\n");
+    printf("  -m <val>     Maximum value for matrix and vector elements (default: 1.0)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+static int run(int argc, char** argv, int rank, int ranks) {
+    index_t numRows = 1024;
+    index_t sparsity = 10;
+    index_t iterations = 10;
+    double maxVal = 1.0;
+    bool validate = false;
+    bool printResults = false;
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            numRows = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            sparsity = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            iterations = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            maxVal = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            if (!rank) printUsage(argv[0]);
+            return 0;
+        } else {
+            if (!rank) printf("Unknown option: %s\n", argv[i]);
+            if (!rank) printUsage(argv[0]);
+            return 1;
+        }
+    }
+
+    if (!sparsity || numRows > std::numeric_limits<int>::max()) {
+        if (!rank) fprintf(stderr, "Invalid matrix dimension or sparsity\n");
+        return 1;
+    }
+    const wide cells = wide(numRows) * numRows;
+    const wide nnz = cells / sparsity;
+    if (!rank) {
+        printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+        printf("Matrix size: %u x %u\n", numRows, numRows);
+        printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+        printf("Non-zero elements: %llu (%.2f%% sparse)\n",
+               static_cast<unsigned long long>(nnz), cells ? 100.0 * (1.0 - double(nnz) / cells) : 100.0);
+        printf("Iterations: %u\nMax value: %.2f\nValidation: %s\n", iterations, maxVal,
+               validate ? "enabled" : "disabled");
+        printf("Initializing data structures...\n");
+    }
+
+    MPI_Comm node;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &node);
+    int localRank, devices;
+    MPI_Comm_rank(node, &localRank);
+    MPI_Comm_free(&node);
+    check(cudaGetDeviceCount(&devices));
+    if (!devices) {
+        fprintf(stderr, "Rank %d requires a CUDA device\n", rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    check(cudaSetDevice(localRank % devices));
+
+    auto boundary = [&](int i) { return index_t(wide(numRows) * i / ranks); };
+    const index_t first = boundary(rank), rows = boundary(rank + 1) - first;
+    std::vector<double> vec(numRows), result(rows), reference(validate ? rows : 0);
+    auto matrix = initialize(first, rows, numRows, nnz, maxVal, vec);
+    if (validate) {
+        if (!rank) printf("Computing reference solution...\n");
+        #pragma omp parallel for schedule(static)
+        for (index_t r = 0; r < rows; ++r) {
+            double sum = 0;
+            for (wide j = matrix.offsets[r]; j < matrix.offsets[r + 1]; ++j)
+                sum += matrix.values[j] * vec[matrix.columns[j]];
+            reference[r] = sum;
+        }
+    }
+
+    auto dOffsets = upload(matrix.offsets);
+    auto dValues = upload(matrix.values);
+    auto dColumns = upload(matrix.columns);
+    matrix = {};
+    auto dVec = upload(vec);
+    double* dOut = nullptr;
+    if (rows) check(cudaMalloc(&dOut, rows * sizeof(double)));
+    if (!rank) printf("Computing SpMV...\n");
+    cudaFuncAttributes attributes;
+    check(cudaFuncGetAttributes(&attributes, spmvKernel<32>));
+    check(cudaDeviceSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+    double start = MPI_Wtime();
+    if (rows && iterations) {
+        constexpr int lanes = 32, threads = 128;
+        const unsigned blocks = (wide(rows) * lanes + threads - 1) / threads;
+        for (index_t iter = 0; iter < iterations; ++iter)
+            spmvKernel<lanes><<<blocks, threads>>>(dOffsets, dColumns, dValues, dVec, rows, dOut);
+        check(cudaGetLastError());
+        check(cudaDeviceSynchronize());
+    }
+    double elapsed = MPI_Wtime() - start, seconds;
+    MPI_Reduce(&elapsed, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (!rank) {
+        printf("Computation time: %.3f ms\n", seconds * 1000);
+        printf("Average time per iteration: %.3f ms\n", iterations ? seconds * 1000 / iterations : 0);
+        printf("Performance: %.3f GFLOPS\n", seconds ? 2e-9 * nnz * iterations / seconds : 0);
+    }
+
+    if (rows && iterations && (validate || printResults))
+        check(cudaMemcpy(result.data(), dOut, rows * sizeof(double), cudaMemcpyDeviceToHost));
+    check(cudaFree(dOut));
+    check(cudaFree(dVec));
+    check(cudaFree(dColumns));
+    check(cudaFree(dValues));
+    check(cudaFree(dOffsets));
+    if (printResults) {
+        std::vector<int> counts, displacements;
+        std::vector<double> full;
+        if (!rank) {
+            full.resize(numRows);
+            counts.resize(ranks);
+            displacements.resize(ranks);
+            for (int i = 0; i < ranks; ++i) {
+                counts[i] = boundary(i + 1) - boundary(i);
+                displacements[i] = boundary(i);
+            }
+        }
+        MPI_Gatherv(result.data(), rows, MPI_DOUBLE, full.data(), counts.data(),
+                    displacements.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        if (!rank) print_results(full, "OutputVector");
+    }
+    if (validate) {
+        index_t bad = numRows;
+        #pragma omp parallel for reduction(min:bad)
+        for (index_t r = 0; r < rows; ++r) {
+            double ref = reference[r], res = result[r];
+            double error = std::abs(ref) < 1e-10 ? std::abs(res) : std::abs((res - ref) / ref);
+            if (!(error <= 0.02)) bad = std::min(bad, first + r);
+        }
+        index_t globalBad;
+        MPI_Allreduce(&bad, &globalBad, 1, MPI_UINT32_T, MPI_MIN, MPI_COMM_WORLD);
+        if (!rank) printf("Validating result...\n");
+        if (globalBad >= first && globalBad - first < rows)
+            printf("Validation failed at index %u: reference %.10e, got %.10e\n", globalBad,
+                   reference[globalBad-first], result[globalBad-first]);
+        if (!rank) printf("Validation: %s\n", globalBad == numRows ? "PASSED" : "FAILED");
+        return globalBad != numRows;
+    }
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    int provided, rank, ranks;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+    if (provided < MPI_THREAD_FUNNELED) MPI_Abort(MPI_COMM_WORLD, 1);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+    int status = run(argc, argv, rank, ranks);
+    MPI_Finalize();
+    return status;
+}
+
+ succeeded in 14374ms:
+[ 50%] Building CUDA object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CUDA executable spmv
+[100%] Built target spmv
+Computation time: 43.109 ms
+Average time per iteration: 0.431 ms
+Performance: 9.729 GFLOPS
+Validating result...
+Validation: PASSED
+Computation time: 36.939 ms
+Average time per iteration: 0.037 ms
+Performance: 5.677 GFLOPS
+Validating result...
+Validation: PASSED
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+p='spmv/spmv.cpp'
+s=open(p).read().replace('const wide* offsets, const index_t* columns,\\n                           const double* values, const double* vec, index_t rows,','const wide* __restrict__ offsets, const index_t* __restrict__ columns,\\n                           const double* __restrict__ values, const double* __restrict__ vec, index_t rows,')
+s=s.replace('        for (int i = 0; i < int(end - j); ++i)','        #pragma unroll\\n        for (int i = 0; i < lanes; ++i)')
+s=s.replace('    std::vector<double> vec(numRows), result(rows), reference(validate ? rows : 0);','''    // Bound team startup costs on small local partitions.
+    omp_set_num_threads(std::min<wide>(omp_get_max_threads(), 1 + wide(rows) * numRows / 32768));
+    std::vector<double> vec(numRows), result(validate || printResults ? rows : 0);
+    std::vector<double> reference(validate ? rows : 0);''')
+s=s.replace('    cudaFuncAttributes attributes;\\n    check(cudaFuncGetAttributes(&attributes, spmvKernel<32>));','''    const unsigned lanes = nnz <= wide(numRows) * 2 ? 1 : 8;
+    auto kernel = lanes == 1 ? spmvKernel<1> : spmvKernel<8>;
+    constexpr unsigned threads = 128;
+    const unsigned blocks = (wide(rows) * lanes + threads - 1) / threads;
+    cudaFuncAttributes attributes;
+    check(cudaFuncGetAttributes(&attributes, kernel));''')
+s=s.replace('        constexpr int lanes = 32, threads = 128;\\n        const unsigned blocks = (wide(rows) * lanes + threads - 1) / threads;\\n','').replace('spmvKernel<lanes><<<','kernel<<<')
+open(p,'w').write(s)
+PY
+cmake --build /tmp/tmp.4orLLgYXBk/build -j4" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 4916ms:
+[ 50%] Building CUDA object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CUDA executable spmv
+[100%] Built target spmv
+
+exec
+/bin/bash -lc "export OMP_NUM_THREADS=4 OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+python3 - <<'PY'
+import subprocess as s
+b='/tmp/tmp.4orLLgYXBk'
+for p,n,sp,m,it in [(4,1024,10,1,10),(3,4097,8,1.7,100),(1,4097,8,1.7,100),(2,1025,1000,-2,10),(4,2,1,1,1),(3,17,999,1,1),(2,0,10,1,1),(1,1024,1,1,0)]:
+    args=['-n',str(n),'-s',str(sp),'-m',str(m),'-i',str(it),'-v','-r']
+    ref=s.run([b+'/original',*args],capture_output=True,text=True)
+    run=s.run(['mpirun','--bind-to','none','-np',str(p),b+'/build/spmv',*args],capture_output=True,text=True)
+    def result(x):
+        return x.stdout.split('=== RESULTS ===')[1].split('=== END RESULTS ===')[0]
+    print(p,n,sp,run.returncode, [l for l in run.stdout.splitlines() if l.startswith(('Performance:', 'Hash:', 'Validation: P','Validation: F'))],flush=True)
+    assert run.returncode==ref.returncode and result(run)==result(ref),(run.stdout,ref.stdout,run.stderr)
+PY" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+exec
+/bin/bash -lc 'export OMP_NUM_THREADS=4
+b=/tmp/tmp.4orLLgYXBk
+"$b/original" -n 8192 -s 16 -i 100 -r | rg '"'Average time|Hash'
+for ranks in 1 4; do mpirun --allow-run-as-root --bind-to none -np \""'$ranks" "$b/build/spmv" -n 8192 -s 16 -i 100 -v -r | rg '"'Average time|Hash|PASSED'; done" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-astra-medium_hybrid_r3
+ succeeded in 13955ms:
+Average time per iteration: 6.540 ms
+Hash: 67e202d3be3542fa
+Average time per iteration: 0.385 ms
+Hash: 67e202d3be3542fa
+Validation: PASSED
+Average time per iteration: 0.243 ms
+Hash: 67e202d3be3542fa
+Validation: PASSED
+
+ succeeded in 49132ms:
+4 1024 10 0 ['Performance: 5.849 GFLOPS', 'Hash: 878c45f3660143ae', 'Validation: PASSED']
+3 4097 8 0 ['Performance: 17.810 GFLOPS', 'Hash: 6281905b7a80b810', 'Validation: PASSED']
+1 4097 8 0 ['Performance: 14.378 GFLOPS', 'Hash: 6281905b7a80b810', 'Validation: PASSED']
+2 1025 1000 0 ['Performance: 0.377 GFLOPS', 'Hash: b078358707764908', 'Validation: PASSED']
+4 2 1 0 ['Performance: 0.000 GFLOPS', 'Hash: b0efc3033eb77c58', 'Validation: PASSED']
+3 17 999 0 ['Performance: 0.000 GFLOPS', 'Hash: d8f706edf03243c5', 'Validation: PASSED']
+2 0 10 0 ['Performance: 0.000 GFLOPS', 'Validation: PASSED']
+1 1024 1 1 ['Performance: 0.000 GFLOPS', 'Hash: b9d103fd6854a325', 'Validation: FAILED']
+
+codex
+Implemented hybrid MPI, OpenMP, and CUDA parallelization in the existing `spmv` source and CMake files. The executable remains `spmv` and requires all three technologies. MPI partitions rows across ranks, OpenMP generates each partition and computes the validation reference, and CUDA runs every SpMV iteration with data resident on the GPU.
+
+For an 8192 × 8192 matrix with sparsity 16 over 100 iterations, the original averaged **6.540 ms** per iteration. The hybrid version averaged **0.385 ms on one GPU** and **0.243 ms on four GPUs**, a **26.9× speedup** over the original. All three runs produced the same output hash.
+
+Tests also matched the original for uneven partitions, empty ranks, and zero-nonzero matrices. Testing covered one four-GPU node. Multi-node scaling remains unmeasured.
+tokens used
+41,613
+Implemented hybrid MPI, OpenMP, and CUDA parallelization in the existing `spmv` source and CMake files. The executable remains `spmv` and requires all three technologies. MPI partitions rows across ranks, OpenMP generates each partition and computes the validation reference, and CUDA runs every SpMV iteration with data resident on the GPU.
+
+For an 8192 × 8192 matrix with sparsity 16 over 100 iterations, the original averaged **6.540 ms** per iteration. The hybrid version averaged **0.385 ms on one GPU** and **0.243 ms on four GPUs**, a **26.9× speedup** over the original. All three runs produced the same output hash.
+
+Tests also matched the original for uneven partitions, empty ranks, and zero-nonzero matrices. Testing covered one four-GPU node. Multi-node scaling remains unmeasured.

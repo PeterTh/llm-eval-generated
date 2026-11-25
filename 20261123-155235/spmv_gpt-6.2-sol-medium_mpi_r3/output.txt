@@ -1,0 +1,1966 @@
+Reading additional input from stdin...
+OpenAI Codex v0.171.0
+--------
+workdir: /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+model: gpt-6.2-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a20df3-af76-7d13-83ab-b42a9fa77040
+--------
+user
+Parallelize the spmv benchmark code found in ./spmv/ with MPI for distributed memory cluster parallelism. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the benchmark and build setup, then implement the MPI path and verify it across multiple ranks.
+exec
+/bin/bash -lc "git status --short && rg --files --hidden -g '"'!'"\\.git'" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ exited 128 in 0ms:
+fatal: not a git repository (or any parent up to mount point /home/llmtest/evals/20261123-155235)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+
+exec
+/bin/bash -lc 'ls -a && command -v mpicxx && command -v mpiexec' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 0ms:
+.
+..
+common
+output.txt
+spmv
+/usr/bin/mpicxx
+/usr/bin/mpiexec
+
+exec
+/bin/bash -lc 'rg --files --hidden && ls -la spmv && ls -la ..' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 0ms:
+output.txt
+common/hash.hpp
+common/results_output.hpp
+spmv/CMakeLists.txt
+spmv/spmv.cpp
+total 16
+drwxrwxrwx 2 nobody nogroup   44 Nov 24 15:26 .
+drwxrwxrwx 4 nobody nogroup   50 Nov 24 15:26 ..
+-rwxrwxrwx 1 nobody nogroup  300 Nov 24 15:26 CMakeLists.txt
+-rwxrwxrwx 1 nobody nogroup 9869 Nov 24 15:26 spmv.cpp
+total 8
+drwx------ 3 llmtest users   4096 Nov 24 15:26 .
+drwx------ 3 llmtest users   4096 Nov 24 15:26 ..
+drwxrwxrwx 4 nobody  nogroup   50 Nov 24 15:26 spmv_gpt-6.2-sol-medium_mpi_r3
+
+exec
+/bin/bash -lc 'cat spmv/CMakeLists.txt && cat spmv/spmv.cpp' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 0ms:
+cmake_minimum_required(VERSION 3.10)
+project(spmv_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(spmv spmv.cpp)
+
+# Enable optimizations
+target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link math library
+target_link_libraries(spmv m)
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+using index_t = uint32_t;
+
+// Constants
+constexpr double MAX_RELATIVE_ERROR = 0.02;
+
+// ****************************************************************************
+// Function: fill
+//
+// Purpose:
+//   Initialize array with random values
+//
+// Arguments:
+//   A: pointer to the array to initialize
+//   n: number of elements in the array
+//   maxVal: specifies range of random values [0, maxVal]
+//
+// ****************************************************************************
+void fill(double* A, const index_t n, const double maxVal) {
+    for (index_t i = 0; i < n; ++i) {
+        A[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+    }
+}
+
+// ****************************************************************************
+// Function: initRandomMatrix
+//
+// Purpose:
+//   Assigns random positions to a given number of elements in a square
+//   matrix. The function encodes these positions in compressed sparse
+//   row (CSR) format.
+//
+// Arguments:
+//   cols:          array for column indexes of elements (size should be = n)
+//   rowDelimiters: array of size dim+1 holding indices to rows;
+//                  last element is the index one past the last element
+//   n:             number of nonzero elements
+//   dim:           number of rows/columns in the matrix
+//
+// ****************************************************************************
+void initRandomMatrix(index_t* cols, index_t* rowDelimiters, const index_t n, const index_t dim) {
+    index_t nnzAssigned = 0;
+
+    // Figure out the probability that a nonzero should be assigned
+    double prob = static_cast<double>(n) / (static_cast<double>(dim) * static_cast<double>(dim));
+
+    // Seed random number generator
+    srand(8675309);
+
+    // Randomly decide whether entry i,j gets a value, but ensure n values are assigned
+    bool fillRemaining = false;
+    for (index_t i = 0; i < dim; ++i) {
+        rowDelimiters[i] = nnzAssigned;
+        for (index_t j = 0; j < dim; ++j) {
+            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+            index_t needToAssign = n - nnzAssigned;
+            if (numEntriesLeft <= needToAssign) {
+                fillRemaining = true;
+            }
+            double randVal = static_cast<double>(rand()) / RAND_MAX;
+            if ((nnzAssigned < n && randVal <= prob) || fillRemaining) {
+                // Assign (i,j) a value
+                cols[nnzAssigned] = j;
+                nnzAssigned++;
+            }
+        }
+    }
+    // Convention: put the number of non-zeroes at the end of the row delimiters array
+    rowDelimiters[dim] = n;
+}
+
+// ****************************************************************************
+// Function: spmvCpu
+//
+// Purpose:
+//   Computes sparse matrix-vector multiplication using CSR format
+//
+// Arguments:
+//   val: array holding the non-zero values for the matrix
+//   cols: array of column indices for each element
+//   rowDelimiters: array of size dim+1 holding indices to rows;
+//                  last element is the index one past the last element
+//   vec: dense vector of size dim to be used for multiplication
+//   dim: number of rows/columns in the matrix
+//   out: output - result from the spmv calculation
+//
+// ****************************************************************************
+void spmvCpu(const double* val, const index_t* cols, const index_t* rowDelimiters,
+             const double* vec, const index_t dim, double* out) {
+    for (index_t i = 0; i < dim; ++i) {
+        double t = 0.0;
+        for (index_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
+            const auto col = cols[j];
+            t += val[j] * vec[col];
+        }
+        out[i] = t;
+    }
+}
+
+// ****************************************************************************
+// Function: verifyResults
+//
+// Purpose:
+//   Verifies correctness of results by comparing to reference solution
+//
+// Arguments:
+//   reference: array holding the reference result vector
+//   result: array holding the result vector to verify
+//   size: number of elements per vector
+//
+// ****************************************************************************
+bool verifyResults(const double* reference, const double* result, const index_t size) {
+    for (index_t i = 0; i < size; ++i) {
+        const double ref = reference[i];
+        const double res = result[i];
+        if (std::abs(ref) < 1e-10) {
+            // For very small values, check absolute error
+            if (std::abs(res) > MAX_RELATIVE_ERROR) {
+                printf("Validation failed at index %u: reference %.10e, got %.10e\n", i, ref, res);
+                return false;
+            }
+        } else {
+            // Check relative error
+            const double relError = std::abs((res - ref) / ref);
+            if (relError > MAX_RELATIVE_ERROR) {
+                printf("Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\n",
+                       i, ref, res, relError);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Number of rows/columns in the matrix (default: 1024)\n");
+    printf("  -s <num>     Sparsity: 1 out of N entries is non-zero (default: 10)\n");
+    printf("  -i <num>     Number of iterations (default: 10)\n");
+    printf("  -m <val>     Maximum value for matrix and vector elements (default: 1.0)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    index_t numRows = 1024;
+    index_t sparsity = 10;
+    index_t iterations = 10;
+    double maxVal = 1.0;
+    bool validate = false;
+    bool printResults = false;
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            numRows = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            sparsity = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            iterations = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            maxVal = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+
+    // Calculate number of non-zero elements
+    const index_t nItems = (numRows * numRows) / sparsity;
+
+    printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+    printf("Matrix size: %u x %u\n", numRows, numRows);
+    printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+    printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
+    printf("Iterations: %u\n", iterations);
+    printf("Max value: %.2f\n", maxVal);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+
+    // Allocate and initialize data structures
+    std::vector<double> h_val(nItems);                  // Non-zero values
+    std::vector<index_t> h_cols(nItems);                // Column indices
+    std::vector<index_t> h_rowDelimiters(numRows + 1);  // Row delimiters
+    std::vector<double> h_vec(numRows);                 // Dense vector
+    std::vector<double> h_out(numRows);                 // Output vector
+
+    printf("Initializing data structures...\n");
+    fill(h_vec.data(), numRows, maxVal);
+    fill(h_val.data(), nItems, maxVal);
+    initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+
+    // For validation, compute reference solution
+    std::vector<double> h_reference;
+    if (validate) {
+        printf("Computing reference solution...\n");
+        h_reference.resize(numRows);
+        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(), 
+                h_vec.data(), numRows, h_reference.data());
+    }
+
+    // Perform SpMV computation
+    printf("Computing SpMV...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (index_t iter = 0; iter < iterations; ++iter) {
+        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+                h_vec.data(), numRows, h_out.data());
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+    printf("Computation time: %ld ms\n", duration.count());
+    
+    // Calculate performance metrics
+    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+    const double avgTime = duration.count() / static_cast<double>(iterations);
+    
+    printf("Average time per iteration: %.3f ms\n", avgTime);
+    printf("Performance: %.3f GFLOPS\n", gflops);
+    
+    // Print results for external validation
+    if (printResults) {
+        print_results(h_out, "OutputVector");
+    }
+
+    // Validation
+    if (validate) {
+        printf("Validating result...\n");
+        const bool valid = verifyResults(h_reference.data(), h_out.data(), numRows);
+
+        if (valid) {
+            printf("Validation: PASSED\n");
+            return 0;
+        } else {
+            printf("Validation: FAILED\n");
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+exec
+/bin/bash -lc 'cat common/results_output.hpp common/hash.hpp output.txt && mpiexec --version && lscpu | head -25' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 16ms:
+#pragma once
+
+#include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+#include "hash.hpp"
+
+// Kahan summation for numerically stable sum
+template <typename T>
+T kahan_sum(const std::vector<T>& data) {
+    T sum = 0.0;
+    T c = 0.0;
+    for (const auto& val : data) {
+        T y = val - c;
+        T t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    return sum;
+}
+
+// Print results for floating-point arrays
+template <typename T>
+void print_results(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute statistics
+    T sum = kahan_sum(data);
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Sum: %.17e\n", static_cast<double>(sum));
+    printf("Min: %.17e\n", static_cast<double>(min_val));
+    printf("Max: %.17e\n", static_cast<double>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %.17e\n", indices[i], static_cast<double>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+// Print results for integer arrays (uses exact hash comparison)
+template <typename T>
+void print_results_int(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Compute min/max
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Min: %lld\n", static_cast<long long>(min_val));
+    printf("Max: %lld\n", static_cast<long long>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %lld\n", indices[i], static_cast<long long>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+#pragma once
+
+#include <cstdint>
+
+// FNV-1a hash, 64 bit length
+class hash {
+  public:
+	using digest = uint64_t;
+
+	template <typename T>
+	void add(const T& value) {
+		const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&value);
+		for(size_t i = 0; i < sizeof(T); ++i) {
+			d = (d ^ bytes[i]) * 0x100000001b3ull;
+		}
+	}
+
+	digest get() const { return d; }
+
+  private:
+	digest d = 0xcbf29ce484222325ull;
+};
+Reading additional input from stdin...
+OpenAI Codex v0.171.0
+--------
+workdir: /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+model: gpt-6.2-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a20df3-af76-7d13-83ab-b42a9fa77040
+--------
+user
+Parallelize the spmv benchmark code found in ./spmv/ with MPI for distributed memory cluster parallelism. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the benchmark and build setup, then implement the MPI path and verify it across multiple ranks.
+exec
+/bin/bash -lc "git status --short && rg --files --hidden -g '"'!'"\\.git'" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ exited 128 in 0ms:
+fatal: not a git repository (or any parent up to mount point /home/llmtest/evals/20261123-155235)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+
+exec
+/bin/bash -lc 'ls -a && command -v mpicxx && command -v mpiexec' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 0ms:
+.
+..
+common
+output.txt
+spmv
+/usr/bin/mpicxx
+/usr/bin/mpiexec
+
+exec
+/bin/bash -lc 'rg --files --hidden && ls -la spmv && ls -la ..' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 0ms:
+output.txt
+common/hash.hpp
+common/results_output.hpp
+spmv/CMakeLists.txt
+spmv/spmv.cpp
+total 16
+drwxrwxrwx 2 nobody nogroup   44 Nov 24 15:26 .
+drwxrwxrwx 4 nobody nogroup   50 Nov 24 15:26 ..
+-rwxrwxrwx 1 nobody nogroup  300 Nov 24 15:26 CMakeLists.txt
+-rwxrwxrwx 1 nobody nogroup 9869 Nov 24 15:26 spmv.cpp
+total 8
+drwx------ 3 llmtest users   4096 Nov 24 15:26 .
+drwx------ 3 llmtest users   4096 Nov 24 15:26 ..
+drwxrwxrwx 4 nobody  nogroup   50 Nov 24 15:26 spmv_gpt-6.2-sol-medium_mpi_r3
+
+mpiexec (OpenRTE) 4.1.6
+
+Report bugs to http://www.open-mpi.org/community/help/
+Architecture:                         x86_64
+CPU op-mode(s):                       32-bit, 64-bit
+Address sizes:                        48 bits physical, 48 bits virtual
+Byte Order:                           Little Endian
+CPU(s):                               256
+On-line CPU(s) list:                  0-255
+Vendor ID:                            AuthenticAMD
+Model name:                           AMD EPYC 7763 64-Core Processor
+CPU family:                           25
+Model:                                1
+Thread(s) per core:                   2
+Core(s) per socket:                   64
+Socket(s):                            2
+Stepping:                             1
+Frequency boost:                      enabled
+CPU(s) scaling MHz:                   57%
+CPU max MHz:                          3530.0000
+CPU min MHz:                          400.0000
+BogoMIPS:                             4900.02
+Flags:                                fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpb cat_l3 cdp_l3 hw_pstate ssbd mba ibrs ibpb stibp vmmcall fsgsbase bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk clzero irperf xsaveerptr rdpru wbnoinvd amd_ppin brs arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold v_vmsave_vmload vgif v_spec_ctrl umip pku ospke vaes vpclmulqdq rdpid overflow_recov succor smca fsrm debug_swap
+Virtualization:                       AMD-V
+L1d cache:                            4 MiB (128 instances)
+L1i cache:                            4 MiB (128 instances)
+L2 cache:                             64 MiB (128 instances)
+L3 cache:                             512 MiB (16 instances)
+
+codex
+The benchmark multiplies the same input vector on every iteration. Each rank can keep its own CSR rows and a copy of that vector, which removes communication from the timed loop. I’ll preserve the original random input sequence and distribute the matrix in row blocks during setup.
+exec
+/bin/bash -lc 'mktemp -d /tmp/spmv-mpi.XXXXXX && find .. -name AGENTS.md -print && id' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 0ms:
+/tmp/spmv-mpi.pLTnvE
+uid=4002(llmtest) gid=100(users) groups=100(users)
+
+exec
+/bin/bash -lc 'c++ -std=c++20 -O3 -march=native -Wall -Wextra spmv/spmv.cpp -o /tmp/spmv-mpi.pLTnvE/spmv-original && /tmp/spmv-mpi.pLTnvE/spmv-original -r -v' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 2177ms:
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 1024 x 1024
+Sparsity: 1 out of 10 entries is non-zero
+Non-zero elements: 104857 (90.00% sparse)
+Iterations: 10
+Max value: 1.00
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 1 ms
+Average time per iteration: 0.100 ms
+Performance: 2.097 GFLOPS
+=== RESULTS ===
+Name: OutputVector
+Elements: 1024
+Sum: 2.64923178037303951e+04
+Min: 1.61287140372775646e+01
+Max: 1.37070805085584794e+02
+Sample[0]: 2.77651784395352692e+01
+Sample[256]: 2.12393609971005759e+01
+Sample[512]: 2.79785828840587563e+01
+Sample[768]: 2.85371971652506211e+01
+Sample[1023]: 1.37070805085584794e+02
+Hash: 878c45f3660143ae
+=== END RESULTS ===
+Validating result...
+Validation: PASSED
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3/spmv/CMakeLists.txt
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..883209739da3eaa0f76b1a0cbdcaf79ea4134005
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,13 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++find_package(MPI REQUIRED COMPONENTS CXX)
+ 
+ # Enable optimizations
+ target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(spmv m)
++target_link_libraries(spmv PRIVATE MPI::MPI_CXX m)
+
+exec
+/bin/bash -lc "cat > spmv/spmv.cpp <<'EOF'
+#include <algorithm>
+#include <climits>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <memory>
+#include <vector>
+
+#include <mpi.h>
+
+#include \"../common/results_output.hpp\"
+
+using index_t = uint32_t;
+using offset_t = uint64_t;
+
+constexpr double MAX_RELATIVE_ERROR = 0.02;
+
+enum MessageTag { RowOffsets, Columns, Values, ValidationFailure };
+
+struct RowPartition {
+    index_t rows;
+    int ranks;
+
+    index_t begin(int rank) const {
+        const auto r = static_cast<index_t>(rank);
+        const auto p = static_cast<index_t>(ranks);
+        return r * (rows / p) + std::min(r, rows % p);
+    }
+
+    index_t count(int rank) const {
+        return begin(rank + 1) - begin(rank);
+    }
+};
+
+void fill(double* data, offset_t count, double maxVal) {
+    for (offset_t i = 0; i < count; ++i) {
+        data[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+    }
+}
+
+// MPI's point-to-point count is an int even when a block has more nonzeros.
+template <typename T>
+void sendBlock(const T* data, offset_t count, MPI_Datatype type, int dest, MessageTag tag) {
+    while (count "'!= 0) {
+        const int chunk = static_cast<int>(std::min<offset_t>(count, INT_MAX));
+        MPI_Send(data, chunk, type, dest, tag, MPI_COMM_WORLD);
+        data += chunk;
+        count -= chunk;
+    }
+}
+
+template <typename T>
+void receiveBlock(T* data, offset_t count, MPI_Datatype type, MessageTag tag) {
+    while (count != 0) {
+        const int chunk = static_cast<int>(std::min<offset_t>(count, INT_MAX));
+        MPI_Recv(data, chunk, type, 0, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        data += chunk;
+        count -= chunk;
+    }
+}
+
+// Generate consecutive CSR blocks from the original row-major random stream.
+// Rank zero keeps its own block and reuses one staging block for the others.
+std::vector<offset_t> distributeStructure(const RowPartition& partition, int rank,
+                                          offset_t nItems, std::vector<offset_t>& rowOffsets,
+                                          std::unique_ptr<index_t[]>& receivedColumns,
+                                          std::vector<index_t>& rootColumns) {
+    if (rank != 0) {
+        if (partition.count(rank) != 0) {
+            receiveBlock(rowOffsets.data(), rowOffsets.size(), MPI_UINT64_T, RowOffsets);
+            receivedColumns = std::make_unique_for_overwrite<index_t[]>(rowOffsets.back());
+            receiveBlock(receivedColumns.get(), rowOffsets.back(), MPI_UINT32_T, Columns);
+        }
+        return {};
+    }
+
+    const offset_t totalEntries = static_cast<offset_t>(partition.rows) * partition.rows;
+    const double probability = totalEntries == 0 ? 0.0 : static_cast<double>(nItems) / totalEntries;
+    // Adjust the integer cutoff to match the original floating-point comparison.
+    int cutoff = static_cast<int>(probability * RAND_MAX);
+    if (cutoff / static_cast<double>(RAND_MAX) > probability) {
+        --cutoff;
+    } else if (cutoff < RAND_MAX && (cutoff + 1) / static_cast<double>(RAND_MAX) <= probability) {
+        ++cutoff;
+    }
+
+    srand(8675309);
+    offset_t remaining = nItems;
+    offset_t skipsLeft = totalEntries - nItems;
+    const int activeRanks = std::max(1, std::min(partition.ranks, static_cast<int>(partition.rows)));
+    std::vector<offset_t> blockSizes(activeRanks);
+    std::vector<offset_t> stagingOffsets;
+    std::vector<index_t> stagingColumns;
+    for (int dest = 0; dest < activeRanks; ++dest) {
+        const index_t rows = partition.count(dest);
+        auto& offsets = dest == 0 ? rowOffsets : stagingOffsets;
+        auto& columns = dest == 0 ? rootColumns : stagingColumns;
+        offsets.resize(static_cast<size_t>(rows) + 1);
+        columns.clear();
+        columns.reserve(nItems / activeRanks);
+        for (index_t row = 0; row < rows; ++row) {
+            offsets[row] = columns.size();
+            for (index_t col = 0; col < partition.rows && remaining != 0; ++col) {
+                if (skipsLeft == 0 || rand() <= cutoff) {
+                    columns.push_back(col);
+                    --remaining;
+                } else {
+                    --skipsLeft;
+                }
+            }
+        }
+        offsets[rows] = columns.size();
+        blockSizes[dest] = columns.size();
+        if (dest != 0) {
+            sendBlock(offsets.data(), offsets.size(), MPI_UINT64_T, dest, RowOffsets);
+            sendBlock(columns.data(), columns.size(), MPI_UINT32_T, dest, Columns);
+        }
+    }
+    return blockSizes;
+}
+
+void spmvCpu(const double* val, const index_t* cols, const offset_t* rowOffsets,
+             const double* vec, index_t rows, double* out) {
+    for (index_t row = 0; row < rows; ++row) {
+        double sum = 0.0;
+        for (offset_t j = rowOffsets[row]; j < rowOffsets[row + 1]; ++j) {
+            sum += val[j] * vec[cols[j]];
+        }
+        out[row] = sum;
+    }
+}
+
+bool verifyResults(const std::vector<double>& reference, const std::vector<double>& result,
+                   index_t firstRow, index_t numRows, int rank) {
+    index_t localFailure = numRows;
+    double failureValues[2] = {};
+    for (index_t i = 0; i < result.size(); ++i) {
+        const double ref = reference[i];
+        const double res = result[i];
+        const double error = std::abs(ref) < 1e-10 ? std::abs(res) : std::abs((res - ref) / ref);
+        if (error > MAX_RELATIVE_ERROR) {
+            localFailure = firstRow + i;
+            failureValues[0] = ref;
+            failureValues[1] = res;
+            break;
+        }
+    }
+
+    index_t firstFailure;
+    MPI_Allreduce(&localFailure, &firstFailure, 1, MPI_UINT32_T, MPI_MIN, MPI_COMM_WORLD);
+    if (firstFailure == numRows) {
+        return true;
+    }
+    if (rank != 0 && firstFailure == localFailure) {
+        MPI_Send(failureValues, 2, MPI_DOUBLE, 0, ValidationFailure, MPI_COMM_WORLD);
+    }
+    if (rank == 0) {
+        if (firstFailure != localFailure) {
+            MPI_Recv(failureValues, 2, MPI_DOUBLE, MPI_ANY_SOURCE, ValidationFailure,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+        const double ref = failureValues[0];
+        const double res = failureValues[1];
+        if (std::abs(ref) < 1e-10) {
+            printf("Validation failed at index %u: reference %.10e, got %.10e'"\\n\",
+                   firstFailure, ref, res);
+        } else {
+            printf(\"Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\\n\",
+                   firstFailure, ref, res, std::abs((res - ref) / ref));
+        }
+    }
+    return false;
+}
+
+void printUsage(const char* progName) {
+    printf(\"Usage: %s [options]\\n\", progName);
+    printf(\"Options:\\n\");
+    printf(\"  -n <num>     Number of rows/columns in the matrix (default: 1024)\\n\");
+    printf(\"  -s <num>     Sparsity: 1 out of N entries is non-zero (default: 10)\\n\");
+    printf(\"  -i <num>     Number of iterations (default: 10)\\n\");
+    printf(\"  -m <val>     Maximum value for matrix and vector elements (default: 1.0)\\n\");
+    printf(\"  -v           Enable validation\\n\");
+    printf(\"  -r           Print results for external validation\\n\");
+    printf(\"  -h           Show this help message\\n\");
+}
+
+int runBenchmark(int argc, char** argv, int rank, int ranks) {
+    index_t numRows = 1024;
+    index_t sparsity = 10;
+    index_t iterations = 10;
+    double maxVal = 1.0;
+    bool validate = false;
+    bool printResults = false;
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], \"-n\") == 0 && i + 1 < argc) {
+            numRows = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], \"-s\") == 0 && i + 1 < argc) {
+            sparsity = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], \"-i\") == 0 && i + 1 < argc) {
+            iterations = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], \"-m\") == 0 && i + 1 < argc) {
+            maxVal = atof(argv[++i]);
+        } else if (strcmp(argv[i], \"-v\") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], \"-r\") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], \"-h\") == 0) {
+            if (rank == 0) {
+                printUsage(argv[0]);
+            }
+            return 0;
+        } else {
+            if (rank == 0) {
+                printf(\"Unknown option: %s\\n\", argv[i]);
+                printUsage(argv[0]);
+            }
+            return 1;
+        }
+    }
+    if (sparsity == 0 || numRows > INT_MAX) {
+        if (rank == 0) {
+            fprintf(stderr, \"Sparsity must be nonzero and the matrix must have at most %d rows.\\n\",
+                    INT_MAX);
+        }
+        return 1;
+    }
+
+    const offset_t totalEntries = static_cast<offset_t>(numRows) * numRows;
+    const offset_t nItems = totalEntries / sparsity;
+    if (rank == 0) {
+        printf(\"Sparse Matrix-Vector Multiplication (SpMV) Benchmark\\n\");
+        printf(\"Matrix size: %u x %u\\n\", numRows, numRows);
+        printf(\"Sparsity: 1 out of %u entries is non-zero\\n\", sparsity);
+        printf(\"Non-zero elements: %\" PRIu64 \" (%.2f%% sparse)\\n\",
+               nItems, 100.0 * (1.0 - static_cast<double>(nItems) / totalEntries));
+        printf(\"Iterations: %u\\n\", iterations);
+        printf(\"Max value: %.2f\\n\", maxVal);
+        printf(\"Validation: %s\\n\", validate ? \"enabled\" : \"disabled\");
+        printf(\"Initializing data structures...\\n\");
+    }
+
+    const RowPartition partition{numRows, ranks};
+    const index_t localRows = partition.count(rank);
+    std::vector<offset_t> rowOffsets(static_cast<size_t>(localRows) + 1);
+    std::unique_ptr<index_t[]> receivedColumns;
+    std::vector<index_t> rootColumns;
+    const auto blockSizes = distributeStructure(partition, rank, nItems, rowOffsets,
+                                                receivedColumns, rootColumns);
+    const auto* columns = rank == 0 ? rootColumns.data() : receivedColumns.get();
+
+    std::vector<double> vec(numRows);
+    if (rank == 0) {
+        // Reproduce the original default-seeded stream: vector, then CSR values.
+        srand(1);
+        fill(vec.data(), numRows, maxVal);
+    }
+    MPI_Bcast(vec.data(), static_cast<int>(numRows), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    const offset_t localItems = rowOffsets.back();
+    auto values = std::make_unique_for_overwrite<double[]>(localItems);
+    if (rank == 0) {
+        fill(values.get(), localItems, maxVal);
+        if (blockSizes.size() > 1) {
+            const auto maxBlockSize = *std::max_element(blockSizes.begin() + 1, blockSizes.end());
+            auto stagingValues = std::make_unique_for_overwrite<double[]>(maxBlockSize);
+            for (size_t dest = 1; dest < blockSizes.size(); ++dest) {
+                fill(stagingValues.get(), blockSizes[dest], maxVal);
+                sendBlock(stagingValues.get(), blockSizes[dest], MPI_DOUBLE,
+                          static_cast<int>(dest), Values);
+            }
+        }
+    } else {
+        receiveBlock(values.get(), localItems, MPI_DOUBLE, Values);
+    }
+
+    std::vector<double> out(localRows);
+    std::vector<double> reference;
+    if (validate) {
+        if (rank == 0) {
+            printf(\"Computing reference solution...\\n\");
+        }
+        reference.resize(localRows);
+        spmvCpu(values.get(), columns, rowOffsets.data(), vec.data(), localRows, reference.data());
+    }
+
+    if (rank == 0) {
+        printf(\"Computing SpMV...\\n\");
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    const double start = MPI_Wtime();
+    for (index_t iter = 0; iter < iterations; ++iter) {
+        spmvCpu(values.get(), columns, rowOffsets.data(), vec.data(), localRows, out.data());
+        // Make each result observable to the compiler even though all inputs are fixed.
+        asm volatile(\"\" : : \"g\"(out.data()) : \"memory\");
+    }
+    const double localTime = MPI_Wtime() - start;
+    double elapsed = 0.0;
+    MPI_Reduce(&localTime, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        const double gflops = elapsed > 0 ? (2.0 * nItems * iterations) / elapsed / 1e9 : 0.0;
+        const double avgTime = iterations > 0 ? elapsed * 1000.0 / iterations : 0.0;
+        printf(\"Computation time: %ld ms\\n\", static_cast<long>(elapsed * 1000.0));
+        printf(\"Average time per iteration: %.3f ms\\n\", avgTime);
+        printf(\"Performance: %.3f GFLOPS\\n\", gflops);
+    }
+
+    if (printResults) {
+        std::vector<int> counts, displacements;
+        std::vector<double> result;
+        if (rank == 0) {
+            counts.resize(ranks);
+            displacements.resize(ranks);
+            for (int r = 0; r < ranks; ++r) {
+                counts[r] = static_cast<int>(partition.count(r));
+                displacements[r] = static_cast<int>(partition.begin(r));
+            }
+            result.resize(numRows);
+        }
+        MPI_Gatherv(out.data(), static_cast<int>(localRows), MPI_DOUBLE, result.data(),
+                    counts.data(), displacements.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        if (rank == 0) {
+            print_results(result, \"OutputVector\");
+        }
+    }
+
+    if (validate) {
+        if (rank == 0) {
+            printf(\"Validating result...\\n\");
+        }
+        const bool valid = verifyResults(reference, out, partition.begin(rank), numRows, rank);
+        if (rank == 0) {
+            printf(\"Validation: %s\\n\", valid ? \"PASSED\" : \"FAILED\");
+        }
+        return valid ? 0 : 1;
+    }
+
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    int rank, ranks;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+
+    int status;
+    try {
+        status = runBenchmark(argc, argv, rank, ranks);
+    } catch (const std::exception& error) {
+        fprintf(stderr, \"Rank %d: %s\\n\", rank, error.what());
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        return EXIT_FAILURE;
+    }
+
+    MPI_Finalize();
+    return status;
+}
+EOF
+cmake -S spmv -B /tmp/spmv-mpi.pLTnvE/build && cmake --build /tmp/spmv-mpi.pLTnvE/build" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 5980ms:
+-- The CXX compiler identification is GNU 13.2.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Configuring done (3.2s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/spmv-mpi.pLTnvE/build
+[ 50%] Building CXX object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CXX executable spmv
+[100%] Built target spmv
+
+exec
+/bin/bash -lc 'for p in 1 2 4 8; do
+  echo "Ranks $p"
+  mpiexec --bind-to core -n "$p" /tmp/spmv-mpi.pLTnvE/build/spmv -n 4096 -i 400 | rg '"'Computation time|Average time|Performance'
+done" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+exec
+/bin/bash -lc "python3 - <<'PY'
+import re, subprocess
+p = '/tmp/spmv-mpi.pLTnvE/'
+cases = [([], (1, 2, 3, 8)), (['-n','71','-s','7','-i','3','-m','-2.25'], (2,3,7)),
+         (['-n','5','-s','1'], (2,8)), (['-n','17','-s','200'], (3,8)),
+         (['-n','7','-s','50'], (2,8)), (['-n','0'], (1,4)),
+         (['-n','31','-i','0'], (1,4)), (['-n','9','-m','0'], (4,))]
+def run(cmd):
+    proc = subprocess.run(cmd, text=True, capture_output=True, timeout=30)
+    return proc.returncode, proc.stdout
+for args, ranks in cases:
+    args = args + ['-r','-v']
+    expected_rc, expected = run([p+'spmv-original', *args])
+    for n in ranks:
+        rc, out = run(['mpiexec','--oversubscribe','-n',str(n),p+'build/spmv',*args])
+        assert rc == expected_rc, (args, n, rc, expected_rc, out)
+        for pattern in [r'(?s)=== RESULTS ===.*?=== END RESULTS ===', r'Validation: (?:PASSED|FAILED)', r'Validation failed at index .*']:
+            assert re.findall(pattern, out) == re.findall(pattern, expected), (args,n,pattern,expected,out)
+        assert out.count('Sparse Matrix-Vector Multiplication') == 1
+    print(f\"{args} matched serial output at ranks {ranks}\", flush=True)
+for args, expected_rc, pattern in [(['-h'],0,'Usage:'), (['-x'],1,'Unknown option:'), (['-s','0'],1,'Sparsity must be nonzero')]:
+    proc = subprocess.run(['mpiexec','-n','4',p+'build/spmv',*args], text=True, capture_output=True, timeout=30)
+    assert proc.returncode == expected_rc and (proc.stdout + proc.stderr).count(pattern) == 1, proc
+print('Help and invalid options checked')
+PY" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 18919ms:
+Ranks 1
+Computation time: 1040 ms
+Average time per iteration: 2.600 ms
+Performance: 1.290 GFLOPS
+Ranks 2
+Computation time: 501 ms
+Average time per iteration: 1.253 ms
+Performance: 2.679 GFLOPS
+Ranks 4
+Computation time: 263 ms
+Average time per iteration: 0.660 ms
+Performance: 5.086 GFLOPS
+Ranks 8
+Computation time: 125 ms
+Average time per iteration: 0.314 ms
+Performance: 10.675 GFLOPS
+
+codex
+The MPI build matches the serial output hashes in the comparisons so far. On this host, the timed kernel went from 1,040 ms on one rank to 125 ms on eight ranks. I’ll check whether processing two rows at a time improves throughput while preserving each row’s summation order.
+exec
+/bin/bash -lc "python3 - <<'PY'
+from pathlib import Path
+src = Path('spmv/spmv.cpp').read_text().replace('#include \"../common/results_output.hpp\"', '#include \"'+str(Path('common/results_output.hpp').resolve())+'\"')
+pos = src.index('bool verifyResults')
+src = src[:pos] + '''double accumulateRow(const double* val, const index_t* cols, const double* vec,
+                     offset_t begin, offset_t end, double sum) {
+    for (offset_t j = begin; j < end; ++j) {
+        sum += val[j] * vec[cols[j]];
+    }
+    return sum;
+}
+
+void spmvPaired(const double* val, const index_t* cols, const offset_t* rowOffsets,
+                const double* vec, index_t rows, double* out) {
+    index_t row = 0;
+    for (; row + 1 < rows; row += 2) {
+        offset_t first = rowOffsets[row];
+        offset_t second = rowOffsets[row + 1];
+        const offset_t firstEnd = second;
+        const offset_t secondEnd = rowOffsets[row + 2];
+        const offset_t sharedLength = std::min(firstEnd - first, secondEnd - second);
+        const offset_t pairedEnd = first + sharedLength;
+        double firstSum = 0.0;
+        double secondSum = 0.0;
+        for (; first < pairedEnd; ++first, ++second) {
+            firstSum += val[first] * vec[cols[first]];
+            secondSum += val[second] * vec[cols[second]];
+        }
+        out[row] = accumulateRow(val, cols, vec, first, firstEnd, firstSum);
+        out[row + 1] = accumulateRow(val, cols, vec, second, secondEnd, secondSum);
+    }
+    if (row < rows) {
+        out[row] = accumulateRow(val, cols, vec, rowOffsets[row], rowOffsets[row + 1], 0.0);
+    }
+}
+
+''' + src[pos:]
+src = src.replace('spmvCpu(values.get(), columns, rowOffsets.data(), vec.data(), localRows, out.data());',
+                  'spmvPaired(values.get(), columns, rowOffsets.data(), vec.data(), localRows, out.data());')
+Path('/tmp/spmv-mpi.pLTnvE/paired.cpp').write_text(src)
+PY
+mpicxx -std=c++20 -O3 -march=native /tmp/spmv-mpi.pLTnvE/paired.cpp -o /tmp/spmv-mpi.pLTnvE/paired &&
+for n in 1024 4096; do
+  for p in 1 8; do
+    for bin in build/spmv paired; do
+      echo \""'$n rows, $p ranks, $bin"
+      mpiexec --bind-to core -n "$p" /tmp/spmv-mpi.pLTnvE/"$bin" -n "$n" -i 400 -r -v | rg '"'Computation time|Performance|Hash|PASSED'
+    done
+  done
+done" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+exec
+/bin/bash -lc 'for bin in build/spmv paired; do
+  objdump -dC /tmp/spmv-mpi.pLTnvE/"$bin" | rg '"'"'^[0-9a-f]+ <(spmv|accumulateRow)|'"\\bv(fmadd|mulpd|addpd)' | tail -80
+done" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 0ms:
+0000000000009ac0 <spmvCpu(double const*, unsigned int const*, unsigned long const*, double const*, unsigned int, double*)>:
+0000000000009aa0 <spmvCpu(double const*, unsigned int const*, unsigned long const*, double const*, unsigned int, double*)>:
+0000000000009b20 <accumulateRow(double const*, unsigned int const*, double const*, unsigned long, unsigned long, double)>:
+0000000000009b50 <spmvPaired(double const*, unsigned int const*, unsigned long const*, double const*, unsigned int, double*)>:
+    9c0f:	c4 a2 e1 b9 0c c6    	vfmadd231sd (%rsi,%r8,8),%xmm3,%xmm1
+    9c1c:	c4 a2 d9 b9 04 c6    	vfmadd231sd (%rsi,%r8,8),%xmm4,%xmm0
+
+ succeeded in 80263ms:
+['-r', '-v'] matched serial output at ranks (1, 2, 3, 8)
+['-n', '71', '-s', '7', '-i', '3', '-m', '-2.25', '-r', '-v'] matched serial output at ranks (2, 3, 7)
+['-n', '5', '-s', '1', '-r', '-v'] matched serial output at ranks (2, 8)
+['-n', '17', '-s', '200', '-r', '-v'] matched serial output at ranks (3, 8)
+['-n', '7', '-s', '50', '-r', '-v'] matched serial output at ranks (2, 8)
+['-n', '0', '-r', '-v'] matched serial output at ranks (1, 4)
+['-n', '31', '-i', '0', '-r', '-v'] matched serial output at ranks (1, 4)
+['-n', '9', '-m', '0', '-r', '-v'] matched serial output at ranks (4,)
+Help and invalid options checked
+
+exec
+/bin/bash -lc 'for bin in spmv-original build/spmv paired; do
+  objdump -dC /tmp/spmv-mpi.pLTnvE/"$bin" | sed -n '"'/<spmvCpu(.*>:/,+45p'
+done" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 0ms:
+0000000000001fb0 <spmvCpu(double const*, unsigned int const*, unsigned int const*, double const*, unsigned int, double*)>:
+    1fb0:	f3 0f 1e fa          	endbr64
+    1fb4:	45 85 c0             	test   %r8d,%r8d
+    1fb7:	0f 84 98 00 00 00    	je     2055 <spmvCpu(double const*, unsigned int const*, unsigned int const*, double const*, unsigned int, double*)+0xa5>
+    1fbd:	45 89 c0             	mov    %r8d,%r8d
+    1fc0:	41 54                	push   %r12
+    1fc2:	49 89 fb             	mov    %rdi,%r11
+    1fc5:	55                   	push   %rbp
+    1fc6:	4d 89 cc             	mov    %r9,%r12
+    1fc9:	53                   	push   %rbx
+    1fca:	4e 8d 0c 85 00 00 00 	lea    0x0(,%r8,4),%r9
+    1fd1:	00 
+    1fd2:	48 89 f3             	mov    %rsi,%rbx
+    1fd5:	48 89 d5             	mov    %rdx,%rbp
+    1fd8:	49 89 ca             	mov    %rcx,%r10
+    1fdb:	45 31 c0             	xor    %r8d,%r8d
+    1fde:	66 90                	xchg   %ax,%ax
+    1fe0:	42 8b 44 05 00       	mov    0x0(%rbp,%r8,1),%eax
+    1fe5:	42 8b 4c 05 04       	mov    0x4(%rbp,%r8,1),%ecx
+    1fea:	39 c8                	cmp    %ecx,%eax
+    1fec:	73 52                	jae    2040 <spmvCpu(double const*, unsigned int const*, unsigned int const*, double const*, unsigned int, double*)+0x90>
+    1fee:	ff c9                	dec    %ecx
+    1ff0:	48 8d 3c 83          	lea    (%rbx,%rax,4),%rdi
+    1ff4:	49 8d 34 c3          	lea    (%r11,%rax,8),%rsi
+    1ff8:	c5 f1 57 c9          	vxorpd %xmm1,%xmm1,%xmm1
+    1ffc:	29 c1                	sub    %eax,%ecx
+    1ffe:	31 c0                	xor    %eax,%eax
+    2000:	8b 14 87             	mov    (%rdi,%rax,4),%edx
+    2003:	c4 c1 7b 10 04 d2    	vmovsd (%r10,%rdx,8),%xmm0
+    2009:	48 89 c2             	mov    %rax,%rdx
+    200c:	c5 fb 59 04 c6       	vmulsd (%rsi,%rax,8),%xmm0,%xmm0
+    2011:	48 ff c0             	inc    %rax
+    2014:	c5 f3 58 c8          	vaddsd %xmm0,%xmm1,%xmm1
+    2018:	48 39 d1             	cmp    %rdx,%rcx
+    201b:	75 e3                	jne    2000 <spmvCpu(double const*, unsigned int const*, unsigned int const*, double const*, unsigned int, double*)+0x50>
+    201d:	c4 81 7b 11 0c 44    	vmovsd %xmm1,(%r12,%r8,2)
+    2023:	49 83 c0 04          	add    $0x4,%r8
+    2027:	4d 39 c1             	cmp    %r8,%r9
+    202a:	75 b4                	jne    1fe0 <spmvCpu(double const*, unsigned int const*, unsigned int const*, double const*, unsigned int, double*)+0x30>
+    202c:	5b                   	pop    %rbx
+    202d:	5d                   	pop    %rbp
+    202e:	41 5c                	pop    %r12
+    2030:	c3                   	ret
+    2031:	66 66 2e 0f 1f 84 00 	data16 cs nopw 0x0(%rax,%rax,1)
+    2038:	00 00 00 00 
+    203c:	0f 1f 40 00          	nopl   0x0(%rax)
+0000000000009ac0 <spmvCpu(double const*, unsigned int const*, unsigned long const*, double const*, unsigned int, double*)>:
+    9ac0:	f3 0f 1e fa          	endbr64
+    9ac4:	45 85 c0             	test   %r8d,%r8d
+    9ac7:	74 72                	je     9b3b <spmvCpu(double const*, unsigned int const*, unsigned long const*, double const*, unsigned int, double*)+0x7b>
+    9ac9:	45 89 c0             	mov    %r8d,%r8d
+    9acc:	53                   	push   %rbx
+    9acd:	49 89 d3             	mov    %rdx,%r11
+    9ad0:	4c 89 cb             	mov    %r9,%rbx
+    9ad3:	49 89 ca             	mov    %rcx,%r10
+    9ad6:	4e 8d 0c c5 00 00 00 	lea    0x0(,%r8,8),%r9
+    9add:	00 
+    9ade:	45 31 c0             	xor    %r8d,%r8d
+    9ae1:	66 66 2e 0f 1f 84 00 	data16 cs nopw 0x0(%rax,%rax,1)
+    9ae8:	00 00 00 00 
+    9aec:	0f 1f 40 00          	nopl   0x0(%rax)
+    9af0:	4b 8b 04 03          	mov    (%r11,%r8,1),%rax
+    9af4:	4b 8b 4c 03 08       	mov    0x8(%r11,%r8,1),%rcx
+    9af9:	c5 f1 57 c9          	vxorpd %xmm1,%xmm1,%xmm1
+    9afd:	48 39 c8             	cmp    %rcx,%rax
+    9b00:	73 28                	jae    9b2a <spmvCpu(double const*, unsigned int const*, unsigned long const*, double const*, unsigned int, double*)+0x6a>
+    9b02:	66 66 2e 0f 1f 84 00 	data16 cs nopw 0x0(%rax,%rax,1)
+    9b09:	00 00 00 00 
+    9b0d:	0f 1f 00             	nopl   (%rax)
+    9b10:	8b 14 86             	mov    (%rsi,%rax,4),%edx
+    9b13:	c4 c1 7b 10 04 d2    	vmovsd (%r10,%rdx,8),%xmm0
+    9b19:	c5 fb 59 04 c7       	vmulsd (%rdi,%rax,8),%xmm0,%xmm0
+    9b1e:	48 ff c0             	inc    %rax
+    9b21:	c5 f3 58 c8          	vaddsd %xmm0,%xmm1,%xmm1
+    9b25:	48 39 c8             	cmp    %rcx,%rax
+    9b28:	75 e6                	jne    9b10 <spmvCpu(double const*, unsigned int const*, unsigned long const*, double const*, unsigned int, double*)+0x50>
+    9b2a:	c4 a1 7b 11 0c 03    	vmovsd %xmm1,(%rbx,%r8,1)
+    9b30:	49 83 c0 08          	add    $0x8,%r8
+    9b34:	4d 39 c1             	cmp    %r8,%r9
+    9b37:	75 b7                	jne    9af0 <spmvCpu(double const*, unsigned int const*, unsigned long const*, double const*, unsigned int, double*)+0x30>
+    9b39:	5b                   	pop    %rbx
+    9b3a:	c3                   	ret
+    9b3b:	c3                   	ret
+    9b3c:	0f 1f 40 00          	nopl   0x0(%rax)
+
+0000000000009b40 <verifyResults(std::vector<double, std::allocator<double> > const&, std::vector<double, std::allocator<double> > const&, unsigned int, unsigned int, int)>:
+    9b40:	f3 0f 1e fa          	endbr64
+    9b44:	55                   	push   %rbp
+    9b45:	53                   	push   %rbx
+    9b46:	48 89 f8             	mov    %rdi,%rax
+    9b49:	89 d7                	mov    %edx,%edi
+    9b4b:	48 83 ec 38          	sub    $0x38,%rsp
+0000000000009aa0 <spmvCpu(double const*, unsigned int const*, unsigned long const*, double const*, unsigned int, double*)>:
+    9aa0:	f3 0f 1e fa          	endbr64
+    9aa4:	45 85 c0             	test   %r8d,%r8d
+    9aa7:	74 72                	je     9b1b <spmvCpu(double const*, unsigned int const*, unsigned long const*, double const*, unsigned int, double*)+0x7b>
+    9aa9:	45 89 c0             	mov    %r8d,%r8d
+    9aac:	53                   	push   %rbx
+    9aad:	49 89 d3             	mov    %rdx,%r11
+    9ab0:	4c 89 cb             	mov    %r9,%rbx
+    9ab3:	49 89 ca             	mov    %rcx,%r10
+    9ab6:	4e 8d 0c c5 00 00 00 	lea    0x0(,%r8,8),%r9
+    9abd:	00 
+    9abe:	45 31 c0             	xor    %r8d,%r8d
+    9ac1:	66 66 2e 0f 1f 84 00 	data16 cs nopw 0x0(%rax,%rax,1)
+    9ac8:	00 00 00 00 
+    9acc:	0f 1f 40 00          	nopl   0x0(%rax)
+    9ad0:	4b 8b 04 03          	mov    (%r11,%r8,1),%rax
+    9ad4:	4b 8b 4c 03 08       	mov    0x8(%r11,%r8,1),%rcx
+    9ad9:	c5 f1 57 c9          	vxorpd %xmm1,%xmm1,%xmm1
+    9add:	48 39 c8             	cmp    %rcx,%rax
+    9ae0:	73 28                	jae    9b0a <spmvCpu(double const*, unsigned int const*, unsigned long const*, double const*, unsigned int, double*)+0x6a>
+    9ae2:	66 66 2e 0f 1f 84 00 	data16 cs nopw 0x0(%rax,%rax,1)
+    9ae9:	00 00 00 00 
+    9aed:	0f 1f 00             	nopl   (%rax)
+    9af0:	8b 14 86             	mov    (%rsi,%rax,4),%edx
+    9af3:	c4 c1 7b 10 04 d2    	vmovsd (%r10,%rdx,8),%xmm0
+    9af9:	c5 fb 59 04 c7       	vmulsd (%rdi,%rax,8),%xmm0,%xmm0
+    9afe:	48 ff c0             	inc    %rax
+    9b01:	c5 f3 58 c8          	vaddsd %xmm0,%xmm1,%xmm1
+    9b05:	48 39 c8             	cmp    %rcx,%rax
+    9b08:	75 e6                	jne    9af0 <spmvCpu(double const*, unsigned int const*, unsigned long const*, double const*, unsigned int, double*)+0x50>
+    9b0a:	c4 a1 7b 11 0c 03    	vmovsd %xmm1,(%rbx,%r8,1)
+    9b10:	49 83 c0 08          	add    $0x8,%r8
+    9b14:	4d 39 c1             	cmp    %r8,%r9
+    9b17:	75 b7                	jne    9ad0 <spmvCpu(double const*, unsigned int const*, unsigned long const*, double const*, unsigned int, double*)+0x30>
+    9b19:	5b                   	pop    %rbx
+    9b1a:	c3                   	ret
+    9b1b:	c3                   	ret
+    9b1c:	0f 1f 40 00          	nopl   0x0(%rax)
+
+0000000000009b20 <accumulateRow(double const*, unsigned int const*, double const*, unsigned long, unsigned long, double)>:
+    9b20:	f3 0f 1e fa          	endbr64
+    9b24:	4c 39 c1             	cmp    %r8,%rcx
+    9b27:	73 20                	jae    9b49 <accumulateRow(double const*, unsigned int const*, double const*, unsigned long, unsigned long, double)+0x29>
+    9b29:	0f 1f 80 00 00 00 00 	nopl   0x0(%rax)
+    9b30:	8b 04 8e             	mov    (%rsi,%rcx,4),%eax
+    9b33:	c5 fb 10 0c c2       	vmovsd (%rdx,%rax,8),%xmm1
+
+ succeeded in 36060ms:
+1024 rows, 1 ranks, build/spmv
+Computation time: 54 ms
+Performance: 1.530 GFLOPS
+Hash: 878c45f3660143ae
+Validation: PASSED
+1024 rows, 1 ranks, paired
+Computation time: 40 ms
+Performance: 2.094 GFLOPS
+Hash: 05256fe8691b87bb
+Validation: PASSED
+1024 rows, 8 ranks, build/spmv
+Computation time: 6 ms
+Performance: 13.556 GFLOPS
+Hash: 878c45f3660143ae
+Validation: PASSED
+1024 rows, 8 ranks, paired
+Computation time: 4 ms
+Performance: 17.288 GFLOPS
+Hash: 05256fe8691b87bb
+Validation: PASSED
+4096 rows, 1 ranks, build/spmv
+Computation time: 1020 ms
+Performance: 1.316 GFLOPS
+Hash: 20c6ca8034bcb7cd
+Validation: PASSED
+4096 rows, 1 ranks, paired
+Computation time: 790 ms
+Performance: 1.698 GFLOPS
+Hash: 36bd8bec8a884d1a
+Validation: PASSED
+4096 rows, 8 ranks, build/spmv
+Computation time: 126 ms
+Performance: 10.611 GFLOPS
+Hash: 20c6ca8034bcb7cd
+Validation: PASSED
+4096 rows, 8 ranks, paired
+Computation time: 89 ms
+Performance: 15.056 GFLOPS
+Hash: 36bd8bec8a884d1a
+Validation: PASSED
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3/spmv/spmv.cpp
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..883209739da3eaa0f76b1a0cbdcaf79ea4134005
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,13 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++find_package(MPI REQUIRED COMPONENTS CXX)
+ 
+ # Enable optimizations
+ target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(spmv m)
++target_link_libraries(spmv PRIVATE MPI::MPI_CXX m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index b905012594c4cc0325594055c2028030ea2a266d..c6302e547bf552699899a12753bab0aecb493360
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -16,6 +16,7 @@
+ using offset_t = uint64_t;
+ 
+ constexpr double MAX_RELATIVE_ERROR = 0.02;
++constexpr offset_t TRANSFER_CHUNK = 1 << 20;
+ 
+ enum MessageTag { RowOffsets, Columns, Values, ValidationFailure };
+ 
+@@ -40,11 +41,11 @@
+     }
+ }
+ 
+-// MPI's point-to-point count is an int even when a block has more nonzeros.
++// Bound each MPI message and let rank zero reuse a small buffer for values.
+ template <typename T>
+ void sendBlock(const T* data, offset_t count, MPI_Datatype type, int dest, MessageTag tag) {
+     while (count != 0) {
+-        const int chunk = static_cast<int>(std::min<offset_t>(count, INT_MAX));
++        const int chunk = static_cast<int>(std::min(count, TRANSFER_CHUNK));
+         MPI_Send(data, chunk, type, dest, tag, MPI_COMM_WORLD);
+         data += chunk;
+         count -= chunk;
+@@ -54,7 +55,7 @@
+ template <typename T>
+ void receiveBlock(T* data, offset_t count, MPI_Datatype type, MessageTag tag) {
+     while (count != 0) {
+-        const int chunk = static_cast<int>(std::min<offset_t>(count, INT_MAX));
++        const int chunk = static_cast<int>(std::min(count, TRANSFER_CHUNK));
+         MPI_Recv(data, chunk, type, 0, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+         data += chunk;
+         count -= chunk;
+@@ -265,11 +266,16 @@
+         fill(values.get(), localItems, maxVal);
+         if (blockSizes.size() > 1) {
+             const auto maxBlockSize = *std::max_element(blockSizes.begin() + 1, blockSizes.end());
+-            auto stagingValues = std::make_unique_for_overwrite<double[]>(maxBlockSize);
++            auto stagingValues =
++                std::make_unique_for_overwrite<double[]>(std::min(maxBlockSize, TRANSFER_CHUNK));
+             for (size_t dest = 1; dest < blockSizes.size(); ++dest) {
+-                fill(stagingValues.get(), blockSizes[dest], maxVal);
+-                sendBlock(stagingValues.get(), blockSizes[dest], MPI_DOUBLE,
+-                          static_cast<int>(dest), Values);
++                offset_t remaining = blockSizes[dest];
++                while (remaining != 0) {
++                    const offset_t count = std::min(remaining, TRANSFER_CHUNK);
++                    fill(stagingValues.get(), count, maxVal);
++                    sendBlock(stagingValues.get(), count, MPI_DOUBLE, static_cast<int>(dest), Values);
++                    remaining -= count;
++                }
+             }
+         }
+     } else {
+
+exec
+/bin/bash -lc 'cmake --build /tmp/spmv-mpi.pLTnvE/build && rg --files --hidden' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 2830ms:
+[ 50%] Building CXX object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CXX executable spmv
+[100%] Built target spmv
+output.txt
+spmv/CMakeLists.txt
+spmv/spmv.cpp
+common/hash.hpp
+common/results_output.hpp
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+from pathlib import Path
+src = Path('spmv/spmv.cpp').read_text().replace('#include \"../common/results_output.hpp\"', '#include \"'+str(Path('common/results_output.hpp').resolve())+'\"')
+src = src.replace('        for (offset_t j = rowOffsets[row];', '        #pragma GCC unroll 4\\n        for (offset_t j = rowOffsets[row];')
+Path('/tmp/spmv-mpi.pLTnvE/unrolled.cpp').write_text(src)
+PY
+mpicxx -std=c++20 -O3 -march=native /tmp/spmv-mpi.pLTnvE/unrolled.cpp -o /tmp/spmv-mpi.pLTnvE/unrolled &&
+for n in 1024 4096; do
+  for p in 1 8; do
+    for bin in build/spmv unrolled; do
+      echo \""'$n rows, $p ranks, $bin"
+      mpiexec --bind-to core -n "$p" /tmp/spmv-mpi.pLTnvE/"$bin" -n "$n" -i 400 -r -v | rg '"'Computation time|Performance|Hash|PASSED'
+    done
+  done
+done" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+exec
+/bin/bash -lc "python3 - <<'PY'
+import re, subprocess
+p = '/tmp/spmv-mpi.pLTnvE/'
+def check(args, ranks):
+    executable = p+'build/spmv'
+    args += ['-r', '-v']
+    baseline = subprocess.run([p+'spmv-original',*args], text=True, capture_output=True, timeout=30)
+    for n in ranks:
+        test = subprocess.run(['mpiexec','--oversubscribe','-n',str(n),executable,*args],text=True,capture_output=True,timeout=45)
+        for pattern in [r'(?s)=== RESULTS ===.*?=== END RESULTS ===', r'Validation: (?:PASSED|FAILED)', r'Validation failed at index .*']:
+            assert re.findall(pattern,test.stdout) == re.findall(pattern,baseline.stdout), (args,n,test.stdout,baseline.stdout)
+        assert test.returncode == baseline.returncode
+        print(f\"{n} ranks {args} matched serial\",flush=True)
+check(['-n','2048','-s','1','-i','2'],[1,3])
+check(['-n','257','-s','29','-i','7','-m','1.2345'],[1,3,8])
+for n in range(2,25):
+    trial = ['-n',str(n),'-s',str(n*n),'-i','0']
+    proc = subprocess.run([p+'spmv-original',*trial,'-v'], text=True, capture_output=True)
+    match = re.search(r'Validation failed at index (\\d+)',proc.stdout)
+    if match and int(match[1]) >= (n+1)//2:
+        check(trial,[2])
+        break
+else:
+    raise AssertionError('No case with validation mismatch on non-root rank found')
+PY" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3/spmv/CMakeLists.txt
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..be4c9833e91523ec83249cdd5fc13c70056ef635
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,14 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set(MPI_CXX_SKIP_MPICXX TRUE)
++find_package(MPI REQUIRED COMPONENTS CXX)
+ 
+ # Enable optimizations
+ target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(spmv m)
++target_link_libraries(spmv PRIVATE MPI::MPI_CXX m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index b905012594c4cc0325594055c2028030ea2a266d..c6302e547bf552699899a12753bab0aecb493360
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -16,6 +16,7 @@
+ using offset_t = uint64_t;
+ 
+ constexpr double MAX_RELATIVE_ERROR = 0.02;
++constexpr offset_t TRANSFER_CHUNK = 1 << 20;
+ 
+ enum MessageTag { RowOffsets, Columns, Values, ValidationFailure };
+ 
+@@ -40,11 +41,11 @@
+     }
+ }
+ 
+-// MPI's point-to-point count is an int even when a block has more nonzeros.
++// Bound each MPI message and let rank zero reuse a small buffer for values.
+ template <typename T>
+ void sendBlock(const T* data, offset_t count, MPI_Datatype type, int dest, MessageTag tag) {
+     while (count != 0) {
+-        const int chunk = static_cast<int>(std::min<offset_t>(count, INT_MAX));
++        const int chunk = static_cast<int>(std::min(count, TRANSFER_CHUNK));
+         MPI_Send(data, chunk, type, dest, tag, MPI_COMM_WORLD);
+         data += chunk;
+         count -= chunk;
+@@ -54,7 +55,7 @@
+ template <typename T>
+ void receiveBlock(T* data, offset_t count, MPI_Datatype type, MessageTag tag) {
+     while (count != 0) {
+-        const int chunk = static_cast<int>(std::min<offset_t>(count, INT_MAX));
++        const int chunk = static_cast<int>(std::min(count, TRANSFER_CHUNK));
+         MPI_Recv(data, chunk, type, 0, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+         data += chunk;
+         count -= chunk;
+@@ -265,11 +266,16 @@
+         fill(values.get(), localItems, maxVal);
+         if (blockSizes.size() > 1) {
+             const auto maxBlockSize = *std::max_element(blockSizes.begin() + 1, blockSizes.end());
+-            auto stagingValues = std::make_unique_for_overwrite<double[]>(maxBlockSize);
++            auto stagingValues =
++                std::make_unique_for_overwrite<double[]>(std::min(maxBlockSize, TRANSFER_CHUNK));
+             for (size_t dest = 1; dest < blockSizes.size(); ++dest) {
+-                fill(stagingValues.get(), blockSizes[dest], maxVal);
+-                sendBlock(stagingValues.get(), blockSizes[dest], MPI_DOUBLE,
+-                          static_cast<int>(dest), Values);
++                offset_t remaining = blockSizes[dest];
++                while (remaining != 0) {
++                    const offset_t count = std::min(remaining, TRANSFER_CHUNK);
++                    fill(stagingValues.get(), count, maxVal);
++                    sendBlock(stagingValues.get(), count, MPI_DOUBLE, static_cast<int>(dest), Values);
++                    remaining -= count;
++                }
+             }
+         }
+     } else {
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3/spmv/spmv.cpp
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..be4c9833e91523ec83249cdd5fc13c70056ef635
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,14 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set(MPI_CXX_SKIP_MPICXX TRUE)
++find_package(MPI REQUIRED COMPONENTS CXX)
+ 
+ # Enable optimizations
+ target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(spmv m)
++target_link_libraries(spmv PRIVATE MPI::MPI_CXX m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index b905012594c4cc0325594055c2028030ea2a266d..a040f30fc269200d330a8c28556ca7dad9bf0fa6
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -16,6 +16,7 @@
+ using offset_t = uint64_t;
+ 
+ constexpr double MAX_RELATIVE_ERROR = 0.02;
++constexpr offset_t TRANSFER_CHUNK = 1 << 20;
+ 
+ enum MessageTag { RowOffsets, Columns, Values, ValidationFailure };
+ 
+@@ -40,11 +41,11 @@
+     }
+ }
+ 
+-// MPI's point-to-point count is an int even when a block has more nonzeros.
++// Bound each MPI message and let rank zero reuse a small buffer for values.
+ template <typename T>
+ void sendBlock(const T* data, offset_t count, MPI_Datatype type, int dest, MessageTag tag) {
+     while (count != 0) {
+-        const int chunk = static_cast<int>(std::min<offset_t>(count, INT_MAX));
++        const int chunk = static_cast<int>(std::min(count, TRANSFER_CHUNK));
+         MPI_Send(data, chunk, type, dest, tag, MPI_COMM_WORLD);
+         data += chunk;
+         count -= chunk;
+@@ -54,7 +55,7 @@
+ template <typename T>
+ void receiveBlock(T* data, offset_t count, MPI_Datatype type, MessageTag tag) {
+     while (count != 0) {
+-        const int chunk = static_cast<int>(std::min<offset_t>(count, INT_MAX));
++        const int chunk = static_cast<int>(std::min(count, TRANSFER_CHUNK));
+         MPI_Recv(data, chunk, type, 0, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+         data += chunk;
+         count -= chunk;
+@@ -88,6 +89,7 @@
+ 
+     srand(8675309);
+     offset_t remaining = nItems;
++    // Once this many entries have been skipped, every remaining entry is required.
+     offset_t skipsLeft = totalEntries - nItems;
+     const int activeRanks = std::max(1, std::min(partition.ranks, static_cast<int>(partition.rows)));
+     std::vector<offset_t> blockSizes(activeRanks);
+@@ -265,11 +267,16 @@
+         fill(values.get(), localItems, maxVal);
+         if (blockSizes.size() > 1) {
+             const auto maxBlockSize = *std::max_element(blockSizes.begin() + 1, blockSizes.end());
+-            auto stagingValues = std::make_unique_for_overwrite<double[]>(maxBlockSize);
++            auto stagingValues =
++                std::make_unique_for_overwrite<double[]>(std::min(maxBlockSize, TRANSFER_CHUNK));
+             for (size_t dest = 1; dest < blockSizes.size(); ++dest) {
+-                fill(stagingValues.get(), blockSizes[dest], maxVal);
+-                sendBlock(stagingValues.get(), blockSizes[dest], MPI_DOUBLE,
+-                          static_cast<int>(dest), Values);
++                offset_t remaining = blockSizes[dest];
++                while (remaining != 0) {
++                    const offset_t count = std::min(remaining, TRANSFER_CHUNK);
++                    fill(stagingValues.get(), count, maxVal);
++                    sendBlock(stagingValues.get(), count, MPI_DOUBLE, static_cast<int>(dest), Values);
++                    remaining -= count;
++                }
+             }
+         }
+     } else {
+
+exec
+/bin/bash -lc 'cmake -S spmv -B /tmp/spmv-mpi.pLTnvE/final && cmake --build /tmp/spmv-mpi.pLTnvE/final' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 6003ms:
+-- The CXX compiler identification is GNU 13.2.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+CMake Warning (dev) at /usr/share/cmake-3.30/Modules/FindMPI.cmake:1481 (option):
+  Policy CMP0077 is not set: option() honors normal variables.  Run "cmake
+  --help-policy CMP0077" for policy details.  Use the cmake_policy command to
+  set the policy and suppress this warning.
+
+  For compatibility with older versions of CMake, option is clearing the
+  normal variable 'MPI_CXX_SKIP_MPICXX'.
+Call Stack (most recent call first):
+  CMakeLists.txt:9 (find_package)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Configuring done (3.2s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/spmv-mpi.pLTnvE/final
+[ 50%] Building CXX object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CXX executable spmv
+[100%] Built target spmv
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3/spmv/CMakeLists.txt
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..cef0c7243ded5052344bc71f03893cdb1ec32621
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,14 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set(MPI_CXX_SKIP_MPICXX TRUE CACHE BOOL "Skip the deprecated MPI C++ bindings")
++find_package(MPI REQUIRED COMPONENTS CXX)
+ 
+ # Enable optimizations
+ target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(spmv m)
++target_link_libraries(spmv PRIVATE MPI::MPI_CXX m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index b905012594c4cc0325594055c2028030ea2a266d..a040f30fc269200d330a8c28556ca7dad9bf0fa6
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -16,6 +16,7 @@
+ using offset_t = uint64_t;
+ 
+ constexpr double MAX_RELATIVE_ERROR = 0.02;
++constexpr offset_t TRANSFER_CHUNK = 1 << 20;
+ 
+ enum MessageTag { RowOffsets, Columns, Values, ValidationFailure };
+ 
+@@ -40,11 +41,11 @@
+     }
+ }
+ 
+-// MPI's point-to-point count is an int even when a block has more nonzeros.
++// Bound each MPI message and let rank zero reuse a small buffer for values.
+ template <typename T>
+ void sendBlock(const T* data, offset_t count, MPI_Datatype type, int dest, MessageTag tag) {
+     while (count != 0) {
+-        const int chunk = static_cast<int>(std::min<offset_t>(count, INT_MAX));
++        const int chunk = static_cast<int>(std::min(count, TRANSFER_CHUNK));
+         MPI_Send(data, chunk, type, dest, tag, MPI_COMM_WORLD);
+         data += chunk;
+         count -= chunk;
+@@ -54,7 +55,7 @@
+ template <typename T>
+ void receiveBlock(T* data, offset_t count, MPI_Datatype type, MessageTag tag) {
+     while (count != 0) {
+-        const int chunk = static_cast<int>(std::min<offset_t>(count, INT_MAX));
++        const int chunk = static_cast<int>(std::min(count, TRANSFER_CHUNK));
+         MPI_Recv(data, chunk, type, 0, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+         data += chunk;
+         count -= chunk;
+@@ -88,6 +89,7 @@
+ 
+     srand(8675309);
+     offset_t remaining = nItems;
++    // Once this many entries have been skipped, every remaining entry is required.
+     offset_t skipsLeft = totalEntries - nItems;
+     const int activeRanks = std::max(1, std::min(partition.ranks, static_cast<int>(partition.rows)));
+     std::vector<offset_t> blockSizes(activeRanks);
+@@ -265,11 +267,16 @@
+         fill(values.get(), localItems, maxVal);
+         if (blockSizes.size() > 1) {
+             const auto maxBlockSize = *std::max_element(blockSizes.begin() + 1, blockSizes.end());
+-            auto stagingValues = std::make_unique_for_overwrite<double[]>(maxBlockSize);
++            auto stagingValues =
++                std::make_unique_for_overwrite<double[]>(std::min(maxBlockSize, TRANSFER_CHUNK));
+             for (size_t dest = 1; dest < blockSizes.size(); ++dest) {
+-                fill(stagingValues.get(), blockSizes[dest], maxVal);
+-                sendBlock(stagingValues.get(), blockSizes[dest], MPI_DOUBLE,
+-                          static_cast<int>(dest), Values);
++                offset_t remaining = blockSizes[dest];
++                while (remaining != 0) {
++                    const offset_t count = std::min(remaining, TRANSFER_CHUNK);
++                    fill(stagingValues.get(), count, maxVal);
++                    sendBlock(stagingValues.get(), count, MPI_DOUBLE, static_cast<int>(dest), Values);
++                    remaining -= count;
++                }
+             }
+         }
+     } else {
+
+exec
+/bin/bash -lc 'cmake -S spmv -B /tmp/spmv-mpi.pLTnvE/verify && cmake --build /tmp/spmv-mpi.pLTnvE/verify' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 3049ms:
+-- The CXX compiler identification is GNU 13.2.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Configuring done (1.1s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/spmv-mpi.pLTnvE/verify
+[ 50%] Building CXX object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CXX executable spmv
+[100%] Built target spmv
+
+ succeeded in 27683ms:
+1 ranks ['-n', '2048', '-s', '1', '-i', '2', '-r', '-v'] matched serial
+3 ranks ['-n', '2048', '-s', '1', '-i', '2', '-r', '-v'] matched serial
+1 ranks ['-n', '257', '-s', '29', '-i', '7', '-m', '1.2345', '-r', '-v'] matched serial
+3 ranks ['-n', '257', '-s', '29', '-i', '7', '-m', '1.2345', '-r', '-v'] matched serial
+8 ranks ['-n', '257', '-s', '29', '-i', '7', '-m', '1.2345', '-r', '-v'] matched serial
+2 ranks ['-n', '12', '-s', '144', '-i', '0', '-r', '-v'] matched serial
+
+ succeeded in 39658ms:
+1024 rows, 1 ranks, build/spmv
+Computation time: 87 ms
+Performance: 0.954 GFLOPS
+Hash: 878c45f3660143ae
+Validation: PASSED
+1024 rows, 1 ranks, unrolled
+Computation time: 47 ms
+Performance: 1.782 GFLOPS
+Hash: 878c45f3660143ae
+Validation: PASSED
+1024 rows, 8 ranks, build/spmv
+Computation time: 11 ms
+Performance: 7.571 GFLOPS
+Hash: 878c45f3660143ae
+Validation: PASSED
+1024 rows, 8 ranks, unrolled
+Computation time: 6 ms
+Performance: 12.688 GFLOPS
+Hash: 878c45f3660143ae
+Validation: PASSED
+4096 rows, 1 ranks, build/spmv
+Computation time: 1188 ms
+Performance: 1.129 GFLOPS
+Hash: 20c6ca8034bcb7cd
+Validation: PASSED
+4096 rows, 1 ranks, unrolled
+Computation time: 1007 ms
+Performance: 1.333 GFLOPS
+Hash: 20c6ca8034bcb7cd
+Validation: PASSED
+4096 rows, 8 ranks, build/spmv
+Computation time: 132 ms
+Performance: 10.130 GFLOPS
+Hash: 20c6ca8034bcb7cd
+Validation: PASSED
+4096 rows, 8 ranks, unrolled
+Computation time: 124 ms
+Performance: 10.773 GFLOPS
+Hash: 20c6ca8034bcb7cd
+Validation: PASSED
+
+exec
+/bin/bash -lc 'command -v clang++ && clang++ --version' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 0ms:
+/usr/bin/clang++
+Ubuntu clang version 18.1.3 (1ubuntu1)
+Target: x86_64-pc-linux-gnu
+Thread model: posix
+InstalledDir: /usr/bin
+
+exec
+/bin/bash -lc "ldd /tmp/spmv-mpi.pLTnvE/verify/spmv | rg 'mpi|open-rte' && /tmp/spmv-mpi.pLTnvE/verify/spmv -r -v | rg 'Hash|Validation'" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 3818ms:
+	libmpi.so.40 => /lib/x86_64-linux-gnu/libmpi.so.40 (0x0000727a3dd6c000)
+	libopen-rte.so.40 => /lib/x86_64-linux-gnu/libopen-rte.so.40 (0x0000727a3dc83000)
+Validation: enabled
+Hash: 878c45f3660143ae
+Validation: PASSED
+
+exec
+/bin/bash -lc 'for s in 10 1000; do
+  for bin in build/spmv unrolled build/spmv unrolled; do
+    echo "sparsity $s, $bin"
+    mpiexec --bind-to core -n 1 /tmp/spmv-mpi.pLTnvE/"$bin" -n 4096 -s "$s" -i 400 -r | rg '"'Average time|Hash'
+  done
+done" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+codex
+The expanded tests matched the serial result blocks for dense input, zero nonzeros, more ranks than rows, and a validation failure on a non-root rank. Processing two rows at a time changed the hash, so I’ve kept the original arithmetic path.
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3/spmv/spmv.cpp
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..cef0c7243ded5052344bc71f03893cdb1ec32621
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -1,13 +1,14 @@
+ cmake_minimum_required(VERSION 3.10)
+-project(spmv_benchmark)
++project(spmv_benchmark LANGUAGES CXX)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ add_executable(spmv spmv.cpp)
++set(MPI_CXX_SKIP_MPICXX TRUE CACHE BOOL "Skip the deprecated MPI C++ bindings")
++find_package(MPI REQUIRED COMPONENTS CXX)
+ 
+ # Enable optimizations
+ target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(spmv m)
++target_link_libraries(spmv PRIVATE MPI::MPI_CXX m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index b905012594c4cc0325594055c2028030ea2a266d..f588a5f3d9c74b35277eedbd5ea4ffd557eaca28
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -1,4 +1,5 @@
+ #include <algorithm>
++#include <cinttypes>
+ #include <climits>
+ #include <cmath>
+ #include <cstdio>
+@@ -16,6 +17,7 @@
+ using offset_t = uint64_t;
+ 
+ constexpr double MAX_RELATIVE_ERROR = 0.02;
++constexpr offset_t TRANSFER_CHUNK = 1 << 20;
+ 
+ enum MessageTag { RowOffsets, Columns, Values, ValidationFailure };
+ 
+@@ -40,11 +42,11 @@
+     }
+ }
+ 
+-// MPI's point-to-point count is an int even when a block has more nonzeros.
++// Bound each MPI message and let rank zero reuse a small buffer for values.
+ template <typename T>
+ void sendBlock(const T* data, offset_t count, MPI_Datatype type, int dest, MessageTag tag) {
+     while (count != 0) {
+-        const int chunk = static_cast<int>(std::min<offset_t>(count, INT_MAX));
++        const int chunk = static_cast<int>(std::min(count, TRANSFER_CHUNK));
+         MPI_Send(data, chunk, type, dest, tag, MPI_COMM_WORLD);
+         data += chunk;
+         count -= chunk;
+@@ -54,7 +56,7 @@
+ template <typename T>
+ void receiveBlock(T* data, offset_t count, MPI_Datatype type, MessageTag tag) {
+     while (count != 0) {
+-        const int chunk = static_cast<int>(std::min<offset_t>(count, INT_MAX));
++        const int chunk = static_cast<int>(std::min(count, TRANSFER_CHUNK));
+         MPI_Recv(data, chunk, type, 0, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+         data += chunk;
+         count -= chunk;
+@@ -88,6 +90,7 @@
+ 
+     srand(8675309);
+     offset_t remaining = nItems;
++    // Once this many entries have been skipped, every remaining entry is required.
+     offset_t skipsLeft = totalEntries - nItems;
+     const int activeRanks = std::max(1, std::min(partition.ranks, static_cast<int>(partition.rows)));
+     std::vector<offset_t> blockSizes(activeRanks);
+@@ -265,11 +268,16 @@
+         fill(values.get(), localItems, maxVal);
+         if (blockSizes.size() > 1) {
+             const auto maxBlockSize = *std::max_element(blockSizes.begin() + 1, blockSizes.end());
+-            auto stagingValues = std::make_unique_for_overwrite<double[]>(maxBlockSize);
++            auto stagingValues =
++                std::make_unique_for_overwrite<double[]>(std::min(maxBlockSize, TRANSFER_CHUNK));
+             for (size_t dest = 1; dest < blockSizes.size(); ++dest) {
+-                fill(stagingValues.get(), blockSizes[dest], maxVal);
+-                sendBlock(stagingValues.get(), blockSizes[dest], MPI_DOUBLE,
+-                          static_cast<int>(dest), Values);
++                offset_t remaining = blockSizes[dest];
++                while (remaining != 0) {
++                    const offset_t count = std::min(remaining, TRANSFER_CHUNK);
++                    fill(stagingValues.get(), count, maxVal);
++                    sendBlock(stagingValues.get(), count, MPI_DOUBLE, static_cast<int>(dest), Values);
++                    remaining -= count;
++                }
+             }
+         }
+     } else {
+
+exec
+/bin/bash -lc 'cmake --build /tmp/spmv-mpi.pLTnvE/verify && mpiexec --oversubscribe -n 4 /tmp/spmv-mpi.pLTnvE/verify/spmv -r -v' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3
+ succeeded in 6645ms:
+[ 50%] Building CXX object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CXX executable spmv
+[100%] Built target spmv
+Sparse Matrix-Vector Multiplication (SpMV) Benchmark
+Matrix size: 1024 x 1024
+Sparsity: 1 out of 10 entries is non-zero
+Non-zero elements: 104857 (90.00% sparse)
+Iterations: 10
+Max value: 1.00
+Validation: enabled
+Initializing data structures...
+Computing reference solution...
+Computing SpMV...
+Computation time: 0 ms
+Average time per iteration: 0.036 ms
+Performance: 5.905 GFLOPS
+=== RESULTS ===
+Name: OutputVector
+Elements: 1024
+Sum: 2.64923178037303951e+04
+Min: 1.61287140372775646e+01
+Max: 1.37070805085584794e+02
+Sample[0]: 2.77651784395352692e+01
+Sample[256]: 2.12393609971005759e+01
+Sample[512]: 2.79785828840587563e+01
+Sample[768]: 2.85371971652506211e+01
+Sample[1023]: 1.37070805085584794e+02
+Hash: 878c45f3660143ae
+=== END RESULTS ===
+Validating result...
+Validation: PASSED
+
+codex
+Parallelized `spmv` with required MPI support. Each rank owns a contiguous block of CSR rows and keeps a copy of the input vector, so the timed iterations run without MPI communication. Rank 0 generates the matrix in blocks to preserve the original random sequence and gathers the output only when `-r` is requested.
+
+Verified exact matches against the serial result blocks and hashes across 1–8 ranks, including runs with more ranks than rows. On one host, the timed kernel dropped from 1,040 ms on one rank to 125 ms on eight ranks, an **8.3× speedup**. Multi-node performance was not measured.
+
+Edits were limited to [spmv.cpp](/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3/spmv/spmv.cpp) and [CMakeLists.txt](/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3/spmv/CMakeLists.txt).
+2026-11-24T14:33:13.733149Z ERROR codex_core::session: failed to record rollout items: thread 01a20df3-af76-7d13-83ab-b42a9fa77040 not found
+tokens used
+91,014
+Parallelized `spmv` with required MPI support. Each rank owns a contiguous block of CSR rows and keeps a copy of the input vector, so the timed iterations run without MPI communication. Rank 0 generates the matrix in blocks to preserve the original random sequence and gathers the output only when `-r` is requested.
+
+Verified exact matches against the serial result blocks and hashes across 1–8 ranks, including runs with more ranks than rows. On one host, the timed kernel dropped from 1,040 ms on one rank to 125 ms on eight ranks, an **8.3× speedup**. Multi-node performance was not measured.
+
+Edits were limited to [spmv.cpp](/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3/spmv/spmv.cpp) and [CMakeLists.txt](/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r3/spmv/CMakeLists.txt).

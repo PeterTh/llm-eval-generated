@@ -1,0 +1,3515 @@
+Reading additional input from stdin...
+OpenAI Codex v0.171.0
+--------
+workdir: /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+model: gpt-6.2-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a20c16-e28f-7810-b085-4897ccb8f7cf
+--------
+user
+Parallelize the spmv benchmark code found in ./spmv/ with MPI for distributed memory cluster parallelism. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the benchmark and its build setup, then implement MPI and verify the results across multiple rank counts.
+exec
+/bin/bash -lc 'ls -la; command -v mpicxx; command -v mpiexec; find .. -name AGENTS.md -print' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 0ms:
+total 8
+drwxrwxrwx 4 nobody  nogroup   50 Nov 24 06:45 .
+drwx------ 3 llmtest users   4096 Nov 24 06:45 ..
+drwxrwxrwx 2 nobody  nogroup   48 Nov 24 06:45 common
+-rw-r--r-- 1 llmtest users    993 Nov 24 06:45 output.txt
+drwxrwxrwx 2 nobody  nogroup   44 Nov 24 06:45 spmv
+/usr/bin/mpicxx
+/usr/bin/mpiexec
+
+exec
+/bin/bash -lc "git status --short; rg --files --hidden -g '"'!.git'"'" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 0ms:
+fatal: not a git repository (or any parent up to mount point /home/llmtest/evals/20261123-155235)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+output.txt
+common/hash.hpp
+common/results_output.hpp
+spmv/CMakeLists.txt
+spmv/spmv.cpp
+
+exec
+/bin/bash -lc 'cat spmv/CMakeLists.txt; cat spmv/spmv.cpp' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 0ms:
+cmake_minimum_required(VERSION 3.10)
+project(spmv_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(spmv spmv.cpp)
+
+# Enable optimizations
+target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link math library
+target_link_libraries(spmv m)
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+using index_t = uint32_t;
+
+// Constants
+constexpr double MAX_RELATIVE_ERROR = 0.02;
+
+// ****************************************************************************
+// Function: fill
+//
+// Purpose:
+//   Initialize array with random values
+//
+// Arguments:
+//   A: pointer to the array to initialize
+//   n: number of elements in the array
+//   maxVal: specifies range of random values [0, maxVal]
+//
+// ****************************************************************************
+void fill(double* A, const index_t n, const double maxVal) {
+    for (index_t i = 0; i < n; ++i) {
+        A[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+    }
+}
+
+// ****************************************************************************
+// Function: initRandomMatrix
+//
+// Purpose:
+//   Assigns random positions to a given number of elements in a square
+//   matrix. The function encodes these positions in compressed sparse
+//   row (CSR) format.
+//
+// Arguments:
+//   cols:          array for column indexes of elements (size should be = n)
+//   rowDelimiters: array of size dim+1 holding indices to rows;
+//                  last element is the index one past the last element
+//   n:             number of nonzero elements
+//   dim:           number of rows/columns in the matrix
+//
+// ****************************************************************************
+void initRandomMatrix(index_t* cols, index_t* rowDelimiters, const index_t n, const index_t dim) {
+    index_t nnzAssigned = 0;
+
+    // Figure out the probability that a nonzero should be assigned
+    double prob = static_cast<double>(n) / (static_cast<double>(dim) * static_cast<double>(dim));
+
+    // Seed random number generator
+    srand(8675309);
+
+    // Randomly decide whether entry i,j gets a value, but ensure n values are assigned
+    bool fillRemaining = false;
+    for (index_t i = 0; i < dim; ++i) {
+        rowDelimiters[i] = nnzAssigned;
+        for (index_t j = 0; j < dim; ++j) {
+            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+            index_t needToAssign = n - nnzAssigned;
+            if (numEntriesLeft <= needToAssign) {
+                fillRemaining = true;
+            }
+            double randVal = static_cast<double>(rand()) / RAND_MAX;
+            if ((nnzAssigned < n && randVal <= prob) || fillRemaining) {
+                // Assign (i,j) a value
+                cols[nnzAssigned] = j;
+                nnzAssigned++;
+            }
+        }
+    }
+    // Convention: put the number of non-zeroes at the end of the row delimiters array
+    rowDelimiters[dim] = n;
+}
+
+// ****************************************************************************
+// Function: spmvCpu
+//
+// Purpose:
+//   Computes sparse matrix-vector multiplication using CSR format
+//
+// Arguments:
+//   val: array holding the non-zero values for the matrix
+//   cols: array of column indices for each element
+//   rowDelimiters: array of size dim+1 holding indices to rows;
+//                  last element is the index one past the last element
+//   vec: dense vector of size dim to be used for multiplication
+//   dim: number of rows/columns in the matrix
+//   out: output - result from the spmv calculation
+//
+// ****************************************************************************
+void spmvCpu(const double* val, const index_t* cols, const index_t* rowDelimiters,
+             const double* vec, const index_t dim, double* out) {
+    for (index_t i = 0; i < dim; ++i) {
+        double t = 0.0;
+        for (index_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
+            const auto col = cols[j];
+            t += val[j] * vec[col];
+        }
+        out[i] = t;
+    }
+}
+
+// ****************************************************************************
+// Function: verifyResults
+//
+// Purpose:
+//   Verifies correctness of results by comparing to reference solution
+//
+// Arguments:
+//   reference: array holding the reference result vector
+//   result: array holding the result vector to verify
+//   size: number of elements per vector
+//
+// ****************************************************************************
+bool verifyResults(const double* reference, const double* result, const index_t size) {
+    for (index_t i = 0; i < size; ++i) {
+        const double ref = reference[i];
+        const double res = result[i];
+        if (std::abs(ref) < 1e-10) {
+            // For very small values, check absolute error
+            if (std::abs(res) > MAX_RELATIVE_ERROR) {
+                printf("Validation failed at index %u: reference %.10e, got %.10e\n", i, ref, res);
+                return false;
+            }
+        } else {
+            // Check relative error
+            const double relError = std::abs((res - ref) / ref);
+            if (relError > MAX_RELATIVE_ERROR) {
+                printf("Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\n",
+                       i, ref, res, relError);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Number of rows/columns in the matrix (default: 1024)\n");
+    printf("  -s <num>     Sparsity: 1 out of N entries is non-zero (default: 10)\n");
+    printf("  -i <num>     Number of iterations (default: 10)\n");
+    printf("  -m <val>     Maximum value for matrix and vector elements (default: 1.0)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    index_t numRows = 1024;
+    index_t sparsity = 10;
+    index_t iterations = 10;
+    double maxVal = 1.0;
+    bool validate = false;
+    bool printResults = false;
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            numRows = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            sparsity = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            iterations = static_cast<index_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            maxVal = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+
+    // Calculate number of non-zero elements
+    const index_t nItems = (numRows * numRows) / sparsity;
+
+    printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+    printf("Matrix size: %u x %u\n", numRows, numRows);
+    printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+    printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
+    printf("Iterations: %u\n", iterations);
+    printf("Max value: %.2f\n", maxVal);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+
+    // Allocate and initialize data structures
+    std::vector<double> h_val(nItems);                  // Non-zero values
+    std::vector<index_t> h_cols(nItems);                // Column indices
+    std::vector<index_t> h_rowDelimiters(numRows + 1);  // Row delimiters
+    std::vector<double> h_vec(numRows);                 // Dense vector
+    std::vector<double> h_out(numRows);                 // Output vector
+
+    printf("Initializing data structures...\n");
+    fill(h_vec.data(), numRows, maxVal);
+    fill(h_val.data(), nItems, maxVal);
+    initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+
+    // For validation, compute reference solution
+    std::vector<double> h_reference;
+    if (validate) {
+        printf("Computing reference solution...\n");
+        h_reference.resize(numRows);
+        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(), 
+                h_vec.data(), numRows, h_reference.data());
+    }
+
+    // Perform SpMV computation
+    printf("Computing SpMV...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (index_t iter = 0; iter < iterations; ++iter) {
+        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+                h_vec.data(), numRows, h_out.data());
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+    printf("Computation time: %ld ms\n", duration.count());
+    
+    // Calculate performance metrics
+    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+    const double avgTime = duration.count() / static_cast<double>(iterations);
+    
+    printf("Average time per iteration: %.3f ms\n", avgTime);
+    printf("Performance: %.3f GFLOPS\n", gflops);
+    
+    // Print results for external validation
+    if (printResults) {
+        print_results(h_out, "OutputVector");
+    }
+
+    // Validation
+    if (validate) {
+        printf("Validating result...\n");
+        const bool valid = verifyResults(h_reference.data(), h_out.data(), numRows);
+
+        if (valid) {
+            printf("Validation: PASSED\n");
+            return 0;
+        } else {
+            printf("Validation: FAILED\n");
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+exec
+/bin/bash -lc 'cat common/hash.hpp common/results_output.hpp output.txt; mpiexec --version; nproc' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 0ms:
+#pragma once
+
+#include <cstdint>
+
+// FNV-1a hash, 64 bit length
+class hash {
+  public:
+	using digest = uint64_t;
+
+	template <typename T>
+	void add(const T& value) {
+		const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&value);
+		for(size_t i = 0; i < sizeof(T); ++i) {
+			d = (d ^ bytes[i]) * 0x100000001b3ull;
+		}
+	}
+
+	digest get() const { return d; }
+
+  private:
+	digest d = 0xcbf29ce484222325ull;
+};
+#pragma once
+
+#include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+#include "hash.hpp"
+
+// Kahan summation for numerically stable sum
+template <typename T>
+T kahan_sum(const std::vector<T>& data) {
+    T sum = 0.0;
+    T c = 0.0;
+    for (const auto& val : data) {
+        T y = val - c;
+        T t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    return sum;
+}
+
+// Print results for floating-point arrays
+template <typename T>
+void print_results(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute statistics
+    T sum = kahan_sum(data);
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Sum: %.17e\n", static_cast<double>(sum));
+    printf("Min: %.17e\n", static_cast<double>(min_val));
+    printf("Max: %.17e\n", static_cast<double>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %.17e\n", indices[i], static_cast<double>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+// Print results for integer arrays (uses exact hash comparison)
+template <typename T>
+void print_results_int(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Compute min/max
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Min: %lld\n", static_cast<long long>(min_val));
+    printf("Max: %lld\n", static_cast<long long>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %lld\n", indices[i], static_cast<long long>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+Reading additional input from stdin...
+OpenAI Codex v0.171.0
+--------
+workdir: /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+model: gpt-6.2-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a20c16-e28f-7810-b085-4897ccb8f7cf
+--------
+user
+Parallelize the spmv benchmark code found in ./spmv/ with MPI for distributed memory cluster parallelism. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the benchmark and its build setup, then implement MPI and verify the results across multiple rank counts.
+exec
+/bin/bash -lc 'ls -la; command -v mpicxx; command -v mpiexec; find .. -name AGENTS.md -print' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 0ms:
+total 8
+drwxrwxrwx 4 nobody  nogroup   50 Nov 24 06:45 .
+drwx------ 3 llmtest users   4096 Nov 24 06:45 ..
+drwxrwxrwx 2 nobody  nogroup   48 Nov 24 06:45 common
+-rw-r--r-- 1 llmtest users    993 Nov 24 06:45 output.txt
+drwxrwxrwx 2 nobody  nogroup   44 Nov 24 06:45 spmv
+/usr/bin/mpicxx
+/usr/bin/mpiexec
+
+exec
+/bin/bash -lc "git status --short; rg --files --hidden -g '"'!.git'"'" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 0ms:
+fatal: not a git repository (or any parent up to mount point /home/llmtest/evals/20261123-155235)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+output.txt
+common/hash.hpp
+common/results_output.hpp
+spmv/CMakeLists.txt
+spmv/spmv.cpp
+
+mpiexec (OpenRTE) 4.1.6
+
+Report bugs to http://www.open-mpi.org/community/help/
+256
+
+exec
+/bin/bash -lc 'build_dir=$(mktemp -d /tmp/spmv-mpi.XXXXXX)
+g++ -std=c++20 -O3 -march=native -Wall -Wextra spmv/spmv.cpp -o "$build_dir/spmv-serial" && printf '"'%s\\n' \""'$build_dir"' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 2124ms:
+/tmp/spmv-mpi.9jkRqi
+
+codex
+I’ll give each rank a contiguous block of CSR rows and broadcast the input vector once. The timed iterations can then run without MPI communication. Rank 0 will generate the original seeded data in blocks and gather the output only for `-r`.
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2/spmv/CMakeLists.txt
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..4c9f5361116ad4fca10ea15f0946b0379c8f0089
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -4,10 +4,11 @@
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ add_executable(spmv spmv.cpp)
+ 
+ # Enable optimizations
+ target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(spmv m)
++target_link_libraries(spmv PRIVATE MPI::MPI_CXX m)
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2/spmv/spmv.cpp
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..4c9f5361116ad4fca10ea15f0946b0379c8f0089
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -4,10 +4,11 @@
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ add_executable(spmv spmv.cpp)
+ 
+ # Enable optimizations
+ target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(spmv m)
++target_link_libraries(spmv PRIVATE MPI::MPI_CXX m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..eb5732434cc0f29a53ad179b2b530ca137c65b2c
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -1,80 +1,159 @@
+-#include <chrono>
++#include <algorithm>
+ #include <cmath>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <exception>
++#include <limits>
++#include <memory>
+ #include <vector>
+ 
++#include <mpi.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
++using offset_t = uint64_t;
+ 
+-// Constants
+ constexpr double MAX_RELATIVE_ERROR = 0.02;
++constexpr int ROOT = 0;
++constexpr int TRANSFER_CHUNK = 1 << 18;
++
++struct RowBlock {
++    index_t first;
++    index_t count;
++};
++
++RowBlock rowBlock(index_t rows, int rank, int ranks) {
++    const index_t quotient = rows / ranks;
++    const index_t remainder = rows % ranks;
++    const auto peer = static_cast<index_t>(rank);
++    return {peer * quotient + std::min(peer, remainder), quotient + (peer < remainder)};
++}
+ 
+-// ****************************************************************************
+-// Function: fill
+-//
+-// Purpose:
+-//   Initialize array with random values
+-//
+-// Arguments:
+-//   A: pointer to the array to initialize
+-//   n: number of elements in the array
+-//   maxVal: specifies range of random values [0, maxVal]
+-//
+-// ****************************************************************************
+-void fill(double* A, const index_t n, const double maxVal) {
+-    for (index_t i = 0; i < n; ++i) {
++template <typename T>
++void sendBuffer(const T* data, offset_t size, MPI_Datatype type, int peer, int tag) {
++    for (offset_t offset = 0; offset < size; offset += TRANSFER_CHUNK) {
++        const int count = std::min<offset_t>(size - offset, TRANSFER_CHUNK);
++        MPI_Send(data + offset, count, type, peer, tag, MPI_COMM_WORLD);
++    }
++}
++
++template <typename T>
++void receiveBuffer(T* data, offset_t size, MPI_Datatype type, int tag) {
++    for (offset_t offset = 0; offset < size; offset += TRANSFER_CHUNK) {
++        const int count = std::min<offset_t>(size - offset, TRANSFER_CHUNK);
++        MPI_Recv(data + offset, count, type, ROOT, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
++    }
++}
++
++void fill(double* A, const offset_t n, const double maxVal) {
++    for (offset_t i = 0; i < n; ++i) {
+         A[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+     }
+ }
+ 
+-// ****************************************************************************
+-// Function: initRandomMatrix
+-//
+-// Purpose:
+-//   Assigns random positions to a given number of elements in a square
+-//   matrix. The function encodes these positions in compressed sparse
+-//   row (CSR) format.
+-//
+-// Arguments:
+-//   cols:          array for column indexes of elements (size should be = n)
+-//   rowDelimiters: array of size dim+1 holding indices to rows;
+-//                  last element is the index one past the last element
+-//   n:             number of nonzero elements
+-//   dim:           number of rows/columns in the matrix
+-//
+-// ****************************************************************************
+-void initRandomMatrix(index_t* cols, index_t* rowDelimiters, const index_t n, const index_t dim) {
+-    index_t nnzAssigned = 0;
++// Visit blocks in global row order to preserve the original rand() sequence.
++void initRandomRows(std::vector<index_t>& cols, std::vector<offset_t>& rowDelimiters,
++                    index_t dim, RowBlock block, double probability, offset_t& needed) {
++    cols.clear();
++    rowDelimiters.resize(static_cast<offset_t>(block.count) + 1);
++    for (index_t i = 0; i < block.count; ++i) {
++        rowDelimiters[i] = cols.size();
++        offset_t remaining = static_cast<offset_t>(dim - block.first - i) * dim;
++        index_t j = 0;
++        for (; j < dim && needed != 0 && remaining > needed; ++j, --remaining) {
++            if (static_cast<double>(rand()) / RAND_MAX <= probability) {
++                cols.push_back(j);
++                --needed;
++            }
++        }
++        // Once every remaining entry is required, the random draws are immaterial.
++        if (needed != 0 && remaining == needed) {
++            for (; j < dim; ++j) {
++                cols.push_back(j);
++                --needed;
++            }
++        }
++    }
++    rowDelimiters[block.count] = cols.size();
++}
++
++struct LocalMatrix {
++    std::vector<offset_t> rowDelimiters;
++    std::vector<index_t> cols;
++    std::unique_ptr<double[]> val;
++};
+ 
+-    // Figure out the probability that a nonzero should be assigned
+-    double prob = static_cast<double>(n) / (static_cast<double>(dim) * static_cast<double>(dim));
++LocalMatrix initialize(index_t dim, offset_t nonzeros, double maxVal, RowBlock block,
++                       int rank, int ranks, std::vector<double>& vec) {
++    constexpr int ROWS_TAG = 0;
++    constexpr int COLS_TAG = 1;
++    constexpr int VALUES_TAG = 2;
++    LocalMatrix matrix;
++    std::vector<offset_t> nonzerosPerRank;
+ 
+-    // Seed random number generator
+-    srand(8675309);
++    if (rank == ROOT) {
++        nonzerosPerRank.resize(ranks);
++        const double probability = dim == 0 ? 0.0 :
++            static_cast<double>(nonzeros) / (static_cast<double>(dim) * dim);
++        offset_t needed = nonzeros;
++        srand(8675309);
++        matrix.cols.reserve(nonzeros / ranks);
++        initRandomRows(matrix.cols, matrix.rowDelimiters, dim, block, probability, needed);
++        nonzerosPerRank[ROOT] = matrix.cols.size();
+ 
+-    // Randomly decide whether entry i,j gets a value, but ensure n values are assigned
+-    bool fillRemaining = false;
+-    for (index_t i = 0; i < dim; ++i) {
+-        rowDelimiters[i] = nnzAssigned;
+-        for (index_t j = 0; j < dim; ++j) {
+-            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+-            index_t needToAssign = n - nnzAssigned;
+-            if (numEntriesLeft <= needToAssign) {
+-                fillRemaining = true;
++        std::vector<index_t> cols;
++        std::vector<offset_t> rowDelimiters;
++        if (ranks > 1) {
++            cols.reserve(nonzeros / ranks);
++        }
++        for (int peer = 1; peer < ranks; ++peer) {
++            const RowBlock peerBlock = rowBlock(dim, peer, ranks);
++            if (peerBlock.count == 0) {
++                break;
+             }
+-            double randVal = static_cast<double>(rand()) / RAND_MAX;
+-            if ((nnzAssigned < n && randVal <= prob) || fillRemaining) {
+-                // Assign (i,j) a value
+-                cols[nnzAssigned] = j;
+-                nnzAssigned++;
++            initRandomRows(cols, rowDelimiters, dim, peerBlock, probability, needed);
++            nonzerosPerRank[peer] = cols.size();
++            sendBuffer(rowDelimiters.data(), rowDelimiters.size(), MPI_UINT64_T, peer, ROWS_TAG);
++            sendBuffer(cols.data(), cols.size(), MPI_UINT32_T, peer, COLS_TAG);
++        }
++    } else {
++        matrix.rowDelimiters.resize(static_cast<offset_t>(block.count) + 1);
++        if (block.count != 0) {
++            receiveBuffer(matrix.rowDelimiters.data(), matrix.rowDelimiters.size(),
++                          MPI_UINT64_T, ROWS_TAG);
++            matrix.cols.resize(matrix.rowDelimiters.back());
++            receiveBuffer(matrix.cols.data(), matrix.cols.size(), MPI_UINT32_T, COLS_TAG);
++        }
++    }
++
++    if (rank == ROOT) {
++        // The original vector and matrix values shared the default rand() stream.
++        srand(1);
++        fill(vec.data(), dim, maxVal);
++    }
++    MPI_Bcast(vec.data(), static_cast<int>(dim), MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
++
++    matrix.val = std::make_unique_for_overwrite<double[]>(matrix.cols.size());
++    if (rank == ROOT) {
++        fill(matrix.val.get(), matrix.cols.size(), maxVal);
++        const auto bufferSize = std::min<offset_t>(
++            TRANSFER_CHUNK, *std::max_element(nonzerosPerRank.begin() + 1, nonzerosPerRank.end(),
++                                             std::less<offset_t>{}));
++        auto buffer = std::make_unique_for_overwrite<double[]>(bufferSize);
++        for (int peer = 1; peer < ranks; ++peer) {
++            for (offset_t offset = 0; offset < nonzerosPerRank[peer]; offset += TRANSFER_CHUNK) {
++                const int count = std::min<offset_t>(nonzerosPerRank[peer] - offset, TRANSFER_CHUNK);
++                fill(buffer.get(), count, maxVal);
++                MPI_Send(buffer.get(), count, MPI_DOUBLE, peer, VALUES_TAG, MPI_COMM_WORLD);
+             }
+         }
++    } else {
++        receiveBuffer(matrix.val.get(), matrix.cols.size(), MPI_DOUBLE, VALUES_TAG);
+     }
+-    // Convention: put the number of non-zeroes at the end of the row delimiters array
+-    rowDelimiters[dim] = n;
++    return matrix;
+ }
+ 
+ // ****************************************************************************
+@@ -93,11 +172,11 @@
+ //   out: output - result from the spmv calculation
+ //
+ // ****************************************************************************
+-void spmvCpu(const double* val, const index_t* cols, const index_t* rowDelimiters,
++void spmvCpu(const double* val, const index_t* cols, const offset_t* rowDelimiters,
+              const double* vec, const index_t dim, double* out) {
+     for (index_t i = 0; i < dim; ++i) {
+         double t = 0.0;
+-        for (index_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
++        for (offset_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
+             const auto col = cols[j];
+             t += val[j] * vec[col];
+         }
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2/spmv/spmv.cpp
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..4c9f5361116ad4fca10ea15f0946b0379c8f0089
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -4,10 +4,11 @@
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ add_executable(spmv spmv.cpp)
+ 
+ # Enable optimizations
+ target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(spmv m)
++target_link_libraries(spmv PRIVATE MPI::MPI_CXX m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..9c2df80d64bc1021252e918145db52b6584d0141
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -1,80 +1,158 @@
+-#include <chrono>
++#include <algorithm>
+ #include <cmath>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <exception>
++#include <limits>
++#include <memory>
+ #include <vector>
+ 
++#include <mpi.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
++using offset_t = uint64_t;
+ 
+-// Constants
+ constexpr double MAX_RELATIVE_ERROR = 0.02;
++constexpr int ROOT = 0;
++constexpr int TRANSFER_CHUNK = 1 << 18;
++
++struct RowBlock {
++    index_t first;
++    index_t count;
++};
++
++RowBlock rowBlock(index_t rows, int rank, int ranks) {
++    const index_t quotient = rows / ranks;
++    const index_t remainder = rows % ranks;
++    const auto peer = static_cast<index_t>(rank);
++    return {peer * quotient + std::min(peer, remainder), quotient + (peer < remainder)};
++}
+ 
+-// ****************************************************************************
+-// Function: fill
+-//
+-// Purpose:
+-//   Initialize array with random values
+-//
+-// Arguments:
+-//   A: pointer to the array to initialize
+-//   n: number of elements in the array
+-//   maxVal: specifies range of random values [0, maxVal]
+-//
+-// ****************************************************************************
+-void fill(double* A, const index_t n, const double maxVal) {
+-    for (index_t i = 0; i < n; ++i) {
++template <typename T>
++void sendBuffer(const T* data, offset_t size, MPI_Datatype type, int peer, int tag) {
++    for (offset_t offset = 0; offset < size; offset += TRANSFER_CHUNK) {
++        const int count = std::min<offset_t>(size - offset, TRANSFER_CHUNK);
++        MPI_Send(data + offset, count, type, peer, tag, MPI_COMM_WORLD);
++    }
++}
++
++template <typename T>
++void receiveBuffer(T* data, offset_t size, MPI_Datatype type, int tag) {
++    for (offset_t offset = 0; offset < size; offset += TRANSFER_CHUNK) {
++        const int count = std::min<offset_t>(size - offset, TRANSFER_CHUNK);
++        MPI_Recv(data + offset, count, type, ROOT, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
++    }
++}
++
++void fill(double* A, const offset_t n, const double maxVal) {
++    for (offset_t i = 0; i < n; ++i) {
+         A[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+     }
+ }
+ 
+-// ****************************************************************************
+-// Function: initRandomMatrix
+-//
+-// Purpose:
+-//   Assigns random positions to a given number of elements in a square
+-//   matrix. The function encodes these positions in compressed sparse
+-//   row (CSR) format.
+-//
+-// Arguments:
+-//   cols:          array for column indexes of elements (size should be = n)
+-//   rowDelimiters: array of size dim+1 holding indices to rows;
+-//                  last element is the index one past the last element
+-//   n:             number of nonzero elements
+-//   dim:           number of rows/columns in the matrix
+-//
+-// ****************************************************************************
+-void initRandomMatrix(index_t* cols, index_t* rowDelimiters, const index_t n, const index_t dim) {
+-    index_t nnzAssigned = 0;
++// Visit blocks in global row order to preserve the original rand() sequence.
++void initRandomRows(std::vector<index_t>& cols, std::vector<offset_t>& rowDelimiters,
++                    index_t dim, RowBlock block, double probability, offset_t& needed) {
++    cols.clear();
++    rowDelimiters.resize(static_cast<offset_t>(block.count) + 1);
++    for (index_t i = 0; i < block.count; ++i) {
++        rowDelimiters[i] = cols.size();
++        offset_t remaining = static_cast<offset_t>(dim - block.first - i) * dim;
++        index_t j = 0;
++        for (; j < dim && needed != 0 && remaining > needed; ++j, --remaining) {
++            if (static_cast<double>(rand()) / RAND_MAX <= probability) {
++                cols.push_back(j);
++                --needed;
++            }
++        }
++        // Once every remaining entry is required, the random draws are immaterial.
++        if (needed != 0 && remaining == needed) {
++            for (; j < dim; ++j) {
++                cols.push_back(j);
++                --needed;
++            }
++        }
++    }
++    rowDelimiters[block.count] = cols.size();
++}
++
++struct LocalMatrix {
++    std::vector<offset_t> rowDelimiters;
++    std::vector<index_t> cols;
++    std::unique_ptr<double[]> val;
++};
+ 
+-    // Figure out the probability that a nonzero should be assigned
+-    double prob = static_cast<double>(n) / (static_cast<double>(dim) * static_cast<double>(dim));
++LocalMatrix initialize(index_t dim, offset_t nonzeros, double maxVal, RowBlock block,
++                       int rank, int ranks, std::vector<double>& vec) {
++    constexpr int ROWS_TAG = 0;
++    constexpr int COLS_TAG = 1;
++    constexpr int VALUES_TAG = 2;
++    LocalMatrix matrix;
++    std::vector<offset_t> nonzerosPerRank;
+ 
+-    // Seed random number generator
+-    srand(8675309);
++    if (rank == ROOT) {
++        nonzerosPerRank.resize(ranks);
++        const double probability = dim == 0 ? 0.0 :
++            static_cast<double>(nonzeros) / (static_cast<double>(dim) * dim);
++        offset_t needed = nonzeros;
++        srand(8675309);
++        matrix.cols.reserve(nonzeros / ranks);
++        initRandomRows(matrix.cols, matrix.rowDelimiters, dim, block, probability, needed);
++        nonzerosPerRank[ROOT] = matrix.cols.size();
+ 
+-    // Randomly decide whether entry i,j gets a value, but ensure n values are assigned
+-    bool fillRemaining = false;
+-    for (index_t i = 0; i < dim; ++i) {
+-        rowDelimiters[i] = nnzAssigned;
+-        for (index_t j = 0; j < dim; ++j) {
+-            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+-            index_t needToAssign = n - nnzAssigned;
+-            if (numEntriesLeft <= needToAssign) {
+-                fillRemaining = true;
++        std::vector<index_t> cols;
++        std::vector<offset_t> rowDelimiters;
++        if (ranks > 1) {
++            cols.reserve(nonzeros / ranks);
++        }
++        for (int peer = 1; peer < ranks; ++peer) {
++            const RowBlock peerBlock = rowBlock(dim, peer, ranks);
++            if (peerBlock.count == 0) {
++                break;
+             }
+-            double randVal = static_cast<double>(rand()) / RAND_MAX;
+-            if ((nnzAssigned < n && randVal <= prob) || fillRemaining) {
+-                // Assign (i,j) a value
+-                cols[nnzAssigned] = j;
+-                nnzAssigned++;
++            initRandomRows(cols, rowDelimiters, dim, peerBlock, probability, needed);
++            nonzerosPerRank[peer] = cols.size();
++            sendBuffer(rowDelimiters.data(), rowDelimiters.size(), MPI_UINT64_T, peer, ROWS_TAG);
++            sendBuffer(cols.data(), cols.size(), MPI_UINT32_T, peer, COLS_TAG);
++        }
++    } else {
++        matrix.rowDelimiters.resize(static_cast<offset_t>(block.count) + 1);
++        if (block.count != 0) {
++            receiveBuffer(matrix.rowDelimiters.data(), matrix.rowDelimiters.size(),
++                          MPI_UINT64_T, ROWS_TAG);
++            matrix.cols.resize(matrix.rowDelimiters.back());
++            receiveBuffer(matrix.cols.data(), matrix.cols.size(), MPI_UINT32_T, COLS_TAG);
++        }
++    }
++
++    if (rank == ROOT) {
++        // The original vector and matrix values shared the default rand() stream.
++        srand(1);
++        fill(vec.data(), dim, maxVal);
++    }
++    MPI_Bcast(vec.data(), static_cast<int>(dim), MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
++
++    matrix.val = std::make_unique_for_overwrite<double[]>(matrix.cols.size());
++    if (rank == ROOT) {
++        fill(matrix.val.get(), matrix.cols.size(), maxVal);
++        const auto bufferSize = ranks == 1 ? 0 : std::min<offset_t>(
++            TRANSFER_CHUNK, *std::max_element(nonzerosPerRank.begin() + 1, nonzerosPerRank.end()));
++        auto buffer = std::make_unique_for_overwrite<double[]>(bufferSize);
++        for (int peer = 1; peer < ranks; ++peer) {
++            for (offset_t offset = 0; offset < nonzerosPerRank[peer]; offset += TRANSFER_CHUNK) {
++                const int count = std::min<offset_t>(nonzerosPerRank[peer] - offset, TRANSFER_CHUNK);
++                fill(buffer.get(), count, maxVal);
++                MPI_Send(buffer.get(), count, MPI_DOUBLE, peer, VALUES_TAG, MPI_COMM_WORLD);
+             }
+         }
++    } else {
++        receiveBuffer(matrix.val.get(), matrix.cols.size(), MPI_DOUBLE, VALUES_TAG);
+     }
+-    // Convention: put the number of non-zeroes at the end of the row delimiters array
+-    rowDelimiters[dim] = n;
++    return matrix;
+ }
+ 
+ // ****************************************************************************
+@@ -93,11 +171,11 @@
+ //   out: output - result from the spmv calculation
+ //
+ // ****************************************************************************
+-void spmvCpu(const double* val, const index_t* cols, const index_t* rowDelimiters,
++void spmvCpu(const double* val, const index_t* cols, const offset_t* rowDelimiters,
+              const double* vec, const index_t dim, double* out) {
+     for (index_t i = 0; i < dim; ++i) {
+         double t = 0.0;
+-        for (index_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
++        for (offset_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
+             const auto col = cols[j];
+             t += val[j] * vec[col];
+         }
+@@ -117,14 +195,15 @@
+ //   size: number of elements per vector
+ //
+ // ****************************************************************************
+-bool verifyResults(const double* reference, const double* result, const index_t size) {
+-    for (index_t i = 0; i < size; ++i) {
++bool verifyResults(const double* reference, const double* result, RowBlock block) {
++    for (index_t i = 0; i < block.count; ++i) {
+         const double ref = reference[i];
+         const double res = result[i];
+         if (std::abs(ref) < 1e-10) {
+             // For very small values, check absolute error
+             if (std::abs(res) > MAX_RELATIVE_ERROR) {
+-                printf("Validation failed at index %u: reference %.10e, got %.10e\n", i, ref, res);
++                printf("Validation failed at index %u: reference %.10e, got %.10e\n",
++                       block.first + i, ref, res);
+                 return false;
+             }
+         } else {
+@@ -132,7 +211,7 @@
+             const double relError = std::abs((res - ref) / ref);
+             if (relError > MAX_RELATIVE_ERROR) {
+                 printf("Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\n",
+-                       i, ref, res, relError);
++                       block.first + i, ref, res, relError);
+                 return false;
+             }
+         }
+@@ -152,7 +231,7 @@
+     printf("  -h           Show this help message\n");
+ }
+ 
+-int main(int argc, char** argv) {
++int runBenchmark(int argc, char** argv, int rank, int ranks) {
+     index_t numRows = 1024;
+     index_t sparsity = 10;
+     index_t iterations = 10;
+@@ -175,87 +254,129 @@
+         } else if (strcmp(argv[i], "-r") == 0) {
+             printResults = true;
+         } else if (strcmp(argv[i], "-h") == 0) {
+-            printUsage(argv[0]);
++            if (rank == ROOT) {
++                printUsage(argv[0]);
++            }
+             return 0;
+         } else {
+-            printf("Unknown option: %s\n", argv[i]);
+-            printUsage(argv[0]);
++            if (rank == ROOT) {
++                printf("Unknown option: %s\n", argv[i]);
++                printUsage(argv[0]);
++            }
+             return 1;
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
+-
+-    printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+-    printf("Matrix size: %u x %u\n", numRows, numRows);
+-    printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+-    printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
+-    printf("Iterations: %u\n", iterations);
+-    printf("Max value: %.2f\n", maxVal);
+-    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+-
+-    // Allocate and initialize data structures
+-    std::vector<double> h_val(nItems);                  // Non-zero values
+-    std::vector<index_t> h_cols(nItems);                // Column indices
+-    std::vector<index_t> h_rowDelimiters(numRows + 1);  // Row delimiters
+-    std::vector<double> h_vec(numRows);                 // Dense vector
+-    std::vector<double> h_out(numRows);                 // Output vector
++    if (sparsity == 0 || numRows > std::numeric_limits<int>::max()) {
++        if (rank == ROOT) {
++            fprintf(stderr, "Sparsity must be positive and the row count must fit in an MPI count.\n");
++        }
++        return 1;
++    }
+ 
+-    printf("Initializing data structures...\n");
+-    fill(h_vec.data(), numRows, maxVal);
+-    fill(h_val.data(), nItems, maxVal);
+-    initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
++    const offset_t entries = static_cast<offset_t>(numRows) * numRows;
++    const offset_t nItems = entries / sparsity;
++    if (rank == ROOT) {
++        printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
++        printf("Matrix size: %u x %u\n", numRows, numRows);
++        printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
++        printf("Non-zero elements: %" PRIu64 " (%.2f%% sparse)\n",
++               nItems, 100.0 * (1.0 - static_cast<double>(nItems) / entries));
++        printf("Iterations: %u\n", iterations);
++        printf("Max value: %.2f\n", maxVal);
++        printf("Validation: %s\n", validate ? "enabled" : "disabled");
++        printf("Initializing data structures...\n");
++    }
+ 
+-    // For validation, compute reference solution
+-    std::vector<double> h_reference;
++    const RowBlock block = rowBlock(numRows, rank, ranks);
++    std::vector<double> vec(numRows);
++    const LocalMatrix matrix = initialize(numRows, nItems, maxVal, block, rank, ranks, vec);
++    std::vector<double> out(block.count);
++    std::vector<double> reference;
+     if (validate) {
+-        printf("Computing reference solution...\n");
+-        h_reference.resize(numRows);
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(), 
+-                h_vec.data(), numRows, h_reference.data());
++        if (rank == ROOT) {
++            printf("Computing reference solution...\n");
++        }
++        reference.resize(block.count);
++        spmvCpu(matrix.val.get(), matrix.cols.data(), matrix.rowDelimiters.data(),
++                vec.data(), block.count, reference.data());
+     }
+ 
+-    // Perform SpMV computation
+-    printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    if (rank == ROOT) {
++        printf("Computing SpMV...\n");
++    }
++    MPI_Barrier(MPI_COMM_WORLD);
++    const double start = MPI_Wtime();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++    if (block.count != 0) {
++        for (index_t iter = 0; iter < iterations; ++iter) {
++            spmvCpu(matrix.val.get(), matrix.cols.data(), matrix.rowDelimiters.data(),
++                    vec.data(), block.count, out.data());
++        }
+     }
+ 
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
++    const double elapsed = MPI_Wtime() - start;
++    double duration = 0.0;
++    MPI_Reduce(&elapsed, &duration, 1, MPI_DOUBLE, MPI_MAX, ROOT, MPI_COMM_WORLD);
++    if (rank == ROOT) {
++        const double gflops = duration > 0.0 ? (2.0 * nItems * iterations) / duration / 1e9 : 0.0;
++        const double avgTime = iterations != 0 ? 1000.0 * duration / iterations : 0.0;
++        printf("Computation time: %ld ms\n", static_cast<long>(1000.0 * duration));
++        printf("Average time per iteration: %.3f ms\n", avgTime);
++        printf("Performance: %.3f GFLOPS\n", gflops);
++    }
+ 
+-    printf("Computation time: %ld ms\n", duration.count());
+-    
+-    // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
+-    
+-    printf("Average time per iteration: %.3f ms\n", avgTime);
+-    printf("Performance: %.3f GFLOPS\n", gflops);
+-    
+-    // Print results for external validation
+     if (printResults) {
+-        print_results(h_out, "OutputVector");
++        std::vector<int> counts;
++        std::vector<int> displacements;
++        std::vector<double> result;
++        if (rank == ROOT) {
++            counts.resize(ranks);
++            displacements.resize(ranks);
++            result.resize(numRows);
++            for (int peer = 0; peer < ranks; ++peer) {
++                const RowBlock peerBlock = rowBlock(numRows, peer, ranks);
++                counts[peer] = peerBlock.count;
++                displacements[peer] = peerBlock.first;
++            }
++        }
++        MPI_Gatherv(out.data(), static_cast<int>(block.count), MPI_DOUBLE, result.data(),
++                    counts.data(), displacements.data(), MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
++        if (rank == ROOT) {
++            print_results(result, "OutputVector");
++        }
+     }
+ 
+-    // Validation
+     if (validate) {
+-        printf("Validating result...\n");
+-        const bool valid = verifyResults(h_reference.data(), h_out.data(), numRows);
+-
+-        if (valid) {
+-            printf("Validation: PASSED\n");
+-            return 0;
+-        } else {
+-            printf("Validation: FAILED\n");
+-            return 1;
++        if (rank == ROOT) {
++            printf("Validating result...\n");
+         }
++        const int localValid = verifyResults(reference.data(), out.data(), block);
++        int valid = 0;
++        MPI_Allreduce(&localValid, &valid, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
++        if (rank == ROOT) {
++            printf("Validation: %s\n", valid ? "PASSED" : "FAILED");
++        }
++        return valid ? 0 : 1;
+     }
+ 
+     return 0;
+ }
++
++int main(int argc, char** argv) {
++    MPI_Init(&argc, &argv);
++    int rank = 0;
++    int ranks = 0;
++    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
++    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
++
++    int status = 1;
++    try {
++        status = runBenchmark(argc, argv, rank, ranks);
++    } catch (const std::exception& error) {
++        fprintf(stderr, "Rank %d: %s\n", rank, error.what());
++        MPI_Abort(MPI_COMM_WORLD, status);
++    }
++    MPI_Finalize();
++    return status;
++}
+
+exec
+/bin/bash -lc 'cmake -S spmv -B /tmp/spmv-mpi.9jkRqi/build && cmake --build /tmp/spmv-mpi.9jkRqi/build -j' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+exec
+/bin/bash -lc "rg --files; id; lscpu | rg 'Socket|CPU\\(s\\)|Model name'" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 18ms:
+output.txt
+common/hash.hpp
+common/results_output.hpp
+spmv/CMakeLists.txt
+spmv/spmv.cpp
+uid=4002(llmtest) gid=100(users) groups=100(users)
+CPU(s):                               256
+On-line CPU(s) list:                  0-255
+Model name:                           AMD EPYC 7763 64-Core Processor
+Socket(s):                            2
+CPU(s) scaling MHz:                   57%
+NUMA node0 CPU(s):                    0-63,128-191
+NUMA node1 CPU(s):                    64-127,192-255
+
+ succeeded in 6230ms:
+-- The C compiler identification is GNU 13.2.0
+-- The CXX compiler identification is GNU 13.2.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Configuring done (3.4s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/spmv-mpi.9jkRqi/build
+[ 50%] Building CXX object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CXX executable spmv
+[100%] Built target spmv
+
+exec
+/bin/bash -lc 'cat /sys/fs/cgroup/cpu.max; ldd /tmp/spmv-mpi.9jkRqi/build/spmv' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 0ms:
+cat: /sys/fs/cgroup/cpu.max: No such file or directory
+	linux-vdso.so.1 (0x00007ffff379f000)
+	libmpi_cxx.so.40 => /lib/x86_64-linux-gnu/libmpi_cxx.so.40 (0x00007352e3a29000)
+	libmpi.so.40 => /lib/x86_64-linux-gnu/libmpi.so.40 (0x00007352e38f7000)
+	libstdc++.so.6 => /lib/x86_64-linux-gnu/libstdc++.so.6 (0x00007352e3600000)
+	libgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1 (0x00007352e38ca000)
+	libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007352e3200000)
+	libopen-pal.so.40 => /lib/x86_64-linux-gnu/libopen-pal.so.40 (0x00007352e354c000)
+	libopen-rte.so.40 => /lib/x86_64-linux-gnu/libopen-rte.so.40 (0x00007352e3490000)
+	libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6 (0x00007352e3117000)
+	libhwloc.so.15 => /lib/x86_64-linux-gnu/libhwloc.so.15 (0x00007352e342f000)
+	/lib64/ld-linux-x86-64.so.2 (0x00007352e3a74000)
+	libevent_core-2.1.so.7 => /lib/x86_64-linux-gnu/libevent_core-2.1.so.7 (0x00007352e3893000)
+	libevent_pthreads-2.1.so.7 => /lib/x86_64-linux-gnu/libevent_pthreads-2.1.so.7 (0x00007352e388c000)
+	libz.so.1 => /lib/x86_64-linux-gnu/libz.so.1 (0x00007352e3413000)
+	libudev.so.1 => /lib/x86_64-linux-gnu/libudev.so.1 (0x00007352e30e4000)
+	libcap.so.2 => /lib/x86_64-linux-gnu/libcap.so.2 (0x00007352e387f000)
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+import os, subprocess
+root='/tmp/spmv-mpi.9jkRqi'
+cases=[
+    ([], [1,2,3,8]), (['-n','257','-s','13','-m','3.14','-i','3'], [1,3,7]),
+    (['-n','127','-s','1'], [2,5]), (['-n','129','-s','2'], [3]),
+    (['-n','256','-s','60000'], [3,7]), (['-n','3','-s','1'],[8]),
+    (['-n','0'], [1,4]), (['-n','17','-s','1000'],[3]),
+    (['-n','1023','-s','2','-m','-2.5'],[3]),
+    (['-n','4','-i','0','-m','0'],[4]),
+]
+def results(output):
+    return output.split('=== RESULTS ===\\n')[1].split('=== END RESULTS ===')[0]
+for args, ranks in cases:
+    common = [*args,'-r','-v']
+    expected = subprocess.check_output([root+'/spmv-serial', *common], text=True)
+    for n in ranks:
+        output = subprocess.check_output(['mpiexec','--oversubscribe','-n',str(n),root+'/build/spmv', *common], text=True, timeout=30)
+        assert output.count('=== RESULTS ===') == 1 and output.count('Validation: PASSED') == 1, output
+        assert results(output) == results(expected), (args,n,results(output),results(expected))
+    print(f'{args or \"defaults\"}: exact match on {ranks} ranks', flush=True)
+for args in [['-h'],['--unknown'],['-s','0'],['-n','-1']]:
+    p = subprocess.run(['mpiexec','-n','3',root+'/build/spmv',*args], capture_output=True,text=True,timeout=30)
+    assert p.returncode == (0 if args==['-h'] else 1), p
+    assert (p.stdout+p.stderr).count('Usage:' if args[0] in ('-h','--unknown') else 'Sparsity must be positive') == 1, p
+    print(f'{args}: exit {p.returncode}, one message', flush=True)
+PY" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+exec
+/bin/bash -lc "ps -eo pid,stat,pcpu,etime,args | rg 'mpiexec|build/spmv|python3 -'" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 0ms:
+    592 Ss    0.0       00:13 /bin/bash -c python3 - <<'PY' import os, subprocess root='/tmp/spmv-mpi.9jkRqi' cases=[     ([], [1,2,3,8]), (['-n','257','-s','13','-m','3.14','-i','3'], [1,3,7]),     (['-n','127','-s','1'], [2,5]), (['-n','129','-s','2'], [3]),     (['-n','256','-s','60000'], [3,7]), (['-n','3','-s','1'],[8]),     (['-n','0'], [1,4]), (['-n','17','-s','1000'],[3]),     (['-n','1023','-s','2','-m','-2.5'],[3]),     (['-n','4','-i','0','-m','0'],[4]), ] def results(output):     return output.split('=== RESULTS ===\n')[1].split('=== END RESULTS ===')[0] for args, ranks in cases:     common = [*args,'-r','-v']     expected = subprocess.check_output([root+'/spmv-serial', *common], text=True)     for n in ranks:         output = subprocess.check_output(['mpiexec','--oversubscribe','-n',str(n),root+'/build/spmv', *common], text=True, timeout=30)         assert output.count('=== RESULTS ===') == 1 and output.count('Validation: PASSED') == 1, output         assert results(output) == results(expected), (args,n,results(output),results(expected))     print(f'{args or "defaults"}: exact match on {ranks} ranks', flush=True) for args in [['-h'],['--unknown'],['-s','0'],['-n','-1']]:     p = subprocess.run(['mpiexec','-n','3',root+'/build/spmv',*args], capture_output=True,text=True,timeout=30)     assert p.returncode == (0 if args==['-h'] else 1), p     assert (p.stdout+p.stderr).count('Usage:' if args[0] in ('-h','--unknown') else 'Sparsity must be positive') == 1, p     print(f'{args}: exit {p.returncode}, one message', flush=True) PY
+    596 S     0.2       00:13 python3 -
+    638 R    97.7       00:00 mpiexec --oversubscribe -n 8 /tmp/spmv-mpi.9jkRqi/build/spmv -r -v
+    640 Ss   33.3       00:00 /bin/bash -c ps -eo pid,stat,pcpu,etime,args | rg 'mpiexec|build/spmv|python3 -'
+    642 S     0.0       00:00 rg mpiexec|build/spmv|python3 -
+
+exec
+/bin/bash -lc "for ranks in 1 2 4 8; do
+  printf '%s ranks\\n' \""'$ranks"
+  mpiexec --bind-to core -n "$ranks" /tmp/spmv-mpi.9jkRqi/build/spmv -n 4096 -s 6 -i 150 -r -v 2>/dev/null | rg '"'Computation time|Performance|Hash|Validation: PASSED'
+done" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 13170ms:
+1 ranks
+Computation time: 649 ms
+Performance: 1.291 GFLOPS
+Hash: 844931274ca9563b
+Validation: PASSED
+2 ranks
+Computation time: 338 ms
+Performance: 2.481 GFLOPS
+Hash: 844931274ca9563b
+Validation: PASSED
+4 ranks
+Computation time: 162 ms
+Performance: 5.165 GFLOPS
+Hash: 844931274ca9563b
+Validation: PASSED
+8 ranks
+Computation time: 79 ms
+Performance: 10.597 GFLOPS
+Hash: 844931274ca9563b
+Validation: PASSED
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2/spmv/CMakeLists.txt
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..0164c65bbd91c8967be720dcf94e11525ce1d117
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -4,10 +4,12 @@
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
++set(MPI_CXX_SKIP_MPICXX TRUE)
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ add_executable(spmv spmv.cpp)
+ 
+ # Enable optimizations
+ target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(spmv m)
++target_link_libraries(spmv PRIVATE MPI::MPI_CXX m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..9c2df80d64bc1021252e918145db52b6584d0141
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -1,80 +1,158 @@
+-#include <chrono>
++#include <algorithm>
+ #include <cmath>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <exception>
++#include <limits>
++#include <memory>
+ #include <vector>
+ 
++#include <mpi.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
++using offset_t = uint64_t;
+ 
+-// Constants
+ constexpr double MAX_RELATIVE_ERROR = 0.02;
++constexpr int ROOT = 0;
++constexpr int TRANSFER_CHUNK = 1 << 18;
++
++struct RowBlock {
++    index_t first;
++    index_t count;
++};
++
++RowBlock rowBlock(index_t rows, int rank, int ranks) {
++    const index_t quotient = rows / ranks;
++    const index_t remainder = rows % ranks;
++    const auto peer = static_cast<index_t>(rank);
++    return {peer * quotient + std::min(peer, remainder), quotient + (peer < remainder)};
++}
+ 
+-// ****************************************************************************
+-// Function: fill
+-//
+-// Purpose:
+-//   Initialize array with random values
+-//
+-// Arguments:
+-//   A: pointer to the array to initialize
+-//   n: number of elements in the array
+-//   maxVal: specifies range of random values [0, maxVal]
+-//
+-// ****************************************************************************
+-void fill(double* A, const index_t n, const double maxVal) {
+-    for (index_t i = 0; i < n; ++i) {
++template <typename T>
++void sendBuffer(const T* data, offset_t size, MPI_Datatype type, int peer, int tag) {
++    for (offset_t offset = 0; offset < size; offset += TRANSFER_CHUNK) {
++        const int count = std::min<offset_t>(size - offset, TRANSFER_CHUNK);
++        MPI_Send(data + offset, count, type, peer, tag, MPI_COMM_WORLD);
++    }
++}
++
++template <typename T>
++void receiveBuffer(T* data, offset_t size, MPI_Datatype type, int tag) {
++    for (offset_t offset = 0; offset < size; offset += TRANSFER_CHUNK) {
++        const int count = std::min<offset_t>(size - offset, TRANSFER_CHUNK);
++        MPI_Recv(data + offset, count, type, ROOT, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
++    }
++}
++
++void fill(double* A, const offset_t n, const double maxVal) {
++    for (offset_t i = 0; i < n; ++i) {
+         A[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+     }
+ }
+ 
+-// ****************************************************************************
+-// Function: initRandomMatrix
+-//
+-// Purpose:
+-//   Assigns random positions to a given number of elements in a square
+-//   matrix. The function encodes these positions in compressed sparse
+-//   row (CSR) format.
+-//
+-// Arguments:
+-//   cols:          array for column indexes of elements (size should be = n)
+-//   rowDelimiters: array of size dim+1 holding indices to rows;
+-//                  last element is the index one past the last element
+-//   n:             number of nonzero elements
+-//   dim:           number of rows/columns in the matrix
+-//
+-// ****************************************************************************
+-void initRandomMatrix(index_t* cols, index_t* rowDelimiters, const index_t n, const index_t dim) {
+-    index_t nnzAssigned = 0;
++// Visit blocks in global row order to preserve the original rand() sequence.
++void initRandomRows(std::vector<index_t>& cols, std::vector<offset_t>& rowDelimiters,
++                    index_t dim, RowBlock block, double probability, offset_t& needed) {
++    cols.clear();
++    rowDelimiters.resize(static_cast<offset_t>(block.count) + 1);
++    for (index_t i = 0; i < block.count; ++i) {
++        rowDelimiters[i] = cols.size();
++        offset_t remaining = static_cast<offset_t>(dim - block.first - i) * dim;
++        index_t j = 0;
++        for (; j < dim && needed != 0 && remaining > needed; ++j, --remaining) {
++            if (static_cast<double>(rand()) / RAND_MAX <= probability) {
++                cols.push_back(j);
++                --needed;
++            }
++        }
++        // Once every remaining entry is required, the random draws are immaterial.
++        if (needed != 0 && remaining == needed) {
++            for (; j < dim; ++j) {
++                cols.push_back(j);
++                --needed;
++            }
++        }
++    }
++    rowDelimiters[block.count] = cols.size();
++}
++
++struct LocalMatrix {
++    std::vector<offset_t> rowDelimiters;
++    std::vector<index_t> cols;
++    std::unique_ptr<double[]> val;
++};
+ 
+-    // Figure out the probability that a nonzero should be assigned
+-    double prob = static_cast<double>(n) / (static_cast<double>(dim) * static_cast<double>(dim));
++LocalMatrix initialize(index_t dim, offset_t nonzeros, double maxVal, RowBlock block,
++                       int rank, int ranks, std::vector<double>& vec) {
++    constexpr int ROWS_TAG = 0;
++    constexpr int COLS_TAG = 1;
++    constexpr int VALUES_TAG = 2;
++    LocalMatrix matrix;
++    std::vector<offset_t> nonzerosPerRank;
+ 
+-    // Seed random number generator
+-    srand(8675309);
++    if (rank == ROOT) {
++        nonzerosPerRank.resize(ranks);
++        const double probability = dim == 0 ? 0.0 :
++            static_cast<double>(nonzeros) / (static_cast<double>(dim) * dim);
++        offset_t needed = nonzeros;
++        srand(8675309);
++        matrix.cols.reserve(nonzeros / ranks);
++        initRandomRows(matrix.cols, matrix.rowDelimiters, dim, block, probability, needed);
++        nonzerosPerRank[ROOT] = matrix.cols.size();
+ 
+-    // Randomly decide whether entry i,j gets a value, but ensure n values are assigned
+-    bool fillRemaining = false;
+-    for (index_t i = 0; i < dim; ++i) {
+-        rowDelimiters[i] = nnzAssigned;
+-        for (index_t j = 0; j < dim; ++j) {
+-            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+-            index_t needToAssign = n - nnzAssigned;
+-            if (numEntriesLeft <= needToAssign) {
+-                fillRemaining = true;
++        std::vector<index_t> cols;
++        std::vector<offset_t> rowDelimiters;
++        if (ranks > 1) {
++            cols.reserve(nonzeros / ranks);
++        }
++        for (int peer = 1; peer < ranks; ++peer) {
++            const RowBlock peerBlock = rowBlock(dim, peer, ranks);
++            if (peerBlock.count == 0) {
++                break;
+             }
+-            double randVal = static_cast<double>(rand()) / RAND_MAX;
+-            if ((nnzAssigned < n && randVal <= prob) || fillRemaining) {
+-                // Assign (i,j) a value
+-                cols[nnzAssigned] = j;
+-                nnzAssigned++;
++            initRandomRows(cols, rowDelimiters, dim, peerBlock, probability, needed);
++            nonzerosPerRank[peer] = cols.size();
++            sendBuffer(rowDelimiters.data(), rowDelimiters.size(), MPI_UINT64_T, peer, ROWS_TAG);
++            sendBuffer(cols.data(), cols.size(), MPI_UINT32_T, peer, COLS_TAG);
++        }
++    } else {
++        matrix.rowDelimiters.resize(static_cast<offset_t>(block.count) + 1);
++        if (block.count != 0) {
++            receiveBuffer(matrix.rowDelimiters.data(), matrix.rowDelimiters.size(),
++                          MPI_UINT64_T, ROWS_TAG);
++            matrix.cols.resize(matrix.rowDelimiters.back());
++            receiveBuffer(matrix.cols.data(), matrix.cols.size(), MPI_UINT32_T, COLS_TAG);
++        }
++    }
++
++    if (rank == ROOT) {
++        // The original vector and matrix values shared the default rand() stream.
++        srand(1);
++        fill(vec.data(), dim, maxVal);
++    }
++    MPI_Bcast(vec.data(), static_cast<int>(dim), MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
++
++    matrix.val = std::make_unique_for_overwrite<double[]>(matrix.cols.size());
++    if (rank == ROOT) {
++        fill(matrix.val.get(), matrix.cols.size(), maxVal);
++        const auto bufferSize = ranks == 1 ? 0 : std::min<offset_t>(
++            TRANSFER_CHUNK, *std::max_element(nonzerosPerRank.begin() + 1, nonzerosPerRank.end()));
++        auto buffer = std::make_unique_for_overwrite<double[]>(bufferSize);
++        for (int peer = 1; peer < ranks; ++peer) {
++            for (offset_t offset = 0; offset < nonzerosPerRank[peer]; offset += TRANSFER_CHUNK) {
++                const int count = std::min<offset_t>(nonzerosPerRank[peer] - offset, TRANSFER_CHUNK);
++                fill(buffer.get(), count, maxVal);
++                MPI_Send(buffer.get(), count, MPI_DOUBLE, peer, VALUES_TAG, MPI_COMM_WORLD);
+             }
+         }
++    } else {
++        receiveBuffer(matrix.val.get(), matrix.cols.size(), MPI_DOUBLE, VALUES_TAG);
+     }
+-    // Convention: put the number of non-zeroes at the end of the row delimiters array
+-    rowDelimiters[dim] = n;
++    return matrix;
+ }
+ 
+ // ****************************************************************************
+@@ -93,11 +171,11 @@
+ //   out: output - result from the spmv calculation
+ //
+ // ****************************************************************************
+-void spmvCpu(const double* val, const index_t* cols, const index_t* rowDelimiters,
++void spmvCpu(const double* val, const index_t* cols, const offset_t* rowDelimiters,
+              const double* vec, const index_t dim, double* out) {
+     for (index_t i = 0; i < dim; ++i) {
+         double t = 0.0;
+-        for (index_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
++        for (offset_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
+             const auto col = cols[j];
+             t += val[j] * vec[col];
+         }
+@@ -117,14 +195,15 @@
+ //   size: number of elements per vector
+ //
+ // ****************************************************************************
+-bool verifyResults(const double* reference, const double* result, const index_t size) {
+-    for (index_t i = 0; i < size; ++i) {
++bool verifyResults(const double* reference, const double* result, RowBlock block) {
++    for (index_t i = 0; i < block.count; ++i) {
+         const double ref = reference[i];
+         const double res = result[i];
+         if (std::abs(ref) < 1e-10) {
+             // For very small values, check absolute error
+             if (std::abs(res) > MAX_RELATIVE_ERROR) {
+-                printf("Validation failed at index %u: reference %.10e, got %.10e\n", i, ref, res);
++                printf("Validation failed at index %u: reference %.10e, got %.10e\n",
++                       block.first + i, ref, res);
+                 return false;
+             }
+         } else {
+@@ -132,7 +211,7 @@
+             const double relError = std::abs((res - ref) / ref);
+             if (relError > MAX_RELATIVE_ERROR) {
+                 printf("Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\n",
+-                       i, ref, res, relError);
++                       block.first + i, ref, res, relError);
+                 return false;
+             }
+         }
+@@ -152,7 +231,7 @@
+     printf("  -h           Show this help message\n");
+ }
+ 
+-int main(int argc, char** argv) {
++int runBenchmark(int argc, char** argv, int rank, int ranks) {
+     index_t numRows = 1024;
+     index_t sparsity = 10;
+     index_t iterations = 10;
+@@ -175,87 +254,129 @@
+         } else if (strcmp(argv[i], "-r") == 0) {
+             printResults = true;
+         } else if (strcmp(argv[i], "-h") == 0) {
+-            printUsage(argv[0]);
++            if (rank == ROOT) {
++                printUsage(argv[0]);
++            }
+             return 0;
+         } else {
+-            printf("Unknown option: %s\n", argv[i]);
+-            printUsage(argv[0]);
++            if (rank == ROOT) {
++                printf("Unknown option: %s\n", argv[i]);
++                printUsage(argv[0]);
++            }
+             return 1;
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
+-
+-    printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+-    printf("Matrix size: %u x %u\n", numRows, numRows);
+-    printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+-    printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
+-    printf("Iterations: %u\n", iterations);
+-    printf("Max value: %.2f\n", maxVal);
+-    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+-
+-    // Allocate and initialize data structures
+-    std::vector<double> h_val(nItems);                  // Non-zero values
+-    std::vector<index_t> h_cols(nItems);                // Column indices
+-    std::vector<index_t> h_rowDelimiters(numRows + 1);  // Row delimiters
+-    std::vector<double> h_vec(numRows);                 // Dense vector
+-    std::vector<double> h_out(numRows);                 // Output vector
++    if (sparsity == 0 || numRows > std::numeric_limits<int>::max()) {
++        if (rank == ROOT) {
++            fprintf(stderr, "Sparsity must be positive and the row count must fit in an MPI count.\n");
++        }
++        return 1;
++    }
+ 
+-    printf("Initializing data structures...\n");
+-    fill(h_vec.data(), numRows, maxVal);
+-    fill(h_val.data(), nItems, maxVal);
+-    initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
++    const offset_t entries = static_cast<offset_t>(numRows) * numRows;
++    const offset_t nItems = entries / sparsity;
++    if (rank == ROOT) {
++        printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
++        printf("Matrix size: %u x %u\n", numRows, numRows);
++        printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
++        printf("Non-zero elements: %" PRIu64 " (%.2f%% sparse)\n",
++               nItems, 100.0 * (1.0 - static_cast<double>(nItems) / entries));
++        printf("Iterations: %u\n", iterations);
++        printf("Max value: %.2f\n", maxVal);
++        printf("Validation: %s\n", validate ? "enabled" : "disabled");
++        printf("Initializing data structures...\n");
++    }
+ 
+-    // For validation, compute reference solution
+-    std::vector<double> h_reference;
++    const RowBlock block = rowBlock(numRows, rank, ranks);
++    std::vector<double> vec(numRows);
++    const LocalMatrix matrix = initialize(numRows, nItems, maxVal, block, rank, ranks, vec);
++    std::vector<double> out(block.count);
++    std::vector<double> reference;
+     if (validate) {
+-        printf("Computing reference solution...\n");
+-        h_reference.resize(numRows);
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(), 
+-                h_vec.data(), numRows, h_reference.data());
++        if (rank == ROOT) {
++            printf("Computing reference solution...\n");
++        }
++        reference.resize(block.count);
++        spmvCpu(matrix.val.get(), matrix.cols.data(), matrix.rowDelimiters.data(),
++                vec.data(), block.count, reference.data());
+     }
+ 
+-    // Perform SpMV computation
+-    printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    if (rank == ROOT) {
++        printf("Computing SpMV...\n");
++    }
++    MPI_Barrier(MPI_COMM_WORLD);
++    const double start = MPI_Wtime();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++    if (block.count != 0) {
++        for (index_t iter = 0; iter < iterations; ++iter) {
++            spmvCpu(matrix.val.get(), matrix.cols.data(), matrix.rowDelimiters.data(),
++                    vec.data(), block.count, out.data());
++        }
+     }
+ 
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
++    const double elapsed = MPI_Wtime() - start;
++    double duration = 0.0;
++    MPI_Reduce(&elapsed, &duration, 1, MPI_DOUBLE, MPI_MAX, ROOT, MPI_COMM_WORLD);
++    if (rank == ROOT) {
++        const double gflops = duration > 0.0 ? (2.0 * nItems * iterations) / duration / 1e9 : 0.0;
++        const double avgTime = iterations != 0 ? 1000.0 * duration / iterations : 0.0;
++        printf("Computation time: %ld ms\n", static_cast<long>(1000.0 * duration));
++        printf("Average time per iteration: %.3f ms\n", avgTime);
++        printf("Performance: %.3f GFLOPS\n", gflops);
++    }
+ 
+-    printf("Computation time: %ld ms\n", duration.count());
+-    
+-    // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
+-    
+-    printf("Average time per iteration: %.3f ms\n", avgTime);
+-    printf("Performance: %.3f GFLOPS\n", gflops);
+-    
+-    // Print results for external validation
+     if (printResults) {
+-        print_results(h_out, "OutputVector");
++        std::vector<int> counts;
++        std::vector<int> displacements;
++        std::vector<double> result;
++        if (rank == ROOT) {
++            counts.resize(ranks);
++            displacements.resize(ranks);
++            result.resize(numRows);
++            for (int peer = 0; peer < ranks; ++peer) {
++                const RowBlock peerBlock = rowBlock(numRows, peer, ranks);
++                counts[peer] = peerBlock.count;
++                displacements[peer] = peerBlock.first;
++            }
++        }
++        MPI_Gatherv(out.data(), static_cast<int>(block.count), MPI_DOUBLE, result.data(),
++                    counts.data(), displacements.data(), MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
++        if (rank == ROOT) {
++            print_results(result, "OutputVector");
++        }
+     }
+ 
+-    // Validation
+     if (validate) {
+-        printf("Validating result...\n");
+-        const bool valid = verifyResults(h_reference.data(), h_out.data(), numRows);
+-
+-        if (valid) {
+-            printf("Validation: PASSED\n");
+-            return 0;
+-        } else {
+-            printf("Validation: FAILED\n");
+-            return 1;
++        if (rank == ROOT) {
++            printf("Validating result...\n");
+         }
++        const int localValid = verifyResults(reference.data(), out.data(), block);
++        int valid = 0;
++        MPI_Allreduce(&localValid, &valid, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
++        if (rank == ROOT) {
++            printf("Validation: %s\n", valid ? "PASSED" : "FAILED");
++        }
++        return valid ? 0 : 1;
+     }
+ 
+     return 0;
+ }
++
++int main(int argc, char** argv) {
++    MPI_Init(&argc, &argv);
++    int rank = 0;
++    int ranks = 0;
++    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
++    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
++
++    int status = 1;
++    try {
++        status = runBenchmark(argc, argv, rank, ranks);
++    } catch (const std::exception& error) {
++        fprintf(stderr, "Rank %d: %s\n", rank, error.what());
++        MPI_Abort(MPI_COMM_WORLD, status);
++    }
++    MPI_Finalize();
++    return status;
++}
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2/spmv/spmv.cpp
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..0164c65bbd91c8967be720dcf94e11525ce1d117
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -4,10 +4,12 @@
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
++set(MPI_CXX_SKIP_MPICXX TRUE)
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ add_executable(spmv spmv.cpp)
+ 
+ # Enable optimizations
+ target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(spmv m)
++target_link_libraries(spmv PRIVATE MPI::MPI_CXX m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..5bd9a0206a9cf3760cdff50d84767e404de2a68a
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -1,103 +1,166 @@
+-#include <chrono>
++#include <algorithm>
+ #include <cmath>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <exception>
++#include <limits>
++#include <memory>
+ #include <vector>
+ 
++#include <mpi.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
++using offset_t = uint64_t;
+ 
+-// Constants
+ constexpr double MAX_RELATIVE_ERROR = 0.02;
++constexpr int ROOT = 0;
++constexpr int TRANSFER_CHUNK = 1 << 18;
+ 
+-// ****************************************************************************
+-// Function: fill
+-//
+-// Purpose:
+-//   Initialize array with random values
+-//
+-// Arguments:
+-//   A: pointer to the array to initialize
+-//   n: number of elements in the array
+-//   maxVal: specifies range of random values [0, maxVal]
+-//
+-// ****************************************************************************
+-void fill(double* A, const index_t n, const double maxVal) {
+-    for (index_t i = 0; i < n; ++i) {
++struct RowBlock {
++    index_t first;
++    index_t count;
++};
++
++RowBlock rowBlock(index_t rows, int rank, int ranks) {
++    const index_t quotient = rows / ranks;
++    const index_t remainder = rows % ranks;
++    const auto peer = static_cast<index_t>(rank);
++    return {peer * quotient + std::min(peer, remainder), quotient + (peer < remainder)};
++}
++
++template <typename T>
++void sendBuffer(const T* data, offset_t size, MPI_Datatype type, int peer, int tag) {
++    for (offset_t offset = 0; offset < size; offset += TRANSFER_CHUNK) {
++        const int count = std::min<offset_t>(size - offset, TRANSFER_CHUNK);
++        MPI_Send(data + offset, count, type, peer, tag, MPI_COMM_WORLD);
++    }
++}
++
++template <typename T>
++void receiveBuffer(T* data, offset_t size, MPI_Datatype type, int tag) {
++    for (offset_t offset = 0; offset < size; offset += TRANSFER_CHUNK) {
++        const int count = std::min<offset_t>(size - offset, TRANSFER_CHUNK);
++        MPI_Recv(data + offset, count, type, ROOT, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
++    }
++}
++
++void fill(double* A, const offset_t n, const double maxVal) {
++    for (offset_t i = 0; i < n; ++i) {
+         A[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+     }
+ }
+ 
+-// ****************************************************************************
+-// Function: initRandomMatrix
+-//
+-// Purpose:
+-//   Assigns random positions to a given number of elements in a square
+-//   matrix. The function encodes these positions in compressed sparse
+-//   row (CSR) format.
+-//
+-// Arguments:
+-//   cols:          array for column indexes of elements (size should be = n)
+-//   rowDelimiters: array of size dim+1 holding indices to rows;
+-//                  last element is the index one past the last element
+-//   n:             number of nonzero elements
+-//   dim:           number of rows/columns in the matrix
+-//
+-// ****************************************************************************
+-void initRandomMatrix(index_t* cols, index_t* rowDelimiters, const index_t n, const index_t dim) {
+-    index_t nnzAssigned = 0;
++// Visit blocks in global row order to preserve the original rand() sequence.
++void initRandomRows(std::vector<index_t>& cols, std::vector<offset_t>& rowDelimiters,
++                    index_t dim, RowBlock block, double probability, offset_t& needed) {
++    cols.clear();
++    rowDelimiters.resize(static_cast<offset_t>(block.count) + 1);
++    for (index_t i = 0; i < block.count; ++i) {
++        rowDelimiters[i] = cols.size();
++        offset_t remaining = static_cast<offset_t>(dim - block.first - i) * dim;
++        index_t j = 0;
++        for (; j < dim && needed != 0 && remaining > needed; ++j, --remaining) {
++            if (static_cast<double>(rand()) / RAND_MAX <= probability) {
++                cols.push_back(j);
++                --needed;
++            }
++        }
++        // Once every remaining entry is required, the random draws are immaterial.
++        if (needed != 0 && remaining == needed) {
++            for (; j < dim; ++j) {
++                cols.push_back(j);
++                --needed;
++            }
++        }
++    }
++    rowDelimiters[block.count] = cols.size();
++}
+ 
+-    // Figure out the probability that a nonzero should be assigned
+-    double prob = static_cast<double>(n) / (static_cast<double>(dim) * static_cast<double>(dim));
++struct LocalMatrix {
++    std::vector<offset_t> rowDelimiters;
++    std::vector<index_t> cols;
++    std::unique_ptr<double[]> val;
++};
++
++LocalMatrix initialize(index_t dim, offset_t nonzeros, double maxVal, RowBlock block,
++                       int rank, int ranks, std::vector<double>& vec) {
++    constexpr int ROWS_TAG = 0;
++    constexpr int COLS_TAG = 1;
++    constexpr int VALUES_TAG = 2;
++    LocalMatrix matrix;
++    std::vector<offset_t> nonzerosPerRank;
+ 
+-    // Seed random number generator
+-    srand(8675309);
++    if (rank == ROOT) {
++        nonzerosPerRank.resize(ranks);
++        const double probability = dim == 0 ? 0.0 :
++            static_cast<double>(nonzeros) / (static_cast<double>(dim) * dim);
++        offset_t needed = nonzeros;
++        srand(8675309);
++        matrix.cols.reserve(nonzeros / ranks);
++        initRandomRows(matrix.cols, matrix.rowDelimiters, dim, block, probability, needed);
++        nonzerosPerRank[ROOT] = matrix.cols.size();
+ 
+-    // Randomly decide whether entry i,j gets a value, but ensure n values are assigned
+-    bool fillRemaining = false;
+-    for (index_t i = 0; i < dim; ++i) {
+-        rowDelimiters[i] = nnzAssigned;
+-        for (index_t j = 0; j < dim; ++j) {
+-            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+-            index_t needToAssign = n - nnzAssigned;
+-            if (numEntriesLeft <= needToAssign) {
+-                fillRemaining = true;
++        std::vector<index_t> cols;
++        std::vector<offset_t> rowDelimiters;
++        if (ranks > 1) {
++            cols.reserve(nonzeros / ranks);
++        }
++        for (int peer = 1; peer < ranks; ++peer) {
++            const RowBlock peerBlock = rowBlock(dim, peer, ranks);
++            if (peerBlock.count == 0) {
++                break;
+             }
+-            double randVal = static_cast<double>(rand()) / RAND_MAX;
+-            if ((nnzAssigned < n && randVal <= prob) || fillRemaining) {
+-                // Assign (i,j) a value
+-                cols[nnzAssigned] = j;
+-                nnzAssigned++;
++            initRandomRows(cols, rowDelimiters, dim, peerBlock, probability, needed);
++            nonzerosPerRank[peer] = cols.size();
++            sendBuffer(rowDelimiters.data(), rowDelimiters.size(), MPI_UINT64_T, peer, ROWS_TAG);
++            sendBuffer(cols.data(), cols.size(), MPI_UINT32_T, peer, COLS_TAG);
++        }
++    } else {
++        matrix.rowDelimiters.resize(static_cast<offset_t>(block.count) + 1);
++        if (block.count != 0) {
++            receiveBuffer(matrix.rowDelimiters.data(), matrix.rowDelimiters.size(),
++                          MPI_UINT64_T, ROWS_TAG);
++            matrix.cols.resize(matrix.rowDelimiters.back());
++            receiveBuffer(matrix.cols.data(), matrix.cols.size(), MPI_UINT32_T, COLS_TAG);
++        }
++    }
++
++    if (rank == ROOT) {
++        // The original vector and matrix values shared the default rand() stream.
++        srand(1);
++        fill(vec.data(), dim, maxVal);
++    }
++    MPI_Bcast(vec.data(), static_cast<int>(dim), MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
++
++    matrix.val = std::make_unique_for_overwrite<double[]>(matrix.cols.size());
++    if (rank == ROOT) {
++        fill(matrix.val.get(), matrix.cols.size(), maxVal);
++        const auto bufferSize = ranks == 1 ? 0 : std::min<offset_t>(
++            TRANSFER_CHUNK, *std::max_element(nonzerosPerRank.begin() + 1, nonzerosPerRank.end()));
++        auto buffer = std::make_unique_for_overwrite<double[]>(bufferSize);
++        for (int peer = 1; peer < ranks; ++peer) {
++            for (offset_t offset = 0; offset < nonzerosPerRank[peer]; offset += TRANSFER_CHUNK) {
++                const int count = std::min<offset_t>(nonzerosPerRank[peer] - offset, TRANSFER_CHUNK);
++                fill(buffer.get(), count, maxVal);
++                MPI_Send(buffer.get(), count, MPI_DOUBLE, peer, VALUES_TAG, MPI_COMM_WORLD);
+             }
+         }
++    } else {
++        receiveBuffer(matrix.val.get(), matrix.cols.size(), MPI_DOUBLE, VALUES_TAG);
+     }
+-    // Convention: put the number of non-zeroes at the end of the row delimiters array
+-    rowDelimiters[dim] = n;
++    return matrix;
+ }
+ 
+-// ****************************************************************************
+-// Function: spmvCpu
+-//
+-// Purpose:
+-//   Computes sparse matrix-vector multiplication using CSR format
+-//
+-// Arguments:
+-//   val: array holding the non-zero values for the matrix
+-//   cols: array of column indices for each element
+-//   rowDelimiters: array of size dim+1 holding indices to rows;
+-//                  last element is the index one past the last element
+-//   vec: dense vector of size dim to be used for multiplication
+-//   dim: number of rows/columns in the matrix
+-//   out: output - result from the spmv calculation
+-//
+-// ****************************************************************************
+-void spmvCpu(const double* val, const index_t* cols, const index_t* rowDelimiters,
+-             const double* vec, const index_t dim, double* out) {
+-    for (index_t i = 0; i < dim; ++i) {
++// Each row keeps the original CSR accumulation order.
++void spmvCpu(const double* val, const index_t* cols, const offset_t* rowDelimiters,
++             const double* vec, const index_t rows, double* out) {
++    for (index_t i = 0; i < rows; ++i) {
+         double t = 0.0;
+-        for (index_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
++        for (offset_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
+             const auto col = cols[j];
+             t += val[j] * vec[col];
+         }
+@@ -105,39 +168,51 @@
+     }
+ }
+ 
+-// ****************************************************************************
+-// Function: verifyResults
+-//
+-// Purpose:
+-//   Verifies correctness of results by comparing to reference solution
+-//
+-// Arguments:
+-//   reference: array holding the reference result vector
+-//   result: array holding the result vector to verify
+-//   size: number of elements per vector
+-//
+-// ****************************************************************************
+-bool verifyResults(const double* reference, const double* result, const index_t size) {
+-    for (index_t i = 0; i < size; ++i) {
++bool verifyResults(const double* reference, const double* result, RowBlock block, int rank) {
++    constexpr index_t NO_MISMATCH = std::numeric_limits<index_t>::max();
++    constexpr int MISMATCH_TAG = 3;
++    index_t localMismatch = NO_MISMATCH;
++    for (index_t i = 0; i < block.count; ++i) {
+         const double ref = reference[i];
+         const double res = result[i];
++        const double error = std::abs(ref) < 1e-10 ? std::abs(res) : std::abs((res - ref) / ref);
++        if (error > MAX_RELATIVE_ERROR) {
++            localMismatch = block.first + i;
++            break;
++        }
++    }
++
++    index_t mismatch = NO_MISMATCH;
++    MPI_Allreduce(&localMismatch, &mismatch, 1, MPI_UINT32_T, MPI_MIN, MPI_COMM_WORLD);
++    if (mismatch == NO_MISMATCH) {
++        return true;
++    }
++
++    // Match the serial diagnostic by reporting only the first failing row.
++    double values[2];
++    if (localMismatch == mismatch) {
++        const index_t i = mismatch - block.first;
++        values[0] = reference[i];
++        values[1] = result[i];
++        if (rank != ROOT) {
++            MPI_Send(values, 2, MPI_DOUBLE, ROOT, MISMATCH_TAG, MPI_COMM_WORLD);
++        }
++    }
++    if (rank == ROOT) {
++        if (localMismatch != mismatch) {
++            MPI_Recv(values, 2, MPI_DOUBLE, MPI_ANY_SOURCE, MISMATCH_TAG, MPI_COMM_WORLD,
++                     MPI_STATUS_IGNORE);
++        }
++        const double ref = values[0];
++        const double res = values[1];
+         if (std::abs(ref) < 1e-10) {
+-            // For very small values, check absolute error
+-            if (std::abs(res) > MAX_RELATIVE_ERROR) {
+-                printf("Validation failed at index %u: reference %.10e, got %.10e\n", i, ref, res);
+-                return false;
+-            }
++            printf("Validation failed at index %u: reference %.10e, got %.10e\n", mismatch, ref, res);
+         } else {
+-            // Check relative error
+-            const double relError = std::abs((res - ref) / ref);
+-            if (relError > MAX_RELATIVE_ERROR) {
+-                printf("Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\n",
+-                       i, ref, res, relError);
+-                return false;
+-            }
++            printf("Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\n",
++                   mismatch, ref, res, std::abs((res - ref) / ref));
+         }
+     }
+-    return true;
++    return false;
+ }
+ 
+ void printUsage(const char* progName) {
+@@ -152,7 +227,7 @@
+     printf("  -h           Show this help message\n");
+ }
+ 
+-int main(int argc, char** argv) {
++int runBenchmark(int argc, char** argv, int rank, int ranks) {
+     index_t numRows = 1024;
+     index_t sparsity = 10;
+     index_t iterations = 10;
+@@ -175,87 +250,127 @@
+         } else if (strcmp(argv[i], "-r") == 0) {
+             printResults = true;
+         } else if (strcmp(argv[i], "-h") == 0) {
+-            printUsage(argv[0]);
++            if (rank == ROOT) {
++                printUsage(argv[0]);
++            }
+             return 0;
+         } else {
+-            printf("Unknown option: %s\n", argv[i]);
+-            printUsage(argv[0]);
++            if (rank == ROOT) {
++                printf("Unknown option: %s\n", argv[i]);
++                printUsage(argv[0]);
++            }
+             return 1;
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
+-
+-    printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+-    printf("Matrix size: %u x %u\n", numRows, numRows);
+-    printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+-    printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
+-    printf("Iterations: %u\n", iterations);
+-    printf("Max value: %.2f\n", maxVal);
+-    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+-
+-    // Allocate and initialize data structures
+-    std::vector<double> h_val(nItems);                  // Non-zero values
+-    std::vector<index_t> h_cols(nItems);                // Column indices
+-    std::vector<index_t> h_rowDelimiters(numRows + 1);  // Row delimiters
+-    std::vector<double> h_vec(numRows);                 // Dense vector
+-    std::vector<double> h_out(numRows);                 // Output vector
++    if (sparsity == 0 || numRows > std::numeric_limits<int>::max()) {
++        if (rank == ROOT) {
++            fprintf(stderr, "Sparsity must be positive and the row count must fit in an MPI count.\n");
++        }
++        return 1;
++    }
+ 
+-    printf("Initializing data structures...\n");
+-    fill(h_vec.data(), numRows, maxVal);
+-    fill(h_val.data(), nItems, maxVal);
+-    initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
++    const offset_t entries = static_cast<offset_t>(numRows) * numRows;
++    const offset_t nItems = entries / sparsity;
++    if (rank == ROOT) {
++        printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
++        printf("Matrix size: %u x %u\n", numRows, numRows);
++        printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
++        printf("Non-zero elements: %" PRIu64 " (%.2f%% sparse)\n",
++               nItems, 100.0 * (1.0 - static_cast<double>(nItems) / entries));
++        printf("Iterations: %u\n", iterations);
++        printf("Max value: %.2f\n", maxVal);
++        printf("Validation: %s\n", validate ? "enabled" : "disabled");
++        printf("Initializing data structures...\n");
++    }
+ 
+-    // For validation, compute reference solution
+-    std::vector<double> h_reference;
++    const RowBlock block = rowBlock(numRows, rank, ranks);
++    std::vector<double> vec(numRows);
++    const LocalMatrix matrix = initialize(numRows, nItems, maxVal, block, rank, ranks, vec);
++    std::vector<double> out(block.count);
++    std::vector<double> reference;
+     if (validate) {
+-        printf("Computing reference solution...\n");
+-        h_reference.resize(numRows);
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(), 
+-                h_vec.data(), numRows, h_reference.data());
++        if (rank == ROOT) {
++            printf("Computing reference solution...\n");
++        }
++        reference.resize(block.count);
++        spmvCpu(matrix.val.get(), matrix.cols.data(), matrix.rowDelimiters.data(),
++                vec.data(), block.count, reference.data());
+     }
+ 
+-    // Perform SpMV computation
+-    printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    if (rank == ROOT) {
++        printf("Computing SpMV...\n");
++    }
++    MPI_Barrier(MPI_COMM_WORLD);
++    const double start = MPI_Wtime();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++    if (block.count != 0) {
++        for (index_t iter = 0; iter < iterations; ++iter) {
++            spmvCpu(matrix.val.get(), matrix.cols.data(), matrix.rowDelimiters.data(),
++                    vec.data(), block.count, out.data());
++        }
+     }
+ 
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
++    const double elapsed = MPI_Wtime() - start;
++    double duration = 0.0;
++    MPI_Reduce(&elapsed, &duration, 1, MPI_DOUBLE, MPI_MAX, ROOT, MPI_COMM_WORLD);
++    if (rank == ROOT) {
++        const double gflops = duration > 0.0 ? (2.0 * nItems * iterations) / duration / 1e9 : 0.0;
++        const double avgTime = iterations != 0 ? 1000.0 * duration / iterations : 0.0;
++        printf("Computation time: %ld ms\n", static_cast<long>(1000.0 * duration));
++        printf("Average time per iteration: %.3f ms\n", avgTime);
++        printf("Performance: %.3f GFLOPS\n", gflops);
++    }
+ 
+-    printf("Computation time: %ld ms\n", duration.count());
+-    
+-    // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
+-    
+-    printf("Average time per iteration: %.3f ms\n", avgTime);
+-    printf("Performance: %.3f GFLOPS\n", gflops);
+-    
+-    // Print results for external validation
+     if (printResults) {
+-        print_results(h_out, "OutputVector");
++        std::vector<int> counts;
++        std::vector<int> displacements;
++        std::vector<double> result;
++        if (rank == ROOT) {
++            counts.resize(ranks);
++            displacements.resize(ranks);
++            result.resize(numRows);
++            for (int peer = 0; peer < ranks; ++peer) {
++                const RowBlock peerBlock = rowBlock(numRows, peer, ranks);
++                counts[peer] = peerBlock.count;
++                displacements[peer] = peerBlock.first;
++            }
++        }
++        MPI_Gatherv(out.data(), static_cast<int>(block.count), MPI_DOUBLE, result.data(),
++                    counts.data(), displacements.data(), MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
++        if (rank == ROOT) {
++            print_results(result, "OutputVector");
++        }
+     }
+ 
+-    // Validation
+     if (validate) {
+-        printf("Validating result...\n");
+-        const bool valid = verifyResults(h_reference.data(), h_out.data(), numRows);
+-
+-        if (valid) {
+-            printf("Validation: PASSED\n");
+-            return 0;
+-        } else {
+-            printf("Validation: FAILED\n");
+-            return 1;
++        if (rank == ROOT) {
++            printf("Validating result...\n");
++        }
++        const bool valid = verifyResults(reference.data(), out.data(), block, rank);
++        if (rank == ROOT) {
++            printf("Validation: %s\n", valid ? "PASSED" : "FAILED");
+         }
++        return valid ? 0 : 1;
+     }
+ 
+     return 0;
+ }
++
++int main(int argc, char** argv) {
++    MPI_Init(&argc, &argv);
++    int rank = 0;
++    int ranks = 0;
++    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
++    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
++
++    int status = 1;
++    try {
++        status = runBenchmark(argc, argv, rank, ranks);
++    } catch (const std::exception& error) {
++        fprintf(stderr, "Rank %d: %s\n", rank, error.what());
++        MPI_Abort(MPI_COMM_WORLD, status);
++    }
++    MPI_Finalize();
++    return status;
++}
+
+exec
+/bin/bash -lc 'cmake -S spmv -B /tmp/spmv-mpi.9jkRqi/final && cmake --build /tmp/spmv-mpi.9jkRqi/final -j' in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 6237ms:
+-- The C compiler identification is GNU 13.2.0
+-- The CXX compiler identification is GNU 13.2.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+CMake Warning (dev) at /usr/share/cmake-3.30/Modules/FindMPI.cmake:1481 (option):
+  Policy CMP0077 is not set: option() honors normal variables.  Run "cmake
+  --help-policy CMP0077" for policy details.  Use the cmake_policy command to
+  set the policy and suppress this warning.
+
+  For compatibility with older versions of CMake, option is clearing the
+  normal variable 'MPI_CXX_SKIP_MPICXX'.
+Call Stack (most recent call first):
+  CMakeLists.txt:8 (find_package)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Configuring done (3.4s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/spmv-mpi.9jkRqi/final
+[ 50%] Building CXX object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CXX executable spmv
+[100%] Built target spmv
+
+codex
+The MPI output matched the original serial output byte for byte in the cases checked so far, including uneven partitions and runs with more ranks than rows. On one node, the 4,096-row test’s timed section dropped from 649 ms on one rank to 79 ms on eight ranks, with the same output hash.
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2/spmv/CMakeLists.txt
+/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2/spmv/spmv.cpp
+diff --git a/spmv/CMakeLists.txt b/spmv/CMakeLists.txt
+index da10eb8bd6cb4349bb6a1903591d46f6c98a86d3..87f0e47311b4a55b9f427a3e7194fc3704e60da5
+--- a/spmv/CMakeLists.txt
++++ b/spmv/CMakeLists.txt
+@@ -4,10 +4,12 @@
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
++set(MPI_CXX_SKIP_MPICXX TRUE CACHE BOOL "Use the MPI C API from C++")
++find_package(MPI REQUIRED COMPONENTS CXX)
++
+ add_executable(spmv spmv.cpp)
+ 
+ # Enable optimizations
+ target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+ 
+-# Link math library
+-target_link_libraries(spmv m)
++target_link_libraries(spmv PRIVATE MPI::MPI_CXX m)
+diff --git a/spmv/spmv.cpp b/spmv/spmv.cpp
+index 4eeb01bef4b309cf93b845c1e3483978df2f0285..f26a67e329a5e6df40acad06a21500882aee3f1e
+--- a/spmv/spmv.cpp
++++ b/spmv/spmv.cpp
+@@ -1,103 +1,167 @@
+-#include <chrono>
++#include <algorithm>
++#include <cinttypes>
+ #include <cmath>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <exception>
++#include <limits>
++#include <memory>
+ #include <vector>
+ 
++#include <mpi.h>
++
+ #include "../common/results_output.hpp"
+ 
+ using index_t = uint32_t;
++using offset_t = uint64_t;
+ 
+-// Constants
+ constexpr double MAX_RELATIVE_ERROR = 0.02;
++constexpr int ROOT = 0;
++constexpr int TRANSFER_CHUNK = 1 << 18;
+ 
+-// ****************************************************************************
+-// Function: fill
+-//
+-// Purpose:
+-//   Initialize array with random values
+-//
+-// Arguments:
+-//   A: pointer to the array to initialize
+-//   n: number of elements in the array
+-//   maxVal: specifies range of random values [0, maxVal]
+-//
+-// ****************************************************************************
+-void fill(double* A, const index_t n, const double maxVal) {
+-    for (index_t i = 0; i < n; ++i) {
++struct RowBlock {
++    index_t first;
++    index_t count;
++};
++
++RowBlock rowBlock(index_t rows, int rank, int ranks) {
++    const index_t quotient = rows / ranks;
++    const index_t remainder = rows % ranks;
++    const auto peer = static_cast<index_t>(rank);
++    return {peer * quotient + std::min(peer, remainder), quotient + (peer < remainder)};
++}
++
++template <typename T>
++void sendBuffer(const T* data, offset_t size, MPI_Datatype type, int peer, int tag) {
++    for (offset_t offset = 0; offset < size; offset += TRANSFER_CHUNK) {
++        const int count = std::min<offset_t>(size - offset, TRANSFER_CHUNK);
++        MPI_Send(data + offset, count, type, peer, tag, MPI_COMM_WORLD);
++    }
++}
++
++template <typename T>
++void receiveBuffer(T* data, offset_t size, MPI_Datatype type, int tag) {
++    for (offset_t offset = 0; offset < size; offset += TRANSFER_CHUNK) {
++        const int count = std::min<offset_t>(size - offset, TRANSFER_CHUNK);
++        MPI_Recv(data + offset, count, type, ROOT, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
++    }
++}
++
++void fill(double* A, const offset_t n, const double maxVal) {
++    for (offset_t i = 0; i < n; ++i) {
+         A[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+     }
+ }
+ 
+-// ****************************************************************************
+-// Function: initRandomMatrix
+-//
+-// Purpose:
+-//   Assigns random positions to a given number of elements in a square
+-//   matrix. The function encodes these positions in compressed sparse
+-//   row (CSR) format.
+-//
+-// Arguments:
+-//   cols:          array for column indexes of elements (size should be = n)
+-//   rowDelimiters: array of size dim+1 holding indices to rows;
+-//                  last element is the index one past the last element
+-//   n:             number of nonzero elements
+-//   dim:           number of rows/columns in the matrix
+-//
+-// ****************************************************************************
+-void initRandomMatrix(index_t* cols, index_t* rowDelimiters, const index_t n, const index_t dim) {
+-    index_t nnzAssigned = 0;
++// Visit blocks in global row order to preserve the original rand() sequence.
++void initRandomRows(std::vector<index_t>& cols, std::vector<offset_t>& rowDelimiters,
++                    index_t dim, RowBlock block, double probability, offset_t& needed) {
++    cols.clear();
++    rowDelimiters.resize(static_cast<offset_t>(block.count) + 1);
++    for (index_t i = 0; i < block.count; ++i) {
++        rowDelimiters[i] = cols.size();
++        offset_t remaining = static_cast<offset_t>(dim - block.first - i) * dim;
++        index_t j = 0;
++        for (; j < dim && needed != 0 && remaining > needed; ++j, --remaining) {
++            if (static_cast<double>(rand()) / RAND_MAX <= probability) {
++                cols.push_back(j);
++                --needed;
++            }
++        }
++        // Once every remaining entry is required, the random draws are immaterial.
++        if (needed != 0 && remaining == needed) {
++            for (; j < dim; ++j) {
++                cols.push_back(j);
++                --needed;
++            }
++        }
++    }
++    rowDelimiters[block.count] = cols.size();
++}
+ 
+-    // Figure out the probability that a nonzero should be assigned
+-    double prob = static_cast<double>(n) / (static_cast<double>(dim) * static_cast<double>(dim));
++struct LocalMatrix {
++    std::vector<offset_t> rowDelimiters;
++    std::vector<index_t> cols;
++    std::unique_ptr<double[]> val;
++};
++
++LocalMatrix initialize(index_t dim, offset_t nonzeros, double maxVal, RowBlock block,
++                       int rank, int ranks, std::vector<double>& vec) {
++    constexpr int ROWS_TAG = 0;
++    constexpr int COLS_TAG = 1;
++    constexpr int VALUES_TAG = 2;
++    LocalMatrix matrix;
++    std::vector<offset_t> nonzerosPerRank;
+ 
+-    // Seed random number generator
+-    srand(8675309);
++    if (rank == ROOT) {
++        nonzerosPerRank.resize(ranks);
++        const double probability = dim == 0 ? 0.0 :
++            static_cast<double>(nonzeros) / (static_cast<double>(dim) * dim);
++        offset_t needed = nonzeros;
++        srand(8675309);
++        matrix.cols.reserve(nonzeros / ranks);
++        initRandomRows(matrix.cols, matrix.rowDelimiters, dim, block, probability, needed);
++        nonzerosPerRank[ROOT] = matrix.cols.size();
+ 
+-    // Randomly decide whether entry i,j gets a value, but ensure n values are assigned
+-    bool fillRemaining = false;
+-    for (index_t i = 0; i < dim; ++i) {
+-        rowDelimiters[i] = nnzAssigned;
+-        for (index_t j = 0; j < dim; ++j) {
+-            index_t numEntriesLeft = (dim * dim) - ((i * dim) + j);
+-            index_t needToAssign = n - nnzAssigned;
+-            if (numEntriesLeft <= needToAssign) {
+-                fillRemaining = true;
++        std::vector<index_t> cols;
++        std::vector<offset_t> rowDelimiters;
++        if (ranks > 1) {
++            cols.reserve(nonzeros / ranks);
++        }
++        for (int peer = 1; peer < ranks; ++peer) {
++            const RowBlock peerBlock = rowBlock(dim, peer, ranks);
++            if (peerBlock.count == 0) {
++                break;
+             }
+-            double randVal = static_cast<double>(rand()) / RAND_MAX;
+-            if ((nnzAssigned < n && randVal <= prob) || fillRemaining) {
+-                // Assign (i,j) a value
+-                cols[nnzAssigned] = j;
+-                nnzAssigned++;
++            initRandomRows(cols, rowDelimiters, dim, peerBlock, probability, needed);
++            nonzerosPerRank[peer] = cols.size();
++            sendBuffer(rowDelimiters.data(), rowDelimiters.size(), MPI_UINT64_T, peer, ROWS_TAG);
++            sendBuffer(cols.data(), cols.size(), MPI_UINT32_T, peer, COLS_TAG);
++        }
++    } else {
++        matrix.rowDelimiters.resize(static_cast<offset_t>(block.count) + 1);
++        if (block.count != 0) {
++            receiveBuffer(matrix.rowDelimiters.data(), matrix.rowDelimiters.size(),
++                          MPI_UINT64_T, ROWS_TAG);
++            matrix.cols.resize(matrix.rowDelimiters.back());
++            receiveBuffer(matrix.cols.data(), matrix.cols.size(), MPI_UINT32_T, COLS_TAG);
++        }
++    }
++
++    if (rank == ROOT) {
++        // The original vector and matrix values shared the default rand() stream.
++        srand(1);
++        fill(vec.data(), dim, maxVal);
++    }
++    MPI_Bcast(vec.data(), static_cast<int>(dim), MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
++
++    matrix.val = std::make_unique_for_overwrite<double[]>(matrix.cols.size());
++    if (rank == ROOT) {
++        fill(matrix.val.get(), matrix.cols.size(), maxVal);
++        const auto bufferSize = ranks == 1 ? 0 : std::min<offset_t>(
++            TRANSFER_CHUNK, *std::max_element(nonzerosPerRank.begin() + 1, nonzerosPerRank.end()));
++        auto buffer = std::make_unique_for_overwrite<double[]>(bufferSize);
++        for (int peer = 1; peer < ranks; ++peer) {
++            for (offset_t offset = 0; offset < nonzerosPerRank[peer]; offset += TRANSFER_CHUNK) {
++                const int count = std::min<offset_t>(nonzerosPerRank[peer] - offset, TRANSFER_CHUNK);
++                fill(buffer.get(), count, maxVal);
++                MPI_Send(buffer.get(), count, MPI_DOUBLE, peer, VALUES_TAG, MPI_COMM_WORLD);
+             }
+         }
++    } else {
++        receiveBuffer(matrix.val.get(), matrix.cols.size(), MPI_DOUBLE, VALUES_TAG);
+     }
+-    // Convention: put the number of non-zeroes at the end of the row delimiters array
+-    rowDelimiters[dim] = n;
++    return matrix;
+ }
+ 
+-// ****************************************************************************
+-// Function: spmvCpu
+-//
+-// Purpose:
+-//   Computes sparse matrix-vector multiplication using CSR format
+-//
+-// Arguments:
+-//   val: array holding the non-zero values for the matrix
+-//   cols: array of column indices for each element
+-//   rowDelimiters: array of size dim+1 holding indices to rows;
+-//                  last element is the index one past the last element
+-//   vec: dense vector of size dim to be used for multiplication
+-//   dim: number of rows/columns in the matrix
+-//   out: output - result from the spmv calculation
+-//
+-// ****************************************************************************
+-void spmvCpu(const double* val, const index_t* cols, const index_t* rowDelimiters,
+-             const double* vec, const index_t dim, double* out) {
+-    for (index_t i = 0; i < dim; ++i) {
++// Each row keeps the original CSR accumulation order.
++void spmvCpu(const double* val, const index_t* cols, const offset_t* rowDelimiters,
++             const double* vec, const index_t rows, double* out) {
++    for (index_t i = 0; i < rows; ++i) {
+         double t = 0.0;
+-        for (index_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
++        for (offset_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
+             const auto col = cols[j];
+             t += val[j] * vec[col];
+         }
+@@ -105,39 +169,51 @@
+     }
+ }
+ 
+-// ****************************************************************************
+-// Function: verifyResults
+-//
+-// Purpose:
+-//   Verifies correctness of results by comparing to reference solution
+-//
+-// Arguments:
+-//   reference: array holding the reference result vector
+-//   result: array holding the result vector to verify
+-//   size: number of elements per vector
+-//
+-// ****************************************************************************
+-bool verifyResults(const double* reference, const double* result, const index_t size) {
+-    for (index_t i = 0; i < size; ++i) {
++bool verifyResults(const double* reference, const double* result, RowBlock block, int rank) {
++    constexpr index_t NO_MISMATCH = std::numeric_limits<index_t>::max();
++    constexpr int MISMATCH_TAG = 3;
++    index_t localMismatch = NO_MISMATCH;
++    for (index_t i = 0; i < block.count; ++i) {
+         const double ref = reference[i];
+         const double res = result[i];
++        const double error = std::abs(ref) < 1e-10 ? std::abs(res) : std::abs((res - ref) / ref);
++        if (error > MAX_RELATIVE_ERROR) {
++            localMismatch = block.first + i;
++            break;
++        }
++    }
++
++    index_t mismatch = NO_MISMATCH;
++    MPI_Allreduce(&localMismatch, &mismatch, 1, MPI_UINT32_T, MPI_MIN, MPI_COMM_WORLD);
++    if (mismatch == NO_MISMATCH) {
++        return true;
++    }
++
++    // Match the serial diagnostic by reporting only the first failing row.
++    double values[2];
++    if (localMismatch == mismatch) {
++        const index_t i = mismatch - block.first;
++        values[0] = reference[i];
++        values[1] = result[i];
++        if (rank != ROOT) {
++            MPI_Send(values, 2, MPI_DOUBLE, ROOT, MISMATCH_TAG, MPI_COMM_WORLD);
++        }
++    }
++    if (rank == ROOT) {
++        if (localMismatch != mismatch) {
++            MPI_Recv(values, 2, MPI_DOUBLE, MPI_ANY_SOURCE, MISMATCH_TAG, MPI_COMM_WORLD,
++                     MPI_STATUS_IGNORE);
++        }
++        const double ref = values[0];
++        const double res = values[1];
+         if (std::abs(ref) < 1e-10) {
+-            // For very small values, check absolute error
+-            if (std::abs(res) > MAX_RELATIVE_ERROR) {
+-                printf("Validation failed at index %u: reference %.10e, got %.10e\n", i, ref, res);
+-                return false;
+-            }
++            printf("Validation failed at index %u: reference %.10e, got %.10e\n", mismatch, ref, res);
+         } else {
+-            // Check relative error
+-            const double relError = std::abs((res - ref) / ref);
+-            if (relError > MAX_RELATIVE_ERROR) {
+-                printf("Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\n",
+-                       i, ref, res, relError);
+-                return false;
+-            }
++            printf("Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\n",
++                   mismatch, ref, res, std::abs((res - ref) / ref));
+         }
+     }
+-    return true;
++    return false;
+ }
+ 
+ void printUsage(const char* progName) {
+@@ -152,7 +228,7 @@
+     printf("  -h           Show this help message\n");
+ }
+ 
+-int main(int argc, char** argv) {
++int runBenchmark(int argc, char** argv, int rank, int ranks) {
+     index_t numRows = 1024;
+     index_t sparsity = 10;
+     index_t iterations = 10;
+@@ -175,87 +251,127 @@
+         } else if (strcmp(argv[i], "-r") == 0) {
+             printResults = true;
+         } else if (strcmp(argv[i], "-h") == 0) {
+-            printUsage(argv[0]);
++            if (rank == ROOT) {
++                printUsage(argv[0]);
++            }
+             return 0;
+         } else {
+-            printf("Unknown option: %s\n", argv[i]);
+-            printUsage(argv[0]);
++            if (rank == ROOT) {
++                printf("Unknown option: %s\n", argv[i]);
++                printUsage(argv[0]);
++            }
+             return 1;
+         }
+     }
+ 
+-    // Calculate number of non-zero elements
+-    const index_t nItems = (numRows * numRows) / sparsity;
++    if (sparsity == 0 || numRows > std::numeric_limits<int>::max()) {
++        if (rank == ROOT) {
++            fprintf(stderr, "Sparsity must be positive and the row count must fit in an MPI count.\n");
++        }
++        return 1;
++    }
+ 
+-    printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+-    printf("Matrix size: %u x %u\n", numRows, numRows);
+-    printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+-    printf("Non-zero elements: %u (%.2f%% sparse)\n", 
+-           nItems, 100.0 * (1.0 - static_cast<double>(nItems) / (numRows * numRows)));
+-    printf("Iterations: %u\n", iterations);
+-    printf("Max value: %.2f\n", maxVal);
+-    printf("Validation: %s\n", validate ? "enabled" : "disabled");
++    const offset_t entries = static_cast<offset_t>(numRows) * numRows;
++    const offset_t nItems = entries / sparsity;
++    if (rank == ROOT) {
++        printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
++        printf("Matrix size: %u x %u\n", numRows, numRows);
++        printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
++        printf("Non-zero elements: %" PRIu64 " (%.2f%% sparse)\n",
++               nItems, 100.0 * (1.0 - static_cast<double>(nItems) / entries));
++        printf("Iterations: %u\n", iterations);
++        printf("Max value: %.2f\n", maxVal);
++        printf("Validation: %s\n", validate ? "enabled" : "disabled");
++        printf("Initializing data structures...\n");
++    }
+ 
+-    // Allocate and initialize data structures
+-    std::vector<double> h_val(nItems);                  // Non-zero values
+-    std::vector<index_t> h_cols(nItems);                // Column indices
+-    std::vector<index_t> h_rowDelimiters(numRows + 1);  // Row delimiters
+-    std::vector<double> h_vec(numRows);                 // Dense vector
+-    std::vector<double> h_out(numRows);                 // Output vector
+-
+-    printf("Initializing data structures...\n");
+-    fill(h_vec.data(), numRows, maxVal);
+-    fill(h_val.data(), nItems, maxVal);
+-    initRandomMatrix(h_cols.data(), h_rowDelimiters.data(), nItems, numRows);
+-
+-    // For validation, compute reference solution
+-    std::vector<double> h_reference;
++    const RowBlock block = rowBlock(numRows, rank, ranks);
++    std::vector<double> vec(numRows);
++    const LocalMatrix matrix = initialize(numRows, nItems, maxVal, block, rank, ranks, vec);
++    std::vector<double> out(block.count);
++    std::vector<double> reference;
+     if (validate) {
+-        printf("Computing reference solution...\n");
+-        h_reference.resize(numRows);
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(), 
+-                h_vec.data(), numRows, h_reference.data());
++        if (rank == ROOT) {
++            printf("Computing reference solution...\n");
++        }
++        reference.resize(block.count);
++        spmvCpu(matrix.val.get(), matrix.cols.data(), matrix.rowDelimiters.data(),
++                vec.data(), block.count, reference.data());
+     }
+ 
+-    // Perform SpMV computation
+-    printf("Computing SpMV...\n");
+-    auto start = std::chrono::high_resolution_clock::now();
++    if (rank == ROOT) {
++        printf("Computing SpMV...\n");
++    }
++    MPI_Barrier(MPI_COMM_WORLD);
++    const double start = MPI_Wtime();
+ 
+-    for (index_t iter = 0; iter < iterations; ++iter) {
+-        spmvCpu(h_val.data(), h_cols.data(), h_rowDelimiters.data(),
+-                h_vec.data(), numRows, h_out.data());
++    if (block.count != 0) {
++        for (index_t iter = 0; iter < iterations; ++iter) {
++            spmvCpu(matrix.val.get(), matrix.cols.data(), matrix.rowDelimiters.data(),
++                    vec.data(), block.count, out.data());
++        }
+     }
+ 
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
++    const double elapsed = MPI_Wtime() - start;
++    double duration = 0.0;
++    MPI_Reduce(&elapsed, &duration, 1, MPI_DOUBLE, MPI_MAX, ROOT, MPI_COMM_WORLD);
++    if (rank == ROOT) {
++        const double gflops = duration > 0.0 ? (2.0 * nItems * iterations) / duration / 1e9 : 0.0;
++        const double avgTime = iterations != 0 ? 1000.0 * duration / iterations : 0.0;
++        printf("Computation time: %ld ms\n", static_cast<long>(1000.0 * duration));
++        printf("Average time per iteration: %.3f ms\n", avgTime);
++        printf("Performance: %.3f GFLOPS\n", gflops);
++    }
+ 
+-    printf("Computation time: %ld ms\n", duration.count());
+-    
+-    // Calculate performance metrics
+-    const double gflops = (2.0 * nItems * iterations) / (duration.count() / 1000.0) / 1e9;
+-    const double avgTime = duration.count() / static_cast<double>(iterations);
+-    
+-    printf("Average time per iteration: %.3f ms\n", avgTime);
+-    printf("Performance: %.3f GFLOPS\n", gflops);
+-    
+-    // Print results for external validation
+     if (printResults) {
+-        print_results(h_out, "OutputVector");
++        std::vector<int> counts;
++        std::vector<int> displacements;
++        std::vector<double> result;
++        if (rank == ROOT) {
++            counts.resize(ranks);
++            displacements.resize(ranks);
++            result.resize(numRows);
++            for (int peer = 0; peer < ranks; ++peer) {
++                const RowBlock peerBlock = rowBlock(numRows, peer, ranks);
++                counts[peer] = peerBlock.count;
++                displacements[peer] = peerBlock.first;
++            }
++        }
++        MPI_Gatherv(out.data(), static_cast<int>(block.count), MPI_DOUBLE, result.data(),
++                    counts.data(), displacements.data(), MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
++        if (rank == ROOT) {
++            print_results(result, "OutputVector");
++        }
+     }
+ 
+-    // Validation
+     if (validate) {
+-        printf("Validating result...\n");
+-        const bool valid = verifyResults(h_reference.data(), h_out.data(), numRows);
+-
+-        if (valid) {
+-            printf("Validation: PASSED\n");
+-            return 0;
+-        } else {
+-            printf("Validation: FAILED\n");
+-            return 1;
++        if (rank == ROOT) {
++            printf("Validating result...\n");
++        }
++        const bool valid = verifyResults(reference.data(), out.data(), block, rank);
++        if (rank == ROOT) {
++            printf("Validation: %s\n", valid ? "PASSED" : "FAILED");
+         }
++        return valid ? 0 : 1;
+     }
+ 
+     return 0;
+ }
++
++int main(int argc, char** argv) {
++    MPI_Init(&argc, &argv);
++    int rank = 0;
++    int ranks = 0;
++    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
++    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
++
++    int status = 1;
++    try {
++        status = runBenchmark(argc, argv, rank, ranks);
++    } catch (const std::exception& error) {
++        fprintf(stderr, "Rank %d: %s\n", rank, error.what());
++        MPI_Abort(MPI_COMM_WORLD, status);
++    }
++    MPI_Finalize();
++    return status;
++}
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+import subprocess
+root='/tmp/spmv-mpi.9jkRqi/spmv-serial'
+for n in range(3, 65):
+    p=subprocess.run([root,'-n',str(n),'-s',str(n*n),'-i','0','-v'],capture_output=True,text=True)
+    if p.returncode and f'failed at index {n-1}:' in p.stdout:
+        print(n,p.stdout.splitlines()[-2])
+        break
+PY
+ls -l spmv" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 0ms:
+14 Validation failed at index 13: reference 4.8887560716e-01, got 0.0000000000e+00 (rel error: 1.0000000000e+00)
+total 20
+-rwxrwxrwx 1 nobody nogroup   414 Nov 24 06:50 CMakeLists.txt
+-rwxrwxrwx 1 nobody nogroup 14232 Nov 24 06:50 spmv.cpp
+
+ succeeded in 88272ms:
+defaults: exact match on [1, 2, 3, 8] ranks
+['-n', '257', '-s', '13', '-m', '3.14', '-i', '3']: exact match on [1, 3, 7] ranks
+['-n', '127', '-s', '1']: exact match on [2, 5] ranks
+['-n', '129', '-s', '2']: exact match on [3] ranks
+['-n', '256', '-s', '60000']: exact match on [3, 7] ranks
+['-n', '3', '-s', '1']: exact match on [8] ranks
+['-n', '0']: exact match on [1, 4] ranks
+['-n', '17', '-s', '1000']: exact match on [3] ranks
+['-n', '1023', '-s', '2', '-m', '-2.5']: exact match on [3] ranks
+['-n', '4', '-i', '0', '-m', '0']: exact match on [4] ranks
+['-h']: exit 0, one message
+['--unknown']: exit 1, one message
+['-s', '0']: exit 1, one message
+['-n', '-1']: exit 1, one message
+
+exec
+/bin/bash -lc "cmake -S spmv -B /tmp/spmv-mpi.9jkRqi/verified && cmake --build /tmp/spmv-mpi.9jkRqi/verified -j && python3 - <<'PY'
+import subprocess
+root='/tmp/spmv-mpi.9jkRqi'
+mpi=root+'/verified/spmv'
+serial=root+'/spmv-serial'
+tests=[
+    ([], [0,1,2,3,8]), (['-n','257','-s','13','-m','3.14','-i','3'], [3,7]),
+    (['-n','127','-s','1'], [5]), (['-n','256','-s','60000'], [7]),
+    (['-n','3','-s','1'],[8]), (['-n','0'], [4]), (['-n','17','-s','1000'],[3]),
+    (['-n','1023','-s','2','-m','-2.5'],[3]), (['-n','4','-i','0','-m','0'],[4]),
+    (['-n','14','-s','196','-i','0'],[4]),
+]
+def run(cmd):
+    return subprocess.run(cmd,capture_output=True,text=True,timeout=40)
+def stable(output):
+    return [line for line in output.splitlines() if not line.startswith(('Computation time', 'Average time', 'Performance'))]
+for args,ranks in tests:
+    flags=[*args,'-r','-v']
+    expected=run([serial,*flags])
+    for n in ranks:
+        launcher=['mpiexec','--oversubscribe','-n',str(n)] if n else []
+        actual=run([*launcher,mpi,*flags])
+        assert expected.returncode==actual.returncode and stable(expected.stdout)==stable(actual.stdout), (args,n,expected.stdout,actual.stdout,actual.stderr)
+    print(f'{args or \"defaults\"}: exact output and exit status on {ranks}',flush=True)
+for flags, rc in [([],0), (['-v'],0), (['-h'],0), (['--unknown'],1), (['-s','0'],1)]:
+    actual=run(['mpiexec','-n','3',mpi,*flags])
+    assert actual.returncode == rc and '=== RESULTS ===' not in actual.stdout, actual
+    assert actual.stdout.count('Validation: PASSED') == int(flags == ['-v']), actual
+print('No-gather execution, help and error paths passed',flush=True)
+PY" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+exec
+/bin/bash -lc "nl -ba spmv/spmv.cpp | sed -n '1,380p'
+nl -ba spmv/CMakeLists.txt
+rg --files" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 0ms:
+     1	#include <algorithm>
+     2	#include <cinttypes>
+     3	#include <cmath>
+     4	#include <cstdint>
+     5	#include <cstdio>
+     6	#include <cstdlib>
+     7	#include <cstring>
+     8	#include <exception>
+     9	#include <limits>
+    10	#include <memory>
+    11	#include <vector>
+    12	
+    13	#include <mpi.h>
+    14	
+    15	#include "../common/results_output.hpp"
+    16	
+    17	using index_t = uint32_t;
+    18	using offset_t = uint64_t;
+    19	
+    20	constexpr double MAX_RELATIVE_ERROR = 0.02;
+    21	constexpr int ROOT = 0;
+    22	constexpr int TRANSFER_CHUNK = 1 << 18;
+    23	
+    24	struct RowBlock {
+    25	    index_t first;
+    26	    index_t count;
+    27	};
+    28	
+    29	RowBlock rowBlock(index_t rows, int rank, int ranks) {
+    30	    const index_t quotient = rows / ranks;
+    31	    const index_t remainder = rows % ranks;
+    32	    const auto peer = static_cast<index_t>(rank);
+    33	    return {peer * quotient + std::min(peer, remainder), quotient + (peer < remainder)};
+    34	}
+    35	
+    36	template <typename T>
+    37	void sendBuffer(const T* data, offset_t size, MPI_Datatype type, int peer, int tag) {
+    38	    for (offset_t offset = 0; offset < size; offset += TRANSFER_CHUNK) {
+    39	        const int count = std::min<offset_t>(size - offset, TRANSFER_CHUNK);
+    40	        MPI_Send(data + offset, count, type, peer, tag, MPI_COMM_WORLD);
+    41	    }
+    42	}
+    43	
+    44	template <typename T>
+    45	void receiveBuffer(T* data, offset_t size, MPI_Datatype type, int tag) {
+    46	    for (offset_t offset = 0; offset < size; offset += TRANSFER_CHUNK) {
+    47	        const int count = std::min<offset_t>(size - offset, TRANSFER_CHUNK);
+    48	        MPI_Recv(data + offset, count, type, ROOT, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    49	    }
+    50	}
+    51	
+    52	void fill(double* A, const offset_t n, const double maxVal) {
+    53	    for (offset_t i = 0; i < n; ++i) {
+    54	        A[i] = maxVal * (rand() / (static_cast<double>(RAND_MAX) + 1.0));
+    55	    }
+    56	}
+    57	
+    58	// Visit blocks in global row order to preserve the original rand() sequence.
+    59	void initRandomRows(std::vector<index_t>& cols, std::vector<offset_t>& rowDelimiters,
+    60	                    index_t dim, RowBlock block, double probability, offset_t& needed) {
+    61	    cols.clear();
+    62	    rowDelimiters.resize(static_cast<offset_t>(block.count) + 1);
+    63	    for (index_t i = 0; i < block.count; ++i) {
+    64	        rowDelimiters[i] = cols.size();
+    65	        offset_t remaining = static_cast<offset_t>(dim - block.first - i) * dim;
+    66	        index_t j = 0;
+    67	        for (; j < dim && needed != 0 && remaining > needed; ++j, --remaining) {
+    68	            if (static_cast<double>(rand()) / RAND_MAX <= probability) {
+    69	                cols.push_back(j);
+    70	                --needed;
+    71	            }
+    72	        }
+    73	        // Once every remaining entry is required, the random draws are immaterial.
+    74	        if (needed != 0 && remaining == needed) {
+    75	            for (; j < dim; ++j) {
+    76	                cols.push_back(j);
+    77	                --needed;
+    78	            }
+    79	        }
+    80	    }
+    81	    rowDelimiters[block.count] = cols.size();
+    82	}
+    83	
+    84	struct LocalMatrix {
+    85	    std::vector<offset_t> rowDelimiters;
+    86	    std::vector<index_t> cols;
+    87	    std::unique_ptr<double[]> val;
+    88	};
+    89	
+    90	LocalMatrix initialize(index_t dim, offset_t nonzeros, double maxVal, RowBlock block,
+    91	                       int rank, int ranks, std::vector<double>& vec) {
+    92	    constexpr int ROWS_TAG = 0;
+    93	    constexpr int COLS_TAG = 1;
+    94	    constexpr int VALUES_TAG = 2;
+    95	    LocalMatrix matrix;
+    96	    std::vector<offset_t> nonzerosPerRank;
+    97	
+    98	    if (rank == ROOT) {
+    99	        nonzerosPerRank.resize(ranks);
+   100	        const double probability = dim == 0 ? 0.0 :
+   101	            static_cast<double>(nonzeros) / (static_cast<double>(dim) * dim);
+   102	        offset_t needed = nonzeros;
+   103	        srand(8675309);
+   104	        matrix.cols.reserve(nonzeros / ranks);
+   105	        initRandomRows(matrix.cols, matrix.rowDelimiters, dim, block, probability, needed);
+   106	        nonzerosPerRank[ROOT] = matrix.cols.size();
+   107	
+   108	        std::vector<index_t> cols;
+   109	        std::vector<offset_t> rowDelimiters;
+   110	        if (ranks > 1) {
+   111	            cols.reserve(nonzeros / ranks);
+   112	        }
+   113	        for (int peer = 1; peer < ranks; ++peer) {
+   114	            const RowBlock peerBlock = rowBlock(dim, peer, ranks);
+   115	            if (peerBlock.count == 0) {
+   116	                break;
+   117	            }
+   118	            initRandomRows(cols, rowDelimiters, dim, peerBlock, probability, needed);
+   119	            nonzerosPerRank[peer] = cols.size();
+   120	            sendBuffer(rowDelimiters.data(), rowDelimiters.size(), MPI_UINT64_T, peer, ROWS_TAG);
+   121	            sendBuffer(cols.data(), cols.size(), MPI_UINT32_T, peer, COLS_TAG);
+   122	        }
+   123	    } else {
+   124	        matrix.rowDelimiters.resize(static_cast<offset_t>(block.count) + 1);
+   125	        if (block.count != 0) {
+   126	            receiveBuffer(matrix.rowDelimiters.data(), matrix.rowDelimiters.size(),
+   127	                          MPI_UINT64_T, ROWS_TAG);
+   128	            matrix.cols.resize(matrix.rowDelimiters.back());
+   129	            receiveBuffer(matrix.cols.data(), matrix.cols.size(), MPI_UINT32_T, COLS_TAG);
+   130	        }
+   131	    }
+   132	
+   133	    if (rank == ROOT) {
+   134	        // The original vector and matrix values shared the default rand() stream.
+   135	        srand(1);
+   136	        fill(vec.data(), dim, maxVal);
+   137	    }
+   138	    MPI_Bcast(vec.data(), static_cast<int>(dim), MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
+   139	
+   140	    matrix.val = std::make_unique_for_overwrite<double[]>(matrix.cols.size());
+   141	    if (rank == ROOT) {
+   142	        fill(matrix.val.get(), matrix.cols.size(), maxVal);
+   143	        const auto bufferSize = ranks == 1 ? 0 : std::min<offset_t>(
+   144	            TRANSFER_CHUNK, *std::max_element(nonzerosPerRank.begin() + 1, nonzerosPerRank.end()));
+   145	        auto buffer = std::make_unique_for_overwrite<double[]>(bufferSize);
+   146	        for (int peer = 1; peer < ranks; ++peer) {
+   147	            for (offset_t offset = 0; offset < nonzerosPerRank[peer]; offset += TRANSFER_CHUNK) {
+   148	                const int count = std::min<offset_t>(nonzerosPerRank[peer] - offset, TRANSFER_CHUNK);
+   149	                fill(buffer.get(), count, maxVal);
+   150	                MPI_Send(buffer.get(), count, MPI_DOUBLE, peer, VALUES_TAG, MPI_COMM_WORLD);
+   151	            }
+   152	        }
+   153	    } else {
+   154	        receiveBuffer(matrix.val.get(), matrix.cols.size(), MPI_DOUBLE, VALUES_TAG);
+   155	    }
+   156	    return matrix;
+   157	}
+   158	
+   159	// Each row keeps the original CSR accumulation order.
+   160	void spmvCpu(const double* val, const index_t* cols, const offset_t* rowDelimiters,
+   161	             const double* vec, const index_t rows, double* out) {
+   162	    for (index_t i = 0; i < rows; ++i) {
+   163	        double t = 0.0;
+   164	        for (offset_t j = rowDelimiters[i]; j < rowDelimiters[i + 1]; ++j) {
+   165	            const auto col = cols[j];
+   166	            t += val[j] * vec[col];
+   167	        }
+   168	        out[i] = t;
+   169	    }
+   170	}
+   171	
+   172	bool verifyResults(const double* reference, const double* result, RowBlock block, int rank) {
+   173	    constexpr index_t NO_MISMATCH = std::numeric_limits<index_t>::max();
+   174	    constexpr int MISMATCH_TAG = 3;
+   175	    index_t localMismatch = NO_MISMATCH;
+   176	    for (index_t i = 0; i < block.count; ++i) {
+   177	        const double ref = reference[i];
+   178	        const double res = result[i];
+   179	        const double error = std::abs(ref) < 1e-10 ? std::abs(res) : std::abs((res - ref) / ref);
+   180	        if (error > MAX_RELATIVE_ERROR) {
+   181	            localMismatch = block.first + i;
+   182	            break;
+   183	        }
+   184	    }
+   185	
+   186	    index_t mismatch = NO_MISMATCH;
+   187	    MPI_Allreduce(&localMismatch, &mismatch, 1, MPI_UINT32_T, MPI_MIN, MPI_COMM_WORLD);
+   188	    if (mismatch == NO_MISMATCH) {
+   189	        return true;
+   190	    }
+   191	
+   192	    // Match the serial diagnostic by reporting only the first failing row.
+   193	    double values[2];
+   194	    if (localMismatch == mismatch) {
+   195	        const index_t i = mismatch - block.first;
+   196	        values[0] = reference[i];
+   197	        values[1] = result[i];
+   198	        if (rank != ROOT) {
+   199	            MPI_Send(values, 2, MPI_DOUBLE, ROOT, MISMATCH_TAG, MPI_COMM_WORLD);
+   200	        }
+   201	    }
+   202	    if (rank == ROOT) {
+   203	        if (localMismatch != mismatch) {
+   204	            MPI_Recv(values, 2, MPI_DOUBLE, MPI_ANY_SOURCE, MISMATCH_TAG, MPI_COMM_WORLD,
+   205	                     MPI_STATUS_IGNORE);
+   206	        }
+   207	        const double ref = values[0];
+   208	        const double res = values[1];
+   209	        if (std::abs(ref) < 1e-10) {
+   210	            printf("Validation failed at index %u: reference %.10e, got %.10e\n", mismatch, ref, res);
+   211	        } else {
+   212	            printf("Validation failed at index %u: reference %.10e, got %.10e (rel error: %.10e)\n",
+   213	                   mismatch, ref, res, std::abs((res - ref) / ref));
+   214	        }
+   215	    }
+   216	    return false;
+   217	}
+   218	
+   219	void printUsage(const char* progName) {
+   220	    printf("Usage: %s [options]\n", progName);
+   221	    printf("Options:\n");
+   222	    printf("  -n <num>     Number of rows/columns in the matrix (default: 1024)\n");
+   223	    printf("  -s <num>     Sparsity: 1 out of N entries is non-zero (default: 10)\n");
+   224	    printf("  -i <num>     Number of iterations (default: 10)\n");
+   225	    printf("  -m <val>     Maximum value for matrix and vector elements (default: 1.0)\n");
+   226	    printf("  -v           Enable validation\n");
+   227	    printf("  -r           Print results for external validation\n");
+   228	    printf("  -h           Show this help message\n");
+   229	}
+   230	
+   231	int runBenchmark(int argc, char** argv, int rank, int ranks) {
+   232	    index_t numRows = 1024;
+   233	    index_t sparsity = 10;
+   234	    index_t iterations = 10;
+   235	    double maxVal = 1.0;
+   236	    bool validate = false;
+   237	    bool printResults = false;
+   238	
+   239	    // Parse command line arguments
+   240	    for (int i = 1; i < argc; ++i) {
+   241	        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+   242	            numRows = static_cast<index_t>(atoi(argv[++i]));
+   243	        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+   244	            sparsity = static_cast<index_t>(atoi(argv[++i]));
+   245	        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+   246	            iterations = static_cast<index_t>(atoi(argv[++i]));
+   247	        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+   248	            maxVal = atof(argv[++i]);
+   249	        } else if (strcmp(argv[i], "-v") == 0) {
+   250	            validate = true;
+   251	        } else if (strcmp(argv[i], "-r") == 0) {
+   252	            printResults = true;
+   253	        } else if (strcmp(argv[i], "-h") == 0) {
+   254	            if (rank == ROOT) {
+   255	                printUsage(argv[0]);
+   256	            }
+   257	            return 0;
+   258	        } else {
+   259	            if (rank == ROOT) {
+   260	                printf("Unknown option: %s\n", argv[i]);
+   261	                printUsage(argv[0]);
+   262	            }
+   263	            return 1;
+   264	        }
+   265	    }
+   266	
+   267	    if (sparsity == 0 || numRows > std::numeric_limits<int>::max()) {
+   268	        if (rank == ROOT) {
+   269	            fprintf(stderr, "Sparsity must be positive and the row count must fit in an MPI count.\n");
+   270	        }
+   271	        return 1;
+   272	    }
+   273	
+   274	    const offset_t entries = static_cast<offset_t>(numRows) * numRows;
+   275	    const offset_t nItems = entries / sparsity;
+   276	    if (rank == ROOT) {
+   277	        printf("Sparse Matrix-Vector Multiplication (SpMV) Benchmark\n");
+   278	        printf("Matrix size: %u x %u\n", numRows, numRows);
+   279	        printf("Sparsity: 1 out of %u entries is non-zero\n", sparsity);
+   280	        printf("Non-zero elements: %" PRIu64 " (%.2f%% sparse)\n",
+   281	               nItems, 100.0 * (1.0 - static_cast<double>(nItems) / entries));
+   282	        printf("Iterations: %u\n", iterations);
+   283	        printf("Max value: %.2f\n", maxVal);
+   284	        printf("Validation: %s\n", validate ? "enabled" : "disabled");
+   285	        printf("Initializing data structures...\n");
+   286	    }
+   287	
+   288	    const RowBlock block = rowBlock(numRows, rank, ranks);
+   289	    std::vector<double> vec(numRows);
+   290	    const LocalMatrix matrix = initialize(numRows, nItems, maxVal, block, rank, ranks, vec);
+   291	    std::vector<double> out(block.count);
+   292	    std::vector<double> reference;
+   293	    if (validate) {
+   294	        if (rank == ROOT) {
+   295	            printf("Computing reference solution...\n");
+   296	        }
+   297	        reference.resize(block.count);
+   298	        spmvCpu(matrix.val.get(), matrix.cols.data(), matrix.rowDelimiters.data(),
+   299	                vec.data(), block.count, reference.data());
+   300	    }
+   301	
+   302	    if (rank == ROOT) {
+   303	        printf("Computing SpMV...\n");
+   304	    }
+   305	    MPI_Barrier(MPI_COMM_WORLD);
+   306	    const double start = MPI_Wtime();
+   307	
+   308	    if (block.count != 0) {
+   309	        for (index_t iter = 0; iter < iterations; ++iter) {
+   310	            spmvCpu(matrix.val.get(), matrix.cols.data(), matrix.rowDelimiters.data(),
+   311	                    vec.data(), block.count, out.data());
+   312	        }
+   313	    }
+   314	
+   315	    const double elapsed = MPI_Wtime() - start;
+   316	    double duration = 0.0;
+   317	    MPI_Reduce(&elapsed, &duration, 1, MPI_DOUBLE, MPI_MAX, ROOT, MPI_COMM_WORLD);
+   318	    if (rank == ROOT) {
+   319	        const double gflops = duration > 0.0 ? (2.0 * nItems * iterations) / duration / 1e9 : 0.0;
+   320	        const double avgTime = iterations != 0 ? 1000.0 * duration / iterations : 0.0;
+   321	        printf("Computation time: %ld ms\n", static_cast<long>(1000.0 * duration));
+   322	        printf("Average time per iteration: %.3f ms\n", avgTime);
+   323	        printf("Performance: %.3f GFLOPS\n", gflops);
+   324	    }
+   325	
+   326	    if (printResults) {
+   327	        std::vector<int> counts;
+   328	        std::vector<int> displacements;
+   329	        std::vector<double> result;
+   330	        if (rank == ROOT) {
+   331	            counts.resize(ranks);
+   332	            displacements.resize(ranks);
+   333	            result.resize(numRows);
+   334	            for (int peer = 0; peer < ranks; ++peer) {
+   335	                const RowBlock peerBlock = rowBlock(numRows, peer, ranks);
+   336	                counts[peer] = peerBlock.count;
+   337	                displacements[peer] = peerBlock.first;
+   338	            }
+   339	        }
+   340	        MPI_Gatherv(out.data(), static_cast<int>(block.count), MPI_DOUBLE, result.data(),
+   341	                    counts.data(), displacements.data(), MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
+   342	        if (rank == ROOT) {
+   343	            print_results(result, "OutputVector");
+   344	        }
+   345	    }
+   346	
+   347	    if (validate) {
+   348	        if (rank == ROOT) {
+   349	            printf("Validating result...\n");
+   350	        }
+   351	        const bool valid = verifyResults(reference.data(), out.data(), block, rank);
+   352	        if (rank == ROOT) {
+   353	            printf("Validation: %s\n", valid ? "PASSED" : "FAILED");
+   354	        }
+   355	        return valid ? 0 : 1;
+   356	    }
+   357	
+   358	    return 0;
+   359	}
+   360	
+   361	int main(int argc, char** argv) {
+   362	    MPI_Init(&argc, &argv);
+   363	    int rank = 0;
+   364	    int ranks = 0;
+   365	    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+   366	    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+   367	
+   368	    int status = 1;
+   369	    try {
+   370	        status = runBenchmark(argc, argv, rank, ranks);
+   371	    } catch (const std::exception& error) {
+   372	        fprintf(stderr, "Rank %d: %s\n", rank, error.what());
+   373	        MPI_Abort(MPI_COMM_WORLD, status);
+   374	    }
+   375	    MPI_Finalize();
+   376	    return status;
+   377	}
+     1	cmake_minimum_required(VERSION 3.10)
+     2	project(spmv_benchmark)
+     3	
+     4	set(CMAKE_CXX_STANDARD 20)
+     5	set(CMAKE_CXX_STANDARD_REQUIRED ON)
+     6	
+     7	set(MPI_CXX_SKIP_MPICXX TRUE CACHE BOOL "Use the MPI C API from C++")
+     8	find_package(MPI REQUIRED COMPONENTS CXX)
+     9	
+    10	add_executable(spmv spmv.cpp)
+    11	
+    12	# Enable optimizations
+    13	target_compile_options(spmv PRIVATE -O3 -march=native -Wall -Wextra)
+    14	
+    15	target_link_libraries(spmv PRIVATE MPI::MPI_CXX m)
+output.txt
+common/hash.hpp
+common/results_output.hpp
+spmv/CMakeLists.txt
+spmv/spmv.cpp
+
+exec
+/bin/bash -lc "set -o pipefail
+mpiexec --mca btl self,tcp --bind-to core -n 4 /tmp/spmv-mpi.9jkRqi/verified/spmv -n 4096 -s 6 -i 150 -r -v | rg 'Computation time|Performance|Hash|Validation: PASSED'" in /home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2
+ succeeded in 4133ms:
+Computation time: 173 ms
+Performance: 4.830 GFLOPS
+Hash: 844931274ca9563b
+Validation: PASSED
+
+ succeeded in 92054ms:
+-- The C compiler identification is GNU 13.2.0
+-- The CXX compiler identification is GNU 13.2.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Configuring done (1.3s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/spmv-mpi.9jkRqi/verified
+[ 50%] Building CXX object CMakeFiles/spmv.dir/spmv.cpp.o
+[100%] Linking CXX executable spmv
+[100%] Built target spmv
+defaults: exact output and exit status on [0, 1, 2, 3, 8]
+['-n', '257', '-s', '13', '-m', '3.14', '-i', '3']: exact output and exit status on [3, 7]
+['-n', '127', '-s', '1']: exact output and exit status on [5]
+['-n', '256', '-s', '60000']: exact output and exit status on [7]
+['-n', '3', '-s', '1']: exact output and exit status on [8]
+['-n', '0']: exact output and exit status on [4]
+['-n', '17', '-s', '1000']: exact output and exit status on [3]
+['-n', '1023', '-s', '2', '-m', '-2.5']: exact output and exit status on [3]
+['-n', '4', '-i', '0', '-m', '0']: exact output and exit status on [4]
+['-n', '14', '-s', '196', '-i', '0']: exact output and exit status on [4]
+No-gather execution, help and error paths passed
+
+codex
+Parallelized `spmv` with MPI and kept the executable name. Each rank owns a contiguous block of CSR rows and receives the input vector once. Timed iterations run without MPI communication, and rank 0 gathers the output only when `-r` is requested. Rank 0 generates the seeded matrix during setup to preserve the original data.
+
+The MPI build matched the original serial result hashes and validation behavior across tests with up to eight ranks. On one node, a 4,096-row benchmark’s timed computation fell from 649 ms on one rank to 79 ms on eight ranks. Multi-node performance was unverified.
+
+Only the two existing benchmark files were modified. [spmv.cpp](/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2/spmv/spmv.cpp) · [CMakeLists.txt](/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2/spmv/CMakeLists.txt)
+tokens used
+60,475
+Parallelized `spmv` with MPI and kept the executable name. Each rank owns a contiguous block of CSR rows and receives the input vector once. Timed iterations run without MPI communication, and rank 0 gathers the output only when `-r` is requested. Rank 0 generates the seeded matrix during setup to preserve the original data.
+
+The MPI build matched the original serial result hashes and validation behavior across tests with up to eight ranks. On one node, a 4,096-row benchmark’s timed computation fell from 649 ms on one rank to 79 ms on eight ranks. Multi-node performance was unverified.
+
+Only the two existing benchmark files were modified. [spmv.cpp](/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2/spmv/spmv.cpp) · [CMakeLists.txt](/home/llmtest/evals/20261123-155235/spmv_gpt-6.2-sol-medium_mpi_r2/spmv/CMakeLists.txt)

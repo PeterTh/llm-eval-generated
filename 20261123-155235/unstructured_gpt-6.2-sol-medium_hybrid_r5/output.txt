@@ -1,0 +1,2146 @@
+Reading additional input from stdin...
+OpenAI Codex v0.171.0
+--------
+workdir: /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+model: gpt-6.2-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a2126a-3afc-7ca1-beb7-07429f262992
+--------
+user
+Parallelize the unstructured benchmark code found in ./unstructured/ with a hybrid approach combining MPI, OpenMP, and CUDA as appropriate for the problem for maximum parallel performance on an accelerator cluster. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the benchmark and its build setup, then map the work across MPI ranks, OpenMP threads, and CUDA GPUs while preserving the existing executable and file layout.
+exec
+/bin/bash -lc "ls -la; rg --files --hidden -g '"'!**/.git/**'"'" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 0ms:
+total 8
+drwxrwxrwx 4 nobody  nogroup   74 Nov 25 12:14 .
+drwx------ 3 llmtest users   4096 Nov 25 12:14 ..
+drwxrwxrwx 2 nobody  nogroup   60 Nov 25 12:14 common
+-rw-r--r-- 1 llmtest users   1166 Nov 25 12:14 output.txt
+drwxrwxrwx 2 nobody  nogroup   64 Nov 25 12:14 unstructured
+output.txt
+common/hash.hpp
+common/results_output.hpp
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+
+exec
+/bin/bash -lc "git status --short; command -v nvcc mpicxx cmake; ls /usr/local; rg --files --hidden -g AGENTS.md -g '"'!**/.git/**'"' /home/llmtest/evals | head -40" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 0ms:
+fatal: not a git repository (or any parent up to mount point /home/llmtest/evals/20261123-155235)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+/usr/bin/nvcc
+/usr/bin/mpicxx
+/usr/bin/cmake
+bin
+cuda
+cuda-11.2
+cuda-11.6
+cuda-12
+cuda-12.6
+etc
+games
+include
+lib
+libexec
+man
+sbin
+share
+src
+stow
+
+exec
+/bin/bash -lc 'cat unstructured/CMakeLists.txt; cat unstructured/unstructured.cpp' in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 0ms:
+cmake_minimum_required(VERSION 3.10)
+project(unstructured_benchmark)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(unstructured unstructured.cpp)
+
+# Enable optimizations
+target_compile_options(unstructured PRIVATE -O3 -march=native -Wall -Wextra)
+
+# Link math library
+target_link_libraries(unstructured m)
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include "../common/results_output.hpp"
+
+// Types to represent unstructured mesh elements
+using idx_t = uint64_t;
+using val_t = double;
+
+// Maximum number of connections per element (for a 2D grid: 4 neighbors)
+constexpr int MAX_CONNECTIONS = 8;
+
+// Material properties for energy transfer
+struct Material {
+    val_t transfer_coeff;  // Energy transfer coefficient
+    val_t external_flow;   // External energy source/sink
+};
+
+// Static connectivity information for each element
+struct ElementStatic {
+    idx_t material_idx;
+    idx_t num_connections;
+    idx_t connected_idx[MAX_CONNECTIONS];     // Indices of connected elements
+    val_t connected_flux[MAX_CONNECTIONS];    // Flux coefficients for each connection
+};
+
+// Dynamic state for each element
+struct ElementDynamic {
+    val_t current_energy;
+    val_t total_flux;
+};
+
+// World state
+struct World {
+    std::vector<Material> materials;
+    std::vector<ElementStatic> elements_static;
+    std::vector<ElementDynamic> elements_dynamic;
+    std::vector<ElementDynamic> elements_dynamic_swap;
+};
+
+// Material type IDs
+constexpr idx_t DEFAULT_MAT_ID = 0;
+constexpr idx_t INFLOW_MAT_ID = 1;
+constexpr idx_t OUTFLOW_MAT_ID = 2;
+
+// Build a 2D square grid as an unstructured mesh
+// This represents computation on arbitrarily-shaped geometries
+void buildSquare2D(World& world, const int n_elems_root) {
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    // Initialize materials
+    world.materials.emplace_back(Material{0.8, 0.0});    // Default material
+    world.materials.emplace_back(Material{0.8, 0.5});    // Inflow material
+    world.materials.emplace_back(Material{0.8, -0.5});   // Outflow material
+    
+    // Allocate elements
+    world.elements_static.resize(n_elems);
+    world.elements_dynamic.resize(n_elems);
+    world.elements_dynamic_swap.resize(n_elems);
+    
+    // Initialize all elements with default material and zero energy
+    for (int i = 0; i < n_elems; ++i) {
+        world.elements_static[i].material_idx = DEFAULT_MAT_ID;
+        world.elements_static[i].num_connections = 0;
+        world.elements_dynamic[i].current_energy = 0.0;
+        world.elements_dynamic[i].total_flux = 0.0;
+    }
+    
+    // Build connectivity: each element connects to its neighbors in 2D grid
+    for (int x = 0; x < n_elems_root; ++x) {
+        for (int y = 0; y < n_elems_root; ++y) {
+            const int idx = x * n_elems_root + y;
+            ElementStatic& elem = world.elements_static[idx];
+            
+            // Connect to neighbors (up, down, left, right)
+            const int offsets[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            
+            for (int n = 0; n < 4; ++n) {
+                const int nx = x + offsets[n][0];
+                const int ny = y + offsets[n][1];
+                
+                // Check if neighbor is within bounds
+                if (nx >= 0 && nx < n_elems_root && ny >= 0 && ny < n_elems_root) {
+                    const int neighbor_idx = nx * n_elems_root + ny;
+                    elem.connected_idx[elem.num_connections] = neighbor_idx;
+                    elem.connected_flux[elem.num_connections] = 1.0;
+                    elem.num_connections++;
+                }
+            }
+        }
+    }
+    
+    // Set corner elements as inflow/outflow to create interesting dynamics
+    const int last = n_elems_root - 1;
+    world.elements_static[0 * n_elems_root + 0].material_idx = INFLOW_MAT_ID;
+    world.elements_static[0 * n_elems_root + last].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + 0].material_idx = OUTFLOW_MAT_ID;
+    world.elements_static[last * n_elems_root + last].material_idx = INFLOW_MAT_ID;
+}
+
+// Compute energy flux between two elements
+inline val_t computeFlux(const Material& mat, const ElementDynamic& this_elem,
+                        val_t connection_flux, const ElementDynamic& other_elem) {
+    return (other_elem.current_energy - this_elem.current_energy) * 
+           mat.transfer_coeff * connection_flux * 0.25;
+}
+
+// Run simulation for n_iters iterations
+void runSimulation(World& world, const int n_iters) {
+    const size_t n_elems = world.elements_static.size();
+    
+    for (int iter = 0; iter < n_iters; ++iter) {
+        // Update all elements
+        for (size_t i = 0; i < n_elems; ++i) {
+            const ElementStatic& elem_static = world.elements_static[i];
+            const ElementDynamic& elem_dyn = world.elements_dynamic[i];
+            const Material& mat = world.materials[elem_static.material_idx];
+            
+            // Start with external flow
+            val_t total_flux = mat.external_flow;
+            
+            // Add flux from all connected elements
+            for (idx_t j = 0; j < elem_static.num_connections; ++j) {
+                const idx_t neighbor_idx = elem_static.connected_idx[j];
+                const ElementDynamic& neighbor_dyn = world.elements_dynamic[neighbor_idx];
+                total_flux += computeFlux(mat, elem_dyn, elem_static.connected_flux[j], neighbor_dyn);
+            }
+            
+            // Update element state
+            ElementDynamic& elem_write = world.elements_dynamic_swap[i];
+            elem_write.current_energy = elem_dyn.current_energy + total_flux;
+            elem_write.total_flux = elem_dyn.total_flux + std::abs(total_flux);
+        }
+        
+        // Swap buffers
+        std::swap(world.elements_dynamic, world.elements_dynamic_swap);
+    }
+}
+
+// Validate simulation results
+bool validateResults(const World& world) {
+    val_t energy_sum = 0.0;
+    val_t flux_sum = 0.0;
+    val_t energy_max = std::numeric_limits<val_t>::lowest();
+    val_t energy_min = std::numeric_limits<val_t>::max();
+    
+    for (const auto& elem : world.elements_dynamic) {
+        energy_sum += elem.current_energy;
+        flux_sum += elem.total_flux;
+        energy_max = std::max(elem.current_energy, energy_max);
+        energy_min = std::min(elem.current_energy, energy_min);
+    }
+    
+    printf("Validation results:\n");
+    printf("  Energy sum: %.12f\n", energy_sum);
+    printf("  Flux sum: %.2f\n", flux_sum);
+    printf("  Energy range: [%.6f, %.6f]\n", energy_min, energy_max);
+    
+    // Check for numerical issues
+    constexpr val_t energy_epsilon = 1e-8;
+    
+    if (!std::isfinite(energy_sum)) {
+        printf("  ERROR: Energy sum is not finite\n");
+        return false;
+    }
+    
+    if (std::abs(energy_sum) > energy_epsilon) {
+        printf("  WARNING: Energy sum diverged from 0 (expected conservation)\n");
+        // Don't fail validation as this can happen with external flows
+    }
+    
+    if (!std::isfinite(flux_sum)) {
+        printf("  ERROR: Flux sum is not finite\n");
+        return false;
+    }
+    
+    if (!std::isfinite(energy_max) || !std::isfinite(energy_min)) {
+        printf("  ERROR: Energy extrema are not finite\n");
+        return false;
+    }
+    
+    printf("  Validation: PASSED\n");
+    return true;
+}
+
+// Compute a simple hash of the results for verification
+uint64_t computeHash(const std::vector<ElementDynamic>& elements) {
+    uint64_t hash = 0;
+    for (size_t i = 0; i < elements.size(); ++i) {
+        // Simple hash combining energy and flux values
+        const uint64_t* e_ptr = reinterpret_cast<const uint64_t*>(&elements[i].current_energy);
+        const uint64_t* f_ptr = reinterpret_cast<const uint64_t*>(&elements[i].total_flux);
+        hash ^= (*e_ptr + i) * 0x9e3779b97f4a7c15ULL;
+        hash ^= (*f_ptr + i) * 0xbf58476d1ce4e5b9ULL;
+    }
+    return hash;
+}
+
+void printUsage(const char* progName) {
+    printf("Usage: %s [options]\n", progName);
+    printf("Options:\n");
+    printf("  -n <num>     Grid size (NxN elements) (default: 512)\n");
+    printf("  -i <num>     Number of simulation iterations (default: 10)\n");
+    printf("  -v           Enable validation\n");
+    printf("  -r           Print results for external validation\n");
+    printf("  -h           Show this help message\n");
+}
+
+int main(int argc, char** argv) {
+    int n_elems_root = 512;
+    int n_iters = 10;
+    bool validate = false;
+    bool printResults = false;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            n_elems_root = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            n_iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            validate = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            printResults = true;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+    
+    const int n_elems = n_elems_root * n_elems_root;
+    
+    printf("Unstructured Mesh Energy Transfer Benchmark\n");
+    printf("============================================\n");
+    printf("Grid size: %d x %d = %d elements\n", n_elems_root, n_elems_root, n_elems);
+    printf("Iterations: %d\n", n_iters);
+    printf("Validation: %s\n", validate ? "enabled" : "disabled");
+    printf("\n");
+    
+    // Build the unstructured mesh
+    printf("Building unstructured mesh...\n");
+    World world;
+    buildSquare2D(world, n_elems_root);
+    
+    // Calculate memory usage
+    const size_t static_mem = world.elements_static.size() * sizeof(ElementStatic);
+    const size_t dynamic_mem = world.elements_dynamic.size() * sizeof(ElementDynamic) * 2;
+    const size_t total_mem = static_mem + dynamic_mem;
+    printf("Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\n",
+           total_mem / (1024.0 * 1024.0),
+           static_mem / (1024.0 * 1024.0),
+           dynamic_mem / (1024.0 * 1024.0));
+    printf("\n");
+    
+    // Run simulation
+    printf("Running simulation...\n");
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    runSimulation(world, n_iters);
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    
+    printf("Computation time: %ld ms\n", duration_ms);
+    
+    // Calculate performance metrics
+    const int n_measured_iters = std::max(n_iters - 1, 1);
+    const double time_per_iter = static_cast<double>(duration_ms) / n_measured_iters;
+    const double giga_elems_per_sec = (n_measured_iters * n_elems) / (duration_ms / 1000.0) / 1e9;
+    
+    // Approximate FLOPS: ~22 FLOPS per element per iteration (from reference)
+    const double gflops = giga_elems_per_sec * 22.0;
+    
+    printf("Performance:\n");
+    printf("  Time per iteration: %.4f ms\n", time_per_iter);
+    printf("  Elements/sec: %.4f GigaElements/s\n", giga_elems_per_sec);
+    printf("  Performance: %.4f GFLOPS\n", gflops);
+    
+    // Compute hash for verification
+    const uint64_t hash = computeHash(world.elements_dynamic);
+    printf("  Result hash: %016lX\n", hash);
+    printf("\n");
+    
+    // Print results for external validation
+    if (printResults) {
+        std::vector<double> energyData;
+        energyData.reserve(world.elements_dynamic.size());
+        for (const auto& elem : world.elements_dynamic) {
+            energyData.push_back(elem.current_energy);
+        }
+        print_results(energyData, "ElementEnergy");
+    }
+    
+    // Validation
+    if (validate) {
+        bool valid = validateResults(world);
+        if (!valid) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+exec
+/bin/bash -lc 'cat common/hash.hpp common/results_output.hpp output.txt; nvidia-smi; nvcc --version; mpiexec --version; cmake --version' in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 91ms:
+#pragma once
+
+#include <cstdint>
+
+// FNV-1a hash, 64 bit length
+class hash {
+  public:
+	using digest = uint64_t;
+
+	template <typename T>
+	void add(const T& value) {
+		const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&value);
+		for(size_t i = 0; i < sizeof(T); ++i) {
+			d = (d ^ bytes[i]) * 0x100000001b3ull;
+		}
+	}
+
+	digest get() const { return d; }
+
+  private:
+	digest d = 0xcbf29ce484222325ull;
+};
+#pragma once
+
+#include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+#include "hash.hpp"
+
+// Kahan summation for numerically stable sum
+template <typename T>
+T kahan_sum(const std::vector<T>& data) {
+    T sum = 0.0;
+    T c = 0.0;
+    for (const auto& val : data) {
+        T y = val - c;
+        T t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    return sum;
+}
+
+// Print results for floating-point arrays
+template <typename T>
+void print_results(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute statistics
+    T sum = kahan_sum(data);
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Sum: %.17e\n", static_cast<double>(sum));
+    printf("Min: %.17e\n", static_cast<double>(min_val));
+    printf("Max: %.17e\n", static_cast<double>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %.17e\n", indices[i], static_cast<double>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+
+// Print results for integer arrays (uses exact hash comparison)
+template <typename T>
+void print_results_int(const std::vector<T>& data, const char* name = "Result") {
+    if (data.empty()) {
+        printf("=== RESULTS ===\n");
+        printf("Name: %s\n", name);
+        printf("Elements: 0\n");
+        printf("=== END RESULTS ===\n");
+        return;
+    }
+
+    const size_t N = data.size();
+    
+    // Compute hash
+    hash h;
+    for (const auto& val : data) {
+        h.add(val);
+    }
+    
+    // Compute min/max
+    T min_val = data[0];
+    T max_val = data[0];
+    for (const auto& val : data) {
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    
+    // Sample indices: 0, N/4, N/2, 3N/4, N-1
+    size_t indices[5] = {0, N/4, N/2, 3*N/4, N-1};
+    
+    printf("=== RESULTS ===\n");
+    printf("Name: %s\n", name);
+    printf("Elements: %zu\n", N);
+    printf("Min: %lld\n", static_cast<long long>(min_val));
+    printf("Max: %lld\n", static_cast<long long>(max_val));
+    for (int i = 0; i < 5; ++i) {
+        printf("Sample[%zu]: %lld\n", indices[i], static_cast<long long>(data[indices[i]]));
+    }
+    printf("Hash: %016" PRIx64 "\n", h.get());
+    printf("=== END RESULTS ===\n");
+}
+Reading additional input from stdin...
+OpenAI Codex v0.171.0
+--------
+workdir: /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+model: gpt-6.2-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a2126a-3afc-7ca1-beb7-07429f262992
+--------
+user
+Parallelize the unstructured benchmark code found in ./unstructured/ with a hybrid approach combining MPI, OpenMP, and CUDA as appropriate for the problem for maximum parallel performance on an accelerator cluster. The program should be optimized for maximum performance and parallel scalability, while maintaining correctness and equivalent semantics to the original code. Change the code in the existing files only, and do not change the executable name; do not create new files. Update CMakeLists as needed. The resulting program should unconditionally use the specified parallelization approach. Use no new external dependencies. 
+codex
+I’ll inspect the benchmark and its build setup, then map the work across MPI ranks, OpenMP threads, and CUDA GPUs while preserving the existing executable and file layout.
+exec
+/bin/bash -lc "ls -la; rg --files --hidden -g '"'!**/.git/**'"'" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 0ms:
+total 8
+drwxrwxrwx 4 nobody  nogroup   74 Nov 25 12:14 .
+drwx------ 3 llmtest users   4096 Nov 25 12:14 ..
+drwxrwxrwx 2 nobody  nogroup   60 Nov 25 12:14 common
+-rw-r--r-- 1 llmtest users   1166 Nov 25 12:14 output.txt
+drwxrwxrwx 2 nobody  nogroup   64 Nov 25 12:14 unstructured
+output.txt
+common/hash.hpp
+common/results_output.hpp
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+
+exec
+/bin/bash -lc "git status --short; command -v nvcc mpicxx cmake; ls /usr/local; rg --files --hidden -g AGENTS.md -g '"'!**/.git/**'"' /home/llmtest/evals | head -40" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 0ms:
+fatal: not a git repository (or any parent up to mount point /home/llmtest/evals/20261123-155235)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+/usr/bin/nvcc
+/usr/bin/mpicxx
+/usr/bin/cmake
+bin
+cuda
+cuda-11.2
+cuda-11.6
+cuda-12
+cuda-12.6
+etc
+games
+include
+lib
+libexec
+man
+sbin
+share
+src
+stow
+
+Wed Nov 25 12:14:49 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 560.35.03              Driver Version: 560.35.03      CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3090        Off |   00000000:25:00.0 Off |                  N/A |
+| 30%   31C    P8             29W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 3090        Off |   00000000:41:00.0 Off |                  N/A |
+| 30%   29C    P8             25W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA GeForce RTX 3090        Off |   00000000:81:00.0 Off |                  N/A |
+| 30%   28C    P8             25W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA GeForce RTX 3090        Off |   00000000:E1:00.0 Off |                  N/A |
+| 30%   27C    P8             27W /  350W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2023 NVIDIA Corporation
+Built on Fri_Jan__6_16:45:21_PST_2023
+Cuda compilation tools, release 12.0, V12.0.140
+Build cuda_12.0.r12.0/compiler.32267302_0
+mpiexec (OpenRTE) 4.1.6
+
+Report bugs to http://www.open-mpi.org/community/help/
+cmake version 3.30.2
+
+CMake suite maintained and supported by Kitware (kitware.com/cmake).
+
+exec
+/bin/bash -lc "g++ -std=c++20 -O3 -march=native -Wall -Wextra -S unstructured/unstructured.cpp -o - | rg -n -C 5 'vfmadd|vmulsd'" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+exec
+/bin/bash -lc "ls -l /usr/bin/nvcc /usr/local/cuda/bin/nvcc; mpicxx --showme; ompi_info --parsable -l 2 | rg -i cuda; lscpu | rg -m2 'Model name|Flags'; for dir in /home /home/llmtest /home/llmtest/evals/20261123-155235 \""'$PWD" "$PWD/unstructured"; do if test -f "$dir/AGENTS.md"; then cat "$dir/AGENTS.md"; fi; done' in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 309ms:
+-rwxr-xr-x 1 nobody nogroup       59 Jan  8  2024 /usr/bin/nvcc
+-rwxr-xr-x 1 nobody nogroup 23091656 Sep 12  2024 /usr/local/cuda/bin/nvcc
+g++ -I/usr/lib/x86_64-linux-gnu/openmpi/include -I/usr/lib/x86_64-linux-gnu/openmpi/include/openmpi -L/usr/lib/x86_64-linux-gnu/openmpi/lib -lmpi_cxx -lmpi
+options:mpi_ext:affinity, cuda, pcollreq
+Model name:                           AMD EPYC 7763 64-Core Processor
+Flags:                                fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpb cat_l3 cdp_l3 hw_pstate ssbd mba ibrs ibpb stibp vmmcall fsgsbase bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk clzero irperf xsaveerptr rdpru wbnoinvd amd_ppin brs arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold v_vmsave_vmload vgif v_spec_ctrl umip pku ospke vaes vpclmulqdq rdpid overflow_recov succor smca fsrm debug_swap
+
+ succeeded in 2335ms:
+1160-.L226:
+1161-	movl	$4, %edi
+1162-	shlx	%rdi, 16(%rax,%rcx,8), %rsi
+1163-	vmovsd	(%rdx,%rsi), %xmm1
+1164-	vsubsd	%xmm6, %xmm1, %xmm1
+1165:	vmulsd	%xmm7, %xmm1, %xmm1
+1166:	vmulsd	80(%rax,%rcx,8), %xmm1, %xmm1
+1167:	vfmadd231sd	%xmm2, %xmm1, %xmm12
+1168-.L222:
+1169-	vaddsd	%xmm6, %xmm12, %xmm6
+1170-	vandpd	%xmm5, %xmm12, %xmm12
+1171-	vaddsd	8(%rdx,%r8), %xmm12, %xmm12
+1172-	incq	%r11
+--
+2195-	js	.L353
+2196-	vxorpd	%xmm3, %xmm3, %xmm3
+2197-	vcvtsi2sdq	%rax, %xmm3, %xmm2
+2198-.L354:
+2199-	vmovsd	.LC61(%rip), %xmm3
+2200:	vmulsd	%xmm3, %xmm2, %xmm2
+2201-	testq	%rdx, %rdx
+2202-	js	.L355
+2203-	vxorpd	%xmm4, %xmm4, %xmm4
+2204-	vcvtsi2sdq	%rdx, %xmm4, %xmm1
+2205-.L356:
+2206-	addq	%rax, %rdx
+2207:	vmulsd	%xmm3, %xmm1, %xmm1
+2208-	js	.L357
+2209-	vxorpd	%xmm5, %xmm5, %xmm5
+2210-	vcvtsi2sdq	%rdx, %xmm5, %xmm0
+2211-.L358:
+2212:	vmulsd	%xmm3, %xmm0, %xmm0
+2213-	leaq	.LC62(%rip), %rsi
+2214-	movl	$2, %edi
+2215-	movl	$3, %eax
+2216-	call	__printf_chk@PLT
+2217-	leaq	.LC59(%rip), %rsi
+--
+2257-	vdivsd	.LC65(%rip), %xmm1, %xmm1
+2258-	vmovq	%xmm7, %r13
+2259-	vdivsd	%xmm1, %xmm0, %xmm0
+2260-	vdivsd	.LC66(%rip), %xmm0, %xmm7
+2261-	vmovq	%xmm7, %rbx
+2262:	vmulsd	.LC67(%rip), %xmm7, %xmm7
+2263-	vmovq	%xmm7, %r14
+2264-	call	__printf_chk@PLT
+2265-	vmovq	%r13, %xmm0
+2266-	leaq	.LC69(%rip), %rsi
+2267-	movl	$2, %edi
+
+exec
+/bin/bash -lc 'reference=$(mktemp -d /tmp/unstructured-reference.XXXXXX) && g++ -std=c++20 -O3 -march=native -Wall -Wextra unstructured/unstructured.cpp -o "$reference/unstructured" && printf '"'%s\\n' \""'$reference" && "$reference/unstructured" -n 513 -i 31 -r -v | sed -n '"'/Result hash:/,"'$p'"'" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 2571ms:
+/tmp/unstructured-reference.1tGimp
+  Result hash: 2D29C569708FECE8
+
+=== RESULTS ===
+Name: ElementEnergy
+Elements: 263169
+Sum: 0.00000000000000000e+00
+Min: -2.65181915090281350e+00
+Max: 2.65181915090281350e+00
+Sample[0]: 2.65181915090281350e+00
+Sample[65792]: 0.00000000000000000e+00
+Sample[131584]: 0.00000000000000000e+00
+Sample[197376]: 0.00000000000000000e+00
+Sample[263168]: 2.65181915090281350e+00
+Hash: b6242501c09d3921
+=== END RESULTS ===
+Validation results:
+  Energy sum: 0.000000000000
+  Flux sum: 62.00
+  Energy range: [-2.651819, 2.651819]
+  Validation: PASSED
+
+codex
+The benchmark updates each cell from the previous iteration and keeps a fixed neighbor order. I’ll preserve that order on the GPU and use MPI to exchange only tile edges while CUDA computes the interior. OpenMP will build each rank’s local connectivity.
+exec
+/bin/bash -lc "cat > unstructured/CMakeLists.txt <<'EOF'
+cmake_minimum_required(VERSION 3.20)
+project(unstructured_benchmark LANGUAGES CXX CUDA)
+
+find_package(MPI REQUIRED COMPONENTS CXX)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+
+set_source_files_properties(unstructured.cpp PROPERTIES LANGUAGE CUDA)
+add_executable(unstructured unstructured.cpp)
+set_target_properties(unstructured PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+
+# The translation unit is compiled by nvcc, including the OpenMP host code.
+separate_arguments(openmp_flags NATIVE_COMMAND \""'${OpenMP_CXX_FLAGS}")
+foreach(flag IN LISTS openmp_flags)
+    target_compile_options(unstructured PRIVATE "-Xcompiler=${flag}")
+endforeach()
+target_compile_options(unstructured PRIVATE -O3 -Xcompiler=-Wall,-Wextra)
+target_link_libraries(unstructured PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX)
+EOF
+cat > unstructured/unstructured.cpp <<'"'EOF'
+#include <cuda_runtime.h>
+#include <cub/block/block_reduce.cuh>
+
+#include <mpi.h>
+#if defined(OMPI_MAJOR_VERSION)
+#include <mpi-ext.h>
+#endif
+#include <omp.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <vector>
+
+#include \"../common/results_output.hpp\"
+
+using val_t = double;
+constexpr int BLOCK_SIZE = 256;
+
+// Face order is also the original order of flux accumulation.
+enum Face { Bottom, Top, Right, Left, FaceCount };
+constexpr Face opposite[] = {Top, Bottom, Left, Right};
+
+void checkCuda(cudaError_t status, const char* operation) {
+    if (status "'!= cudaSuccess) {
+        int rank;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        fprintf(stderr, "Rank %d: %s: %s'"\\n\", rank, operation, cudaGetErrorString(status));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
+
+#define CUDA_CHECK(call) checkCuda((call), #call)
+
+template <typename T, bool Host = false>
+class CudaBuffer {
+public:
+    explicit CudaBuffer(size_t count) {
+        if (count == 0) {
+            return;
+        }
+        if constexpr (Host) {
+            CUDA_CHECK(cudaMallocHost(&data, count * sizeof(T)));
+        } else {
+            CUDA_CHECK(cudaMalloc(&data, count * sizeof(T)));
+        }
+    }
+
+    ~CudaBuffer() {
+        if (data "'!= nullptr) {
+            if constexpr (Host) {
+                CUDA_CHECK(cudaFreeHost(data));
+            } else {
+                CUDA_CHECK(cudaFree(data));
+            }
+        }
+    }
+
+    CudaBuffer(const CudaBuffer&) = delete;
+    CudaBuffer& operator=(const CudaBuffer&) = delete;
+
+    T* data = nullptr;
+};
+
+struct Range {
+    int begin;
+    int size;
+};
+
+Range splitRange(int length, int parts, int coord) {
+    const int extra = length % parts;
+    return {coord * (length / parts) + std::min(coord, extra),
+            length / parts + (coord < extra)};
+}
+
+struct Tile {
+    Range rows;
+    Range cols;
+    int cells;
+    int faceSize[FaceCount];
+    int faceOffset[FaceCount];
+    int peer[FaceCount];
+    int haloSize = 0;
+};
+
+Tile makeTile(int side, MPI_Comm cart) {
+    int dims[2], periods[2], coords[2];
+    MPI_Cart_get(cart, 2, dims, periods, coords);
+
+    Tile tile{};
+    tile.rows = splitRange(side, dims[0], coords[0]);
+    tile.cols = splitRange(side, dims[1], coords[1]);
+    const int64_t cells = int64_t{tile.rows.size} * tile.cols.size;
+    MPI_Cart_shift(cart, 0, 1, &tile.peer[Top], &tile.peer[Bottom]);
+    MPI_Cart_shift(cart, 1, 1, &tile.peer[Left], &tile.peer[Right]);
+    for (int face = 0; face < FaceCount; ++face) {
+        tile.faceSize[face] = face < Right ? tile.cols.size : tile.rows.size;
+        tile.faceOffset[face] = tile.haloSize;
+        if (tile.peer[face] != MPI_PROC_NULL &&
+            int64_t{tile.haloSize} + tile.faceSize[face] <= INT_MAX) {
+            tile.haloSize += tile.faceSize[face];
+        } else if (tile.peer[face] != MPI_PROC_NULL) {
+            tile.haloSize = INT_MAX;
+        }
+    }
+    if (cells + tile.haloSize > INT_MAX) {
+        fprintf(stderr, "Local tile exceeds the CUDA connectivity index range. Use more MPI ranks.'"\\n\");
+        MPI_Abort(cart, 1);
+    }
+    tile.cells = static_cast<int>(cells);
+    return tile;
+}
+
+void buildConnectivity(const Tile& tile, int* deviceNeighbors) {
+    const size_t cells = tile.cells;
+    // One plane per direction keeps the index loads coalesced on the GPU.
+    std::unique_ptr<int[]> neighbors(new int[FaceCount * cells]);
+    const int rows = tile.rows.size;
+    const int cols = tile.cols.size;
+    const int threads = std::min({omp_get_max_threads(), rows,
+                                  1 + (tile.cells - 1) / 32768});
+    int ghost[FaceCount];
+    for (int face = 0; face < FaceCount; ++face) {
+        ghost[face] = tile.peer[face] == MPI_PROC_NULL ? -1 : tile.cells + tile.faceOffset[face];
+    }
+
+    #pragma omp parallel for schedule(static) num_threads(threads)
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            const int cell = row * cols + col;
+            neighbors[Bottom * cells + cell] = row + 1 < rows ? cell + cols :
+                                               ghost[Bottom] < 0 ? -1 : ghost[Bottom] + col;
+            neighbors[Top * cells + cell] = row > 0 ? cell - cols :
+                                            ghost[Top] < 0 ? -1 : ghost[Top] + col;
+            neighbors[Right * cells + cell] = col + 1 < cols ? cell + 1 :
+                                              ghost[Right] < 0 ? -1 : ghost[Right] + row;
+            neighbors[Left * cells + cell] = col > 0 ? cell - 1 :
+                                             ghost[Left] < 0 ? -1 : ghost[Left] + row;
+        }
+    }
+    CUDA_CHECK(cudaMemcpy(deviceNeighbors, neighbors.get(),
+                          FaceCount * cells * sizeof(int), cudaMemcpyHostToDevice));
+}
+
+enum class Region { Whole, Interior, Boundary };
+
+template <Region region>
+__global__ void updateCells(const int* __restrict__ neighbors,
+                            const val_t* __restrict__ energy,
+                            val_t* __restrict__ nextEnergy,
+                            val_t* __restrict__ accumulatedFlux,
+                            int rows, int cols, int count,
+                            val_t* sendRight, val_t* sendLeft) {
+    const unsigned int item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (item >= static_cast<unsigned int>(count)) {
+        return;
+    }
+
+    int cell = item;
+    if constexpr (region == Region::Interior) {
+        const int innerCols = cols - 2;
+        cell = (item / innerCols + 1) * cols + item % innerCols + 1;
+    } else if constexpr (region == Region::Boundary) {
+        if (rows > 2 && cols > 2) {
+            // The two full rows followed by the remaining cells on the two sides.
+            if (cell < 2 * cols) {
+                if (cell >= cols) {
+                    cell += (rows - 2) * cols;
+                }
+            } else {
+                const int edge = cell - 2 * cols;
+                cell = (edge / 2 + 1) * cols + (edge % 2) * (cols - 1);
+            }
+        }
+    }
+
+    const size_t cells = rows * cols;
+    const int bottom = neighbors[Bottom * cells + cell];
+    const int top = neighbors[Top * cells + cell];
+    const int right = neighbors[Right * cells + cell];
+    const int left = neighbors[Left * cells + cell];
+    const val_t current = energy[cell];
+    val_t flux = 0.0;
+    if constexpr (region "'!= Region::Interior) {
+        // All generated cells have transfer coefficient 0.8 and unit edge
+        // weights. Only global corner cells have an external energy flow.
+        if ((bottom < 0 || top < 0) && (right < 0 || left < 0)) {
+            flux = (top < 0) == (left < 0) ? 0.5 : -0.5;
+        }
+    }
+
+    const int adjacent[] = {bottom, top, right, left};
+    #pragma unroll
+    for (int face = 0; face < FaceCount; ++face) {
+        if (region == Region::Interior || adjacent[face] >= 0) {
+            // Match the original multiply and accumulation order.
+            const val_t transfer = (energy[adjacent[face]] - current) * 0.8;
+            flux = fma(transfer, 0.25, flux);
+        }
+    }
+    const val_t next = current + flux;
+    nextEnergy[cell] = next;
+    accumulatedFlux[cell] += fabs(flux);
+
+    if constexpr (region == Region::Boundary) {
+        // Pack columns as their next values are produced. Rows are contiguous.
+        if (sendRight != nullptr || sendLeft != nullptr) {
+            const int row = cell / cols;
+            const int col = cell % cols;
+            if (sendRight != nullptr && col == cols - 1) {
+                sendRight[row] = next;
+            }
+            if (sendLeft != nullptr && col == 0) {
+                sendLeft[row] = next;
+            }
+        }
+    }
+}
+
+int blocksFor(int count) {
+    return 1 + (count - 1) / BLOCK_SIZE;
+}
+
+bool cudaAwareMpi() {
+#if defined(OMPI_HAVE_MPI_EXT_CUDA) && OMPI_HAVE_MPI_EXT_CUDA
+    return MPIX_Query_cuda_support() != 0;
+#else
+    return false;
+#endif
+}
+
+val_t* runSimulation(const Tile& tile, MPI_Comm cart, int iterations, val_t* current,
+                     val_t* next, val_t* flux, const int* neighbors,
+                     val_t* sendColumns, val_t* hostSend, val_t* hostReceive,
+                     cudaStream_t compute, cudaStream_t halo) {
+    const int rows = tile.rows.size;
+    const int cols = tile.cols.size;
+    if (tile.haloSize == 0) {
+        for (int iter = 0; iter < iterations; ++iter) {
+            updateCells<Region::Whole><<<blocksFor(tile.cells), BLOCK_SIZE, 0, compute>>>(
+                neighbors, current, next, flux, rows, cols, tile.cells, nullptr, nullptr);
+            std::swap(current, next);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(compute));
+        return current;
+    }
+
+    const int interior = std::max(0, rows - 2) * std::max(0, cols - 2);
+    const int boundary = tile.cells - interior;
+    val_t* sendRight = tile.peer[Right] == MPI_PROC_NULL ? nullptr : sendColumns;
+    val_t* sendLeft = tile.peer[Left] == MPI_PROC_NULL ? nullptr : sendColumns + rows;
+    cudaEvent_t boundaryReady, interiorReady[2];
+    CUDA_CHECK(cudaEventCreateWithFlags(&boundaryReady, cudaEventDisableTiming));
+    if (interior > 0) {
+        for (auto& event : interiorReady) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        }
+    }
+
+    for (int iter = 0; iter < iterations; ++iter) {
+        MPI_Request requests[2 * FaceCount];
+        int requestCount = 0;
+        val_t* ghosts = current + tile.cells;
+        const val_t* send[] = {current + (rows - 1) * cols, current, sendRight, sendLeft};
+
+        // The initial state and its halos are already zero.
+        if (iter > 0) {
+            val_t* receive = hostReceive == nullptr ? ghosts : hostReceive;
+            for (int face = 0; face < FaceCount; ++face) {
+                if (tile.peer[face] != MPI_PROC_NULL) {
+                    MPI_Irecv(receive + tile.faceOffset[face], tile.faceSize[face], MPI_DOUBLE,
+                              tile.peer[face], opposite[face], cart, &requests[requestCount++]);
+                    if (hostSend != nullptr) {
+                        CUDA_CHECK(cudaMemcpyAsync(hostSend + tile.faceOffset[face], send[face],
+                                                  tile.faceSize[face] * sizeof(val_t),
+                                                  cudaMemcpyDeviceToHost, halo));
+                    }
+                }
+            }
+        }
+
+        if (interior > 0) {
+            if (iter > 0) {
+                CUDA_CHECK(cudaStreamWaitEvent(compute, boundaryReady, 0));
+            }
+            updateCells<Region::Interior><<<blocksFor(interior), BLOCK_SIZE, 0, compute>>>(
+                neighbors, current, next, flux, rows, cols, interior, nullptr, nullptr);
+            CUDA_CHECK(cudaEventRecord(interiorReady[iter % 2], compute));
+        }
+
+        if (iter > 0) {
+            // Only the preceding boundary update and the optional staging
+            // copies must finish before sending. The interior can keep running.
+            CUDA_CHECK(cudaStreamSynchronize(halo));
+            for (int face = 0; face < FaceCount; ++face) {
+                if (tile.peer[face] != MPI_PROC_NULL) {
+                    const val_t* data = hostSend == nullptr ? send[face] :
+                                        hostSend + tile.faceOffset[face];
+                    MPI_Isend(data, tile.faceSize[face], MPI_DOUBLE, tile.peer[face], face,
+                              cart, &requests[requestCount++]);
+                }
+            }
+            MPI_Waitall(requestCount, requests, MPI_STATUSES_IGNORE);
+            if (hostReceive != nullptr) {
+                CUDA_CHECK(cudaMemcpyAsync(ghosts, hostReceive, tile.haloSize * sizeof(val_t),
+                                          cudaMemcpyHostToDevice, halo));
+            }
+            if (interior > 0) {
+                CUDA_CHECK(cudaStreamWaitEvent(halo, interiorReady[(iter - 1) % 2], 0));
+            }
+        }
+
+        updateCells<Region::Boundary><<<blocksFor(boundary), BLOCK_SIZE, 0, halo>>>(
+            neighbors, current, next, flux, rows, cols, boundary, sendRight, sendLeft);
+        CUDA_CHECK(cudaEventRecord(boundaryReady, halo));
+        std::swap(current, next);
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(halo));
+    CUDA_CHECK(cudaStreamSynchronize(compute));
+    CUDA_CHECK(cudaEventDestroy(boundaryReady));
+    if (interior > 0) {
+        for (auto event : interiorReady) {
+            CUDA_CHECK(cudaEventDestroy(event));
+        }
+    }
+    return current;
+}
+
+struct Results {
+    uint64_t hash;
+    val_t energySum;
+    val_t fluxSum;
+    val_t energyMin;
+    val_t energyMax;
+};
+
+template <bool validate>
+struct CombineResults {
+    __host__ __device__ Results operator()(const Results& a, const Results& b) const {
+        Results result{};
+        result.hash = a.hash ''^ b.hash;
+        if constexpr (validate) {
+            result.energySum = a.energySum + b.energySum;
+            result.fluxSum = a.fluxSum + b.fluxSum;
+            result.energyMin = a.energyMin < b.energyMin ? a.energyMin : b.energyMin;
+            result.energyMax = a.energyMax > b.energyMax ? a.energyMax : b.energyMax;
+        }
+        return result;
+    }
+};
+
+template <bool validate>
+__global__ void summarize(const val_t* energy, const val_t* flux, Results* partials,
+                          int side, int rowStart, int colStart, int cols, int cells) {
+    Results local{0, 0.0, 0.0, std::numeric_limits<val_t>::max(),
+                  std::numeric_limits<val_t>::lowest()};
+    for (size_t cell = blockIdx.x * blockDim.x + threadIdx.x;
+         cell < static_cast<size_t>(cells); cell += gridDim.x * blockDim.x) {
+        const uint64_t index = (uint64_t{static_cast<unsigned int>(rowStart)} + cell / cols) *
+                               side + colStart + cell % cols;
+        const val_t e = energy[cell];
+        const val_t f = flux[cell];
+        local.hash ''^= (__double_as_longlong(e) + index) * 0x9e3779b97f4a7c15ULL;
+        local.hash ''^= (__double_as_longlong(f) + index) * 0xbf58476d1ce4e5b9ULL;
+        if constexpr (validate) {
+            local.energySum += e;
+            local.fluxSum += f;
+            local.energyMin = fmin(local.energyMin, e);
+            local.energyMax = fmax(local.energyMax, e);
+        }
+    }
+    using Reduce = cub::BlockReduce<Results, BLOCK_SIZE>;
+    __shared__ typename Reduce::TempStorage scratch;
+    const Results result = Reduce(scratch).Reduce(local, CombineResults<validate>{});
+    if (threadIdx.x == 0) {
+        partials[blockIdx.x] = result;
+    }
+}
+
+Results collectResults(const Tile& tile, int side, const val_t* energy, const val_t* flux,
+                       bool validate, int multiprocessors, MPI_Comm cart) {
+    const int blocks = std::min(4 * multiprocessors, blocksFor(tile.cells));
+    CudaBuffer<Results> devicePartials(blocks);
+    if (validate) {
+        summarize<true><<<blocks, BLOCK_SIZE>>>(energy, flux, devicePartials.data, side,
+                                                tile.rows.begin, tile.cols.begin,
+                                                tile.cols.size, tile.cells);
+    } else {
+        summarize<false><<<blocks, BLOCK_SIZE>>>(energy, flux, devicePartials.data, side,
+                                                 tile.rows.begin, tile.cols.begin,
+                                                 tile.cols.size, tile.cells);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    std::vector<Results> partials(blocks);
+    CUDA_CHECK(cudaMemcpy(partials.data(), devicePartials.data, blocks * sizeof(Results),
+                          cudaMemcpyDeviceToHost));
+    Results local{0, 0.0, 0.0, std::numeric_limits<val_t>::max(),
+                  std::numeric_limits<val_t>::lowest()};
+    for (const auto& partial : partials) {
+        local = validate ? CombineResults<true>{}(local, partial) :
+                           CombineResults<false>{}(local, partial);
+    }
+
+    Results global{};
+    MPI_Reduce(&local.hash, &global.hash, 1, MPI_UINT64_T, MPI_BXOR, 0, cart);
+    if (validate) {
+        const val_t sums[] = {local.energySum, local.fluxSum};
+        val_t globalSums[2]{};
+        MPI_Reduce(sums, globalSums, 2, MPI_DOUBLE, MPI_SUM, 0, cart);
+        global.energySum = globalSums[0];
+        global.fluxSum = globalSums[1];
+        MPI_Reduce(&local.energyMin, &global.energyMin, 1, MPI_DOUBLE, MPI_MIN, 0, cart);
+        MPI_Reduce(&local.energyMax, &global.energyMax, 1, MPI_DOUBLE, MPI_MAX, 0, cart);
+    }
+    return global;
+}
+
+bool validateResults(const Results& result) {
+    printf("Validation results:'"\\n\");
+    printf(\"  Energy sum: %.12f\\n\", result.energySum);
+    printf(\"  Flux sum: %.2f\\n\", result.fluxSum);
+    printf(\"  Energy range: [%.6f, %.6f]\\n\", result.energyMin, result.energyMax);
+
+    if ("'!std::isfinite(result.energySum)) {
+        printf("  ERROR: Energy sum is not finite'"\\n\");
+        return false;
+    }
+    if (std::abs(result.energySum) > 1e-8) {
+        printf(\"  WARNING: Energy sum diverged from 0 (expected conservation)\\n\");
+    }
+    if ("'!std::isfinite(result.fluxSum)) {
+        printf("  ERROR: Flux sum is not finite'"\\n\");
+        return false;
+    }
+    if ("'!std::isfinite(result.energyMax) || !std::isfinite(result.energyMin)) {
+        printf("  ERROR: Energy extrema are not finite'"\\n\");
+        return false;
+    }
+    printf(\"  Validation: PASSED\\n\");
+    return true;
+}
+
+// The external Kahan sum and FNV hash require the original row-major order.
+void printEnergy(const Tile& tile, const val_t* energy, int side, MPI_Comm cart, int rank) {
+    std::vector<val_t> local(tile.cells);
+    CUDA_CHECK(cudaMemcpy(local.data(), energy, tile.cells * sizeof(val_t), cudaMemcpyDeviceToHost));
+    if (rank "'!= 0) {
+        MPI_Send(local.data(), tile.cells, MPI_DOUBLE, 0, 0, cart);
+        return;
+    }
+
+    int size;
+    MPI_Comm_size(cart, &size);
+    if (size == 1) {
+        print_results(local, "ElementEnergy");
+        return;
+    }
+    std::vector<val_t> global(static_cast<size_t>(side) * side);
+    for (int row = 0; row < tile.rows.size; ++row) {
+        std::copy_n(local.data() + row * tile.cols.size, tile.cols.size,
+                    global.data() + static_cast<size_t>(row) * side);
+    }
+    int dims[2], periods[2], coords[2];
+    MPI_Cart_get(cart, 2, dims, periods, coords);
+    for (int peer = 1; peer < size; ++peer) {
+        MPI_Cart_coords(cart, peer, 2, coords);
+        const Range rows = splitRange(side, dims[0], coords[0]);
+        const Range cols = splitRange(side, dims[1], coords[1]);
+        MPI_Datatype tileType;
+        MPI_Type_vector(rows.size, cols.size, side, MPI_DOUBLE, &tileType);
+        MPI_Type_commit(&tileType);
+        MPI_Recv(global.data() + static_cast<size_t>(rows.begin) * side + cols.begin,
+                 1, tileType, peer, 0, cart, MPI_STATUS_IGNORE);
+        MPI_Type_free(&tileType);
+    }
+    print_results(global, "ElementEnergy");
+}
+
+int runBenchmark(int side, int iterations, bool validate, bool printResults,
+                 MPI_Comm cart, int rank, int localRank) {
+    int devices;
+    CUDA_CHECK(cudaGetDeviceCount(&devices));
+    if (devices == 0) {
+        fprintf(stderr, "Rank %d: no CUDA devices are visible'"\\n\", rank);
+        MPI_Abort(cart, 1);
+        return 1;
+    }
+    const int device = localRank % devices;
+    CUDA_CHECK(cudaSetDevice(device));
+    int multiprocessors;
+    CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device));
+
+    const Tile tile = makeTile(side, cart);
+    const size_t cells = static_cast<size_t>(side) * side;
+    const size_t localEnergySize = static_cast<size_t>(tile.cells) + tile.haloSize;
+    const size_t sendSize = tile.peer[Left] "'!= MPI_PROC_NULL || tile.peer[Right] != MPI_PROC_NULL ?
+                            2 * static_cast<size_t>(tile.rows.size) : 0;
+    const size_t staged = cudaAwareMpi() ? 0 : tile.haloSize;
+
+    if (rank == 0) {
+        printf("Unstructured Mesh Energy Transfer Benchmark'"\\n\");
+        printf(\"============================================\\n\");
+        printf(\"Grid size: %d x %d = %zu elements\\n\", side, side, cells);
+        printf(\"Iterations: %d\\n\", iterations);
+        printf(\"Validation: %s\\n\\n\", validate ? \"enabled\" : \"disabled\");
+        printf(\"Building unstructured mesh...\\n\");
+    }
+
+    CudaBuffer<int> neighbors(FaceCount * static_cast<size_t>(tile.cells));
+    CudaBuffer<val_t> first(localEnergySize), second(localEnergySize), flux(tile.cells);
+    CudaBuffer<val_t> sendColumns(sendSize);
+    CudaBuffer<val_t, true> hostSend(staged), hostReceive(staged);
+    buildConnectivity(tile, neighbors.data);
+    CUDA_CHECK(cudaMemset(first.data, 0, localEnergySize * sizeof(val_t)));
+    CUDA_CHECK(cudaMemset(flux.data, 0, tile.cells * sizeof(val_t)));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    const uint64_t localDynamic = (2 * localEnergySize + tile.cells + sendSize + 2 * staged) *
+                                  sizeof(val_t);
+    uint64_t dynamicBytes = 0;
+    MPI_Reduce(&localDynamic, &dynamicBytes, 1, MPI_UINT64_T, MPI_SUM, 0, cart);
+    if (rank == 0) {
+        const size_t staticBytes = cells * FaceCount * sizeof(int);
+        constexpr double mib = 1024.0 * 1024.0;
+        printf(\"Memory usage: %.2f MB (static: %.2f MB, dynamic: %.2f MB)\\n\\n\",
+               (staticBytes + dynamicBytes) / mib, staticBytes / mib, dynamicBytes / mib);
+        printf(\"Running simulation...\\n\");
+    }
+
+    cudaStream_t compute, halo;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&halo, cudaStreamNonBlocking));
+    MPI_Barrier(cart);
+    const double start = MPI_Wtime();
+    val_t* energy = runSimulation(tile, cart, iterations, first.data, second.data, flux.data,
+                                  neighbors.data, sendColumns.data, hostSend.data, hostReceive.data,
+                                  compute, halo);
+    const double localTime = MPI_Wtime() - start;
+    double seconds = 0.0;
+    MPI_Reduce(&localTime, &seconds, 1, MPI_DOUBLE, MPI_MAX, 0, cart);
+    CUDA_CHECK(cudaStreamDestroy(halo));
+    CUDA_CHECK(cudaStreamDestroy(compute));
+
+    const Results result = collectResults(tile, side, energy, flux.data, validate,
+                                          multiprocessors, cart);
+    if (rank == 0) {
+        const double ms = seconds * 1000.0;
+        const double perIteration = iterations > 0 ? ms / iterations : 0.0;
+        const double throughput = iterations > 0 && seconds > 0 ?
+                                  (static_cast<double>(cells) * iterations) / seconds / 1e9 : 0.0;
+        printf(\"Computation time: %.3f ms\\n\", ms);
+        printf(\"Performance:\\n\");
+        printf(\"  Time per iteration: %.4f ms\\n\", perIteration);
+        printf(\"  Elements/sec: %.4f GigaElements/s\\n\", throughput);
+        printf(\"  Performance: %.4f GFLOPS\\n\", throughput * 22.0);
+        printf(\"  Result hash: %016\" PRIX64 \"\\n\\n\", result.hash);
+    }
+    if (printResults) {
+        printEnergy(tile, energy, side, cart, rank);
+    }
+    return rank == 0 && validate && "'!validateResults(result) ? 1 : 0;
+}
+
+void printUsage(const char* program) {
+    printf("Usage: %s [options]'"\\n\", program);
+    printf(\"Options:\\n\");
+    printf(\"  -n <num>     Grid size (NxN elements) (default: 512)\\n\");
+    printf(\"  -i <num>     Number of simulation iterations (default: 10)\\n\");
+    printf(\"  -v           Enable validation\\n\");
+    printf(\"  -r           Print results for external validation\\n\");
+    printf(\"  -h           Show this help message\\n\");
+}
+
+bool readInt(const char* arg, int& value) {
+    char* end;
+    errno = 0;
+    const long parsed = std::strtol(arg, &end, 10);
+    if (errno "'!= 0 || end == arg || *end != '"'\\0' || parsed < INT_MIN || parsed > INT_MAX) {
+        return false;
+    }
+    value = static_cast<int>(parsed);
+    return true;
+}
+
+int main(int argc, char** argv) {
+    int provided;
+    if (MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided) "'!= MPI_SUCCESS) {
+        return 1;
+    }
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    if (provided < MPI_THREAD_FUNNELED) {
+        if (rank == 0) {
+            fprintf(stderr, "MPI_THREAD_FUNNELED is required for the OpenMP host code'"\\n\");
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    int side = 512;
+    int iterations = 10;
+    bool validate = false;
+    bool printResults = false;
+    for (int i = 1; i < argc; ++i) {
+        const char* option = argv[i];
+        if (strcmp(option, \"-v\") == 0) {
+            validate = true;
+        } else if (strcmp(option, \"-r\") == 0) {
+            printResults = true;
+        } else if (strcmp(option, \"-h\") == 0) {
+            if (rank == 0) {
+                printUsage(argv[0]);
+            }
+            MPI_Finalize();
+            return 0;
+        } else {
+            const bool gridSize = strcmp(option, \"-n\") == 0;
+            const bool iterationCount = strcmp(option, \"-i\") == 0;
+            if ((gridSize || iterationCount) && i + 1 < argc &&
+                readInt(argv[++i], gridSize ? side : iterations) && ("'!gridSize || side > 0)) {
+                continue;
+            }
+            if (rank == 0) {
+                printf("Invalid option or argument: %s'"\\n\", option);
+                printUsage(argv[0]);
+            }
+            MPI_Finalize();
+            return 1;
+        }
+    }
+
+    // Use as many nonempty tiles as possible, breaking ties toward square tiles.
+    int dims[2] = {1, 1};
+    for (int rows = 1; rows <= side && rows <= size / rows; ++rows) {
+        const int cols = std::min(side, size / rows);
+        if (rows * cols >= dims[0] * dims[1]) {
+            dims[0] = rows;
+            dims[1] = cols;
+        }
+    }
+
+    MPI_Comm node, cart;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &node);
+    int localRank;
+    MPI_Comm_rank(node, &localRank);
+    MPI_Comm_free(&node);
+    const int periods[] = {0, 0};
+    MPI_Cart_create(MPI_COMM_WORLD, 2, dims, periods, 0, &cart);
+
+    int status = 0;
+    if (cart "'!= MPI_COMM_NULL) {
+        status = runBenchmark(side, iterations, validate, printResults, cart, rank, localRank);
+        MPI_Comm_free(&cart);
+    }
+    MPI_Bcast(&status, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Finalize();
+    return status;
+}
+EOF
+build=$(mktemp -d /tmp/unstructured-build.XXXXXX) && printf '"'%s\\n' \""'$build" && cmake -S unstructured -B "$build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 && cmake --build "$build" -j' in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ exited 2 in 13189ms:
+/tmp/unstructured-build.mpfhZU
+-- The CXX compiler identification is GNU 13.2.0
+-- The CUDA compiler identification is NVIDIA 12.0.140
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Found OpenMP_CXX: -fopenmp (found version "4.5")
+-- Found OpenMP: TRUE (found version "4.5") found components: CXX
+-- Configuring done (10.1s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/unstructured-build.mpfhZU
+[ 50%] Building CUDA object CMakeFiles/unstructured.dir/unstructured.cpp.o
+/home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5/unstructured/unstructured.cpp(365): error: calling a constexpr __host__ function("max") from a __global__ function("summarize") is not allowed. The experimental flag '--expt-relaxed-constexpr' can be used to allow this.
+
+/home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5/unstructured/unstructured.cpp(366): error: calling a constexpr __host__ function("lowest") from a __global__ function("summarize") is not allowed. The experimental flag '--expt-relaxed-constexpr' can be used to allow this.
+
+2 errors detected in the compilation of "/home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5/unstructured/unstructured.cpp".
+gmake[2]: *** [CMakeFiles/unstructured.dir/build.make:77: CMakeFiles/unstructured.dir/unstructured.cpp.o] Error 1
+gmake[1]: *** [CMakeFiles/Makefile2:83: CMakeFiles/unstructured.dir/all] Error 2
+gmake: *** [Makefile:91: all] Error 2
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5/unstructured/unstructured.cpp
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 623ae7e4519d1530e3098fe9eef7f05947c26d94..7971a5e9b452897160e09f373e672316e41116d7
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -23,6 +23,7 @@
+ 
+ using val_t = double;
+ constexpr int BLOCK_SIZE = 256;
++constexpr val_t MAX_VALUE = std::numeric_limits<val_t>::max();
+ 
+ // Face order is also the original order of flux accumulation.
+ enum Face { Bottom, Top, Right, Left, FaceCount };
+@@ -100,21 +101,23 @@
+     const int64_t cells = int64_t{tile.rows.size} * tile.cols.size;
+     MPI_Cart_shift(cart, 0, 1, &tile.peer[Top], &tile.peer[Bottom]);
+     MPI_Cart_shift(cart, 1, 1, &tile.peer[Left], &tile.peer[Right]);
++    int64_t haloSize = 0;
+     for (int face = 0; face < FaceCount; ++face) {
+         tile.faceSize[face] = face < Right ? tile.cols.size : tile.rows.size;
+-        tile.faceOffset[face] = tile.haloSize;
+-        if (tile.peer[face] != MPI_PROC_NULL &&
+-            int64_t{tile.haloSize} + tile.faceSize[face] <= INT_MAX) {
+-            tile.haloSize += tile.faceSize[face];
+-        } else if (tile.peer[face] != MPI_PROC_NULL) {
+-            tile.haloSize = INT_MAX;
++        if (tile.peer[face] != MPI_PROC_NULL) {
++            tile.faceOffset[face] = static_cast<int>(haloSize);
++            haloSize += tile.faceSize[face];
++            if (cells + haloSize > INT_MAX) {
++                break;
++            }
+         }
+     }
+-    if (cells + tile.haloSize > INT_MAX) {
++    if (cells + haloSize > INT_MAX) {
+         fprintf(stderr, "Local tile exceeds the CUDA connectivity index range. Use more MPI ranks.\n");
+         MPI_Abort(cart, 1);
+     }
+     tile.cells = static_cast<int>(cells);
++    tile.haloSize = static_cast<int>(haloSize);
+     return tile;
+ }
+ 
+@@ -269,11 +272,14 @@
+         MPI_Request requests[2 * FaceCount];
+         int requestCount = 0;
+         val_t* ghosts = current + tile.cells;
++        // MPI can fill one pinned buffer while CUDA copies from the other.
++        val_t* stagedReceive = hostReceive == nullptr ? nullptr :
++                               hostReceive + static_cast<size_t>(iter % 2) * tile.haloSize;
+         const val_t* send[] = {current + (rows - 1) * cols, current, sendRight, sendLeft};
+ 
+         // The initial state and its halos are already zero.
+         if (iter > 0) {
+-            val_t* receive = hostReceive == nullptr ? ghosts : hostReceive;
++            val_t* receive = stagedReceive == nullptr ? ghosts : stagedReceive;
+             for (int face = 0; face < FaceCount; ++face) {
+                 if (tile.peer[face] != MPI_PROC_NULL) {
+                     MPI_Irecv(receive + tile.faceOffset[face], tile.faceSize[face], MPI_DOUBLE,
+@@ -309,8 +315,8 @@
+                 }
+             }
+             MPI_Waitall(requestCount, requests, MPI_STATUSES_IGNORE);
+-            if (hostReceive != nullptr) {
+-                CUDA_CHECK(cudaMemcpyAsync(ghosts, hostReceive, tile.haloSize * sizeof(val_t),
++            if (stagedReceive != nullptr) {
++                CUDA_CHECK(cudaMemcpyAsync(ghosts, stagedReceive, tile.haloSize * sizeof(val_t),
+                                           cudaMemcpyHostToDevice, halo));
+             }
+             if (interior > 0) {
+@@ -362,8 +368,7 @@
+ template <bool validate>
+ __global__ void summarize(const val_t* energy, const val_t* flux, Results* partials,
+                           int side, int rowStart, int colStart, int cols, int cells) {
+-    Results local{0, 0.0, 0.0, std::numeric_limits<val_t>::max(),
+-                  std::numeric_limits<val_t>::lowest()};
++    Results local{0, 0.0, 0.0, MAX_VALUE, -MAX_VALUE};
+     for (size_t cell = blockIdx.x * blockDim.x + threadIdx.x;
+          cell < static_cast<size_t>(cells); cell += gridDim.x * blockDim.x) {
+         const uint64_t index = (uint64_t{static_cast<unsigned int>(rowStart)} + cell / cols) *
+@@ -404,8 +409,7 @@
+     std::vector<Results> partials(blocks);
+     CUDA_CHECK(cudaMemcpy(partials.data(), devicePartials.data, blocks * sizeof(Results),
+                           cudaMemcpyDeviceToHost));
+-    Results local{0, 0.0, 0.0, std::numeric_limits<val_t>::max(),
+-                  std::numeric_limits<val_t>::lowest()};
++    Results local{0, 0.0, 0.0, MAX_VALUE, -MAX_VALUE};
+     for (const auto& partial : partials) {
+         local = validate ? CombineResults<true>{}(local, partial) :
+                            CombineResults<false>{}(local, partial);
+@@ -519,13 +523,13 @@
+     CudaBuffer<int> neighbors(FaceCount * static_cast<size_t>(tile.cells));
+     CudaBuffer<val_t> first(localEnergySize), second(localEnergySize), flux(tile.cells);
+     CudaBuffer<val_t> sendColumns(sendSize);
+-    CudaBuffer<val_t, true> hostSend(staged), hostReceive(staged);
++    CudaBuffer<val_t, true> hostSend(staged), hostReceive(2 * staged);
+     buildConnectivity(tile, neighbors.data);
+     CUDA_CHECK(cudaMemset(first.data, 0, localEnergySize * sizeof(val_t)));
+     CUDA_CHECK(cudaMemset(flux.data, 0, tile.cells * sizeof(val_t)));
+     CUDA_CHECK(cudaDeviceSynchronize());
+ 
+-    const uint64_t localDynamic = (2 * localEnergySize + tile.cells + sendSize + 2 * staged) *
++    const uint64_t localDynamic = (2 * localEnergySize + tile.cells + sendSize + 3 * staged) *
+                                   sizeof(val_t);
+     uint64_t dynamicBytes = 0;
+     MPI_Reduce(&localDynamic, &dynamicBytes, 1, MPI_UINT64_T, MPI_SUM, 0, cart);
+
+exec
+/bin/bash -lc 'cmake --build /tmp/unstructured-build.mpfhZU -j' in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 6031ms:
+[ 50%] Building CUDA object CMakeFiles/unstructured.dir/unstructured.cpp.o
+[100%] Linking CUDA executable unstructured
+[100%] Built target unstructured
+
+exec
+/bin/bash -lc "ompi_info --parsable --all | rg 'mpi_built_with_cuda_support|pml:ucx' | head -20; ls /usr/bin/compute-sanitizer /usr/local/cuda/bin/compute-sanitizer; nproc; id" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 159ms:
+mca:pml:ucx:version:"mca:2.1.0"
+mca:pml:ucx:version:"api:2.0.0"
+mca:pml:ucx:version:"component:4.1.6"
+mca:opal:base:param:opal_built_with_cuda_support:synonym:name:mpi_built_with_cuda_support
+mca:mpi:base:param:mpi_built_with_cuda_support:value:false
+mca:mpi:base:param:mpi_built_with_cuda_support:source:default
+mca:mpi:base:param:mpi_built_with_cuda_support:status:read-only
+mca:mpi:base:param:mpi_built_with_cuda_support:level:4
+mca:mpi:base:param:mpi_built_with_cuda_support:help:Whether CUDA GPU buffer support is built into library or not
+mca:mpi:base:param:mpi_built_with_cuda_support:enumerator:value:0:false
+mca:mpi:base:param:mpi_built_with_cuda_support:enumerator:value:1:true
+mca:mpi:base:param:mpi_built_with_cuda_support:deprecated:no
+mca:mpi:base:param:mpi_built_with_cuda_support:type:bool
+mca:mpi:base:param:mpi_built_with_cuda_support:synonym_of:name:opal_built_with_cuda_support
+mca:mpi:base:param:mpi_built_with_cuda_support:disabled:false
+mca:pml:ucx:param:pml_ucx_priority:value:51
+mca:pml:ucx:param:pml_ucx_priority:source:default
+mca:pml:ucx:param:pml_ucx_priority:status:read-only
+mca:pml:ucx:param:pml_ucx_priority:level:3
+mca:pml:ucx:param:pml_ucx_priority:help:Priority of the UCX component
+/usr/bin/compute-sanitizer
+/usr/local/cuda/bin/compute-sanitizer
+256
+uid=4002(llmtest) gid=100(users) groups=100(users)
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+import os, subprocess
+ref='/tmp/unstructured-reference.1tGimp/unstructured'
+gpu='/tmp/unstructured-build.mpfhZU/unstructured'
+env=dict(os.environ, OMP_NUM_THREADS='4')
+for ranks,n,i in [(1,1,0),(1,1,10),(1,2,31),(1,17,1000),(1,513,31),(2,2,47),(2,3,30),(2,513,257),(3,3,16),(3,127,43),(4,1,10),(4,2,43),(4,3,120),(4,5,29),(4,513,128),(4,1024,10),(6,2,4),(6,9,71)]:
+    args=['-n',str(n),'-i',str(i),'-r','-v']
+    expected=subprocess.check_output([ref,*args],text=True)
+    actual=subprocess.check_output(['mpiexec','--bind-to','none','-n',str(ranks),gpu,*args],text=True,env=env,timeout=30)
+    extract=lambda output: output.split('Result hash: ')[1].split('Validation results:')[0]
+    assert extract(actual)==extract(expected),(ranks,n,i,extract(actual),extract(expected))
+    assert 'Validation: PASSED' in actual
+    print(f'{ranks} rank(s), {n}x{n}, {i} iterations: matching result hashes and external output', flush=True)
+PY" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+exec
+/bin/bash -lc "ls /opt; ldd /tmp/unstructured-build.mpfhZU/unstructured | rg 'lib(gomp|mpi|cuda)'; rg --files unstructured" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 0ms:
+intel
+nvidia
+rocm
+rocm-4.5.0
+	libmpi.so.40 => /lib/x86_64-linux-gnu/libmpi.so.40 (0x00007a5dfa2b1000)
+	libgomp.so.1 => /lib/x86_64-linux-gnu/libgomp.so.1 (0x00007a5dfa25a000)
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+
+exec
+/bin/bash -lc 'build=$(mktemp -d /tmp/unstructured-default.XXXXXX) && printf '"'%s\\n' \""'$build" && cmake -S unstructured -B "$build" && cmake --build "$build" -j' in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+exec
+/bin/bash -lc "ls -la /opt/nvidia /opt/intel; rg --files /opt/nvidia /opt/intel -g 'mpirun' -g 'libmpi.so*' -g 'mpi-ext.h' | head -30" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 0ms:
+/opt/intel:
+total 28
+drwxr-xr-x  7 nobody nogroup 4096 Dec 29  2024 .
+drwxr-xr-x  5 nobody nogroup 4096 Oct  3  2024 ..
+drwxr-xr-x  3 nobody nogroup 4096 Jan 11  2024 clcpuexp-2023.16.10.0.17
+drwxr-xr-x  3 nobody nogroup 4096 Jan 11  2024 fpgaemu-2023.16.10.0.17
+drwxr-xr-x 27 nobody nogroup 4096 Dec 29  2024 oneapi
+drwxr-sr-x  5 nobody nogroup 4096 May 25  2023 oneapi-tbb-2021.10.0
+drwxr-xr-x  3 nobody nogroup 4096 Dec 29  2024 packagemanager
+
+/opt/nvidia:
+total 16
+drwxr-xr-x 4 nobody nogroup 4096 Oct  3  2024 .
+drwxr-xr-x 5 nobody nogroup 4096 Oct  3  2024 ..
+drwxr-xr-x 3 nobody nogroup 4096 Oct  3  2024 nsight-compute
+drwxr-xr-x 3 nobody nogroup 4096 Oct  3  2024 nsight-systems
+/opt/intel/oneapi/mpi/2021.14/lib/mpi/debug/libmpi.so.12.0.0
+/opt/intel/oneapi/mpi/2021.14/lib/libmpi.so.12.0.0
+/opt/intel/oneapi/mpi/2021.14/bin/mpirun
+
+ succeeded in 12776ms:
+/tmp/unstructured-default.ud9KaQ
+-- The CXX compiler identification is GNU 13.2.0
+-- The CUDA compiler identification is NVIDIA 12.0.140
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Found MPI_CXX: /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Found OpenMP_CXX: -fopenmp (found version "4.5")
+-- Found OpenMP: TRUE (found version "4.5") found components: CXX
+-- Configuring done (6.8s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/unstructured-default.ud9KaQ
+[ 50%] Building CUDA object CMakeFiles/unstructured.dir/unstructured.cpp.o
+[100%] Linking CUDA executable unstructured
+[100%] Built target unstructured
+
+codex
+The CUDA build is working. Serial-reference comparisons have matched both hashes and the `-r` output across the cases tested so far, including uneven tiles and grids smaller than the rank count. The local MPI build lacks CUDA-aware transport, so these runs exercise the pinned-memory exchange path.
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5/unstructured/unstructured.cpp
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 623ae7e4519d1530e3098fe9eef7f05947c26d94..0bce249d9274cef6a8808f13f0145c06b4e8b4be
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -23,6 +23,7 @@
+ 
+ using val_t = double;
+ constexpr int BLOCK_SIZE = 256;
++constexpr val_t MAX_VALUE = std::numeric_limits<val_t>::max();
+ 
+ // Face order is also the original order of flux accumulation.
+ enum Face { Bottom, Top, Right, Left, FaceCount };
+@@ -100,21 +101,23 @@
+     const int64_t cells = int64_t{tile.rows.size} * tile.cols.size;
+     MPI_Cart_shift(cart, 0, 1, &tile.peer[Top], &tile.peer[Bottom]);
+     MPI_Cart_shift(cart, 1, 1, &tile.peer[Left], &tile.peer[Right]);
++    int64_t haloSize = 0;
+     for (int face = 0; face < FaceCount; ++face) {
+         tile.faceSize[face] = face < Right ? tile.cols.size : tile.rows.size;
+-        tile.faceOffset[face] = tile.haloSize;
+-        if (tile.peer[face] != MPI_PROC_NULL &&
+-            int64_t{tile.haloSize} + tile.faceSize[face] <= INT_MAX) {
+-            tile.haloSize += tile.faceSize[face];
+-        } else if (tile.peer[face] != MPI_PROC_NULL) {
+-            tile.haloSize = INT_MAX;
++        if (tile.peer[face] != MPI_PROC_NULL) {
++            tile.faceOffset[face] = static_cast<int>(haloSize);
++            haloSize += tile.faceSize[face];
++            if (cells + haloSize > INT_MAX) {
++                break;
++            }
+         }
+     }
+-    if (cells + tile.haloSize > INT_MAX) {
++    if (cells + haloSize > INT_MAX) {
+         fprintf(stderr, "Local tile exceeds the CUDA connectivity index range. Use more MPI ranks.\n");
+         MPI_Abort(cart, 1);
+     }
+     tile.cells = static_cast<int>(cells);
++    tile.haloSize = static_cast<int>(haloSize);
+     return tile;
+ }
+ 
+@@ -269,11 +272,14 @@
+         MPI_Request requests[2 * FaceCount];
+         int requestCount = 0;
+         val_t* ghosts = current + tile.cells;
++        // MPI can fill one pinned buffer while CUDA copies from the other.
++        val_t* stagedReceive = hostReceive == nullptr ? nullptr :
++                               hostReceive + static_cast<size_t>(iter % 2) * tile.haloSize;
+         const val_t* send[] = {current + (rows - 1) * cols, current, sendRight, sendLeft};
+ 
+         // The initial state and its halos are already zero.
+         if (iter > 0) {
+-            val_t* receive = hostReceive == nullptr ? ghosts : hostReceive;
++            val_t* receive = stagedReceive == nullptr ? ghosts : stagedReceive;
+             for (int face = 0; face < FaceCount; ++face) {
+                 if (tile.peer[face] != MPI_PROC_NULL) {
+                     MPI_Irecv(receive + tile.faceOffset[face], tile.faceSize[face], MPI_DOUBLE,
+@@ -309,8 +315,8 @@
+                 }
+             }
+             MPI_Waitall(requestCount, requests, MPI_STATUSES_IGNORE);
+-            if (hostReceive != nullptr) {
+-                CUDA_CHECK(cudaMemcpyAsync(ghosts, hostReceive, tile.haloSize * sizeof(val_t),
++            if (stagedReceive != nullptr) {
++                CUDA_CHECK(cudaMemcpyAsync(ghosts, stagedReceive, tile.haloSize * sizeof(val_t),
+                                           cudaMemcpyHostToDevice, halo));
+             }
+             if (interior > 0) {
+@@ -362,12 +368,11 @@
+ template <bool validate>
+ __global__ void summarize(const val_t* energy, const val_t* flux, Results* partials,
+                           int side, int rowStart, int colStart, int cols, int cells) {
+-    Results local{0, 0.0, 0.0, std::numeric_limits<val_t>::max(),
+-                  std::numeric_limits<val_t>::lowest()};
+-    for (size_t cell = blockIdx.x * blockDim.x + threadIdx.x;
+-         cell < static_cast<size_t>(cells); cell += gridDim.x * blockDim.x) {
+-        const uint64_t index = (uint64_t{static_cast<unsigned int>(rowStart)} + cell / cols) *
+-                               side + colStart + cell % cols;
++    Results local{0, 0.0, 0.0, MAX_VALUE, -MAX_VALUE};
++    for (unsigned int cell = blockIdx.x * blockDim.x + threadIdx.x;
++         cell < static_cast<unsigned int>(cells); cell += gridDim.x * blockDim.x) {
++        const uint64_t row = rowStart + cell / cols;
++        const uint64_t index = row * side + colStart + cell % cols;
+         const val_t e = energy[cell];
+         const val_t f = flux[cell];
+         local.hash ^= (__double_as_longlong(e) + index) * 0x9e3779b97f4a7c15ULL;
+@@ -404,8 +409,7 @@
+     std::vector<Results> partials(blocks);
+     CUDA_CHECK(cudaMemcpy(partials.data(), devicePartials.data, blocks * sizeof(Results),
+                           cudaMemcpyDeviceToHost));
+-    Results local{0, 0.0, 0.0, std::numeric_limits<val_t>::max(),
+-                  std::numeric_limits<val_t>::lowest()};
++    Results local{0, 0.0, 0.0, MAX_VALUE, -MAX_VALUE};
+     for (const auto& partial : partials) {
+         local = validate ? CombineResults<true>{}(local, partial) :
+                            CombineResults<false>{}(local, partial);
+@@ -519,13 +523,13 @@
+     CudaBuffer<int> neighbors(FaceCount * static_cast<size_t>(tile.cells));
+     CudaBuffer<val_t> first(localEnergySize), second(localEnergySize), flux(tile.cells);
+     CudaBuffer<val_t> sendColumns(sendSize);
+-    CudaBuffer<val_t, true> hostSend(staged), hostReceive(staged);
++    CudaBuffer<val_t, true> hostSend(staged), hostReceive(2 * staged);
+     buildConnectivity(tile, neighbors.data);
+     CUDA_CHECK(cudaMemset(first.data, 0, localEnergySize * sizeof(val_t)));
+     CUDA_CHECK(cudaMemset(flux.data, 0, tile.cells * sizeof(val_t)));
+     CUDA_CHECK(cudaDeviceSynchronize());
+ 
+-    const uint64_t localDynamic = (2 * localEnergySize + tile.cells + sendSize + 2 * staged) *
++    const uint64_t localDynamic = (2 * localEnergySize + tile.cells + sendSize + 3 * staged) *
+                                   sizeof(val_t);
+     uint64_t dynamicBytes = 0;
+     MPI_Reduce(&localDynamic, &dynamicBytes, 1, MPI_UINT64_T, MPI_SUM, 0, cart);
+@@ -641,12 +645,13 @@
+     }
+ 
+     // Use as many nonempty tiles as possible, breaking ties toward square tiles.
++    // Prefer more row partitions when the dimensions differ: row halos are contiguous.
+     int dims[2] = {1, 1};
+     for (int rows = 1; rows <= side && rows <= size / rows; ++rows) {
+         const int cols = std::min(side, size / rows);
+         if (rows * cols >= dims[0] * dims[1]) {
+-            dims[0] = rows;
+-            dims[1] = cols;
++            dims[0] = cols;
++            dims[1] = rows;
+         }
+     }
+ 
+
+exec
+/bin/bash -lc 'cmake --build /tmp/unstructured-build.mpfhZU -j' in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 6057ms:
+[ 50%] Building CUDA object CMakeFiles/unstructured.dir/unstructured.cpp.o
+[100%] Linking CUDA executable unstructured
+[100%] Built target unstructured
+
+ succeeded in 99687ms:
+1 rank(s), 1x1, 0 iterations: matching result hashes and external output
+1 rank(s), 1x1, 10 iterations: matching result hashes and external output
+1 rank(s), 2x2, 31 iterations: matching result hashes and external output
+1 rank(s), 17x17, 1000 iterations: matching result hashes and external output
+1 rank(s), 513x513, 31 iterations: matching result hashes and external output
+2 rank(s), 2x2, 47 iterations: matching result hashes and external output
+2 rank(s), 3x3, 30 iterations: matching result hashes and external output
+2 rank(s), 513x513, 257 iterations: matching result hashes and external output
+3 rank(s), 3x3, 16 iterations: matching result hashes and external output
+3 rank(s), 127x127, 43 iterations: matching result hashes and external output
+4 rank(s), 1x1, 10 iterations: matching result hashes and external output
+4 rank(s), 2x2, 43 iterations: matching result hashes and external output
+4 rank(s), 3x3, 120 iterations: matching result hashes and external output
+4 rank(s), 5x5, 29 iterations: matching result hashes and external output
+4 rank(s), 513x513, 128 iterations: matching result hashes and external output
+4 rank(s), 1024x1024, 10 iterations: matching result hashes and external output
+6 rank(s), 2x2, 4 iterations: matching result hashes and external output
+6 rank(s), 9x9, 71 iterations: matching result hashes and external output
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+import os, re, statistics, subprocess
+gpu = '/tmp/unstructured-build.mpfhZU/unstructured'
+ref = '/tmp/unstructured-reference.1tGimp/unstructured'
+env = dict(os.environ, OMP_NUM_THREADS='4')
+for ranks,n,i in [(1,513,31),(2,513,257),(3,127,43),(4,3,120),(4,513,128),(6,2,4),(6,9,71),(4,127,0),(4,127,-1)]:
+    args = ['-n',str(n),'-i',str(i),'-r','-v']
+    expected = subprocess.check_output([ref,*args],text=True)
+    actual = subprocess.check_output(['mpiexec','--bind-to','none','-n',str(ranks),gpu,*args],text=True,env=env,timeout=30)
+    extract=lambda output: output.split('Result hash: ')[1].split('Validation results:')[0]
+    assert extract(actual)==extract(expected),(ranks,n,i,extract(actual),extract(expected))
+    assert 'Validation: PASSED' in actual
+    assert actual.count('Unstructured Mesh Energy Transfer Benchmark')==1
+    print(f'Correctness: {ranks} rank(s), {n}x{n}, {i} iterations',flush=True)
+times = {}
+hashes = set()
+for ranks in (1,2,4):
+    samples = []
+    for trial in range(3):
+        output = subprocess.check_output(['mpiexec','--bind-to','none','-n',str(ranks),gpu,'-n','8192','-i','100'],text=True,env=env,timeout=60)
+        samples.append(float(re.search(r'Computation time: ([.0-9]+) ms',output)[1]))
+        hashes.add(re.search(r'Result hash: ([A-Z0-9]+)',output)[1])
+    times[ranks] = statistics.median(samples)
+    print(f'Scaling: {ranks} rank(s), 8192x8192, 100 iterations: {samples} ms, median {times[ranks]} ms',flush=True)
+assert len(hashes)==1,hashes
+PY" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+exec
+/bin/bash -lc "compute-sanitizer --version; rg -n '"'^(void|int|bool|Tile|Range|Results|val_t'"\\*) |#pragma omp|add_executable' unstructured" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 0ms:
+NVIDIA (R) Compute Sanitizer
+Copyright (c) 2020-2023 NVIDIA Corporation
+Version 2022.4.1
+unstructured/CMakeLists.txt:8:add_executable(unstructured unstructured.cpp)
+unstructured/unstructured.cpp:32:void checkCuda(cudaError_t status, const char* operation) {
+unstructured/unstructured.cpp:78:Range splitRange(int length, int parts, int coord) {
+unstructured/unstructured.cpp:94:Tile makeTile(int side, MPI_Comm cart) {
+unstructured/unstructured.cpp:124:void buildConnectivity(const Tile& tile, int* deviceNeighbors) {
+unstructured/unstructured.cpp:137:    #pragma omp parallel for schedule(static) num_threads(threads)
+unstructured/unstructured.cpp:230:int blocksFor(int count) {
+unstructured/unstructured.cpp:234:bool cudaAwareMpi() {
+unstructured/unstructured.cpp:242:val_t* runSimulation(const Tile& tile, MPI_Comm cart, int iterations, val_t* current,
+unstructured/unstructured.cpp:395:Results collectResults(const Tile& tile, int side, const val_t* energy, const val_t* flux,
+unstructured/unstructured.cpp:432:bool validateResults(const Results& result) {
+unstructured/unstructured.cpp:458:void printEnergy(const Tile& tile, const val_t* energy, int side, MPI_Comm cart, int rank) {
+unstructured/unstructured.cpp:493:int runBenchmark(int side, int iterations, bool validate, bool printResults,
+unstructured/unstructured.cpp:578:void printUsage(const char* program) {
+unstructured/unstructured.cpp:588:bool readInt(const char* arg, int& value) {
+unstructured/unstructured.cpp:599:int main(int argc, char** argv) {
+
+exec
+/bin/bash -lc 'cmake --build /tmp/unstructured-default.ud9KaQ -j && /tmp/unstructured-default.ud9KaQ/unstructured -h' in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 9965ms:
+[ 50%] Building CUDA object CMakeFiles/unstructured.dir/unstructured.cpp.o
+[100%] Linking CUDA executable unstructured
+[100%] Built target unstructured
+Usage: /tmp/unstructured-default.ud9KaQ/unstructured [options]
+Options:
+  -n <num>     Grid size (NxN elements) (default: 512)
+  -i <num>     Number of simulation iterations (default: 10)
+  -v           Enable validation
+  -r           Print results for external validation
+  -h           Show this help message
+
+exec
+/bin/bash -lc "CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=2 /tmp/unstructured-default.ud9KaQ/unstructured -n 17 -i 10 -v | rg 'Grid size|Result hash|Validation:'" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 3151ms:
+Grid size: 17 x 17 = 289 elements
+Validation: enabled
+  Result hash: A6CDD02C0E3150A0
+  Validation: PASSED
+
+codex
+The correctness checks passed through six MPI ranks, including zero-iteration runs. On the 8192 × 8192 case, two GPUs cut the median simulation time from 394 ms to 203 ms. The four-GPU runs are in progress.
+ succeeded in 106378ms:
+Correctness: 1 rank(s), 513x513, 31 iterations
+Correctness: 2 rank(s), 513x513, 257 iterations
+Correctness: 3 rank(s), 127x127, 43 iterations
+Correctness: 4 rank(s), 3x3, 120 iterations
+Correctness: 4 rank(s), 513x513, 128 iterations
+Correctness: 6 rank(s), 2x2, 4 iterations
+Correctness: 6 rank(s), 9x9, 71 iterations
+Correctness: 4 rank(s), 127x127, 0 iterations
+Correctness: 4 rank(s), 127x127, -1 iterations
+Scaling: 1 rank(s), 8192x8192, 100 iterations: [394.049, 394.003, 396.169] ms, median 394.049 ms
+Scaling: 2 rank(s), 8192x8192, 100 iterations: [203.342, 203.022, 203.288] ms, median 203.288 ms
+Scaling: 4 rank(s), 8192x8192, 100 iterations: [102.588, 102.543, 102.648] ms, median 102.588 ms
+
+apply patch
+patch: completed
+/home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5/unstructured/unstructured.cpp
+diff --git a/unstructured/unstructured.cpp b/unstructured/unstructured.cpp
+index 623ae7e4519d1530e3098fe9eef7f05947c26d94..9d2c2c730dfd1cd438433dfc207a9ca0bb610225
+--- a/unstructured/unstructured.cpp
++++ b/unstructured/unstructured.cpp
+@@ -15,6 +15,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <exception>
+ #include <limits>
+ #include <memory>
+ #include <vector>
+@@ -23,6 +24,7 @@
+ 
+ using val_t = double;
+ constexpr int BLOCK_SIZE = 256;
++constexpr val_t MAX_VALUE = std::numeric_limits<val_t>::max();
+ 
+ // Face order is also the original order of flux accumulation.
+ enum Face { Bottom, Top, Right, Left, FaceCount };
+@@ -100,21 +102,23 @@
+     const int64_t cells = int64_t{tile.rows.size} * tile.cols.size;
+     MPI_Cart_shift(cart, 0, 1, &tile.peer[Top], &tile.peer[Bottom]);
+     MPI_Cart_shift(cart, 1, 1, &tile.peer[Left], &tile.peer[Right]);
++    int64_t haloSize = 0;
+     for (int face = 0; face < FaceCount; ++face) {
+         tile.faceSize[face] = face < Right ? tile.cols.size : tile.rows.size;
+-        tile.faceOffset[face] = tile.haloSize;
+-        if (tile.peer[face] != MPI_PROC_NULL &&
+-            int64_t{tile.haloSize} + tile.faceSize[face] <= INT_MAX) {
+-            tile.haloSize += tile.faceSize[face];
+-        } else if (tile.peer[face] != MPI_PROC_NULL) {
+-            tile.haloSize = INT_MAX;
++        if (tile.peer[face] != MPI_PROC_NULL) {
++            tile.faceOffset[face] = static_cast<int>(haloSize);
++            haloSize += tile.faceSize[face];
++            if (cells + haloSize > INT_MAX) {
++                break;
++            }
+         }
+     }
+-    if (cells + tile.haloSize > INT_MAX) {
++    if (cells + haloSize > INT_MAX) {
+         fprintf(stderr, "Local tile exceeds the CUDA connectivity index range. Use more MPI ranks.\n");
+-        MPI_Abort(cart, 1);
++        MPI_Abort(MPI_COMM_WORLD, 1);
+     }
+     tile.cells = static_cast<int>(cells);
++    tile.haloSize = static_cast<int>(haloSize);
+     return tile;
+ }
+ 
+@@ -269,11 +273,14 @@
+         MPI_Request requests[2 * FaceCount];
+         int requestCount = 0;
+         val_t* ghosts = current + tile.cells;
++        // MPI can fill one pinned buffer while CUDA copies from the other.
++        val_t* stagedReceive = hostReceive == nullptr ? nullptr :
++                               hostReceive + static_cast<size_t>(iter % 2) * tile.haloSize;
+         const val_t* send[] = {current + (rows - 1) * cols, current, sendRight, sendLeft};
+ 
+         // The initial state and its halos are already zero.
+         if (iter > 0) {
+-            val_t* receive = hostReceive == nullptr ? ghosts : hostReceive;
++            val_t* receive = stagedReceive == nullptr ? ghosts : stagedReceive;
+             for (int face = 0; face < FaceCount; ++face) {
+                 if (tile.peer[face] != MPI_PROC_NULL) {
+                     MPI_Irecv(receive + tile.faceOffset[face], tile.faceSize[face], MPI_DOUBLE,
+@@ -309,8 +316,8 @@
+                 }
+             }
+             MPI_Waitall(requestCount, requests, MPI_STATUSES_IGNORE);
+-            if (hostReceive != nullptr) {
+-                CUDA_CHECK(cudaMemcpyAsync(ghosts, hostReceive, tile.haloSize * sizeof(val_t),
++            if (stagedReceive != nullptr) {
++                CUDA_CHECK(cudaMemcpyAsync(ghosts, stagedReceive, tile.haloSize * sizeof(val_t),
+                                           cudaMemcpyHostToDevice, halo));
+             }
+             if (interior > 0) {
+@@ -362,12 +369,11 @@
+ template <bool validate>
+ __global__ void summarize(const val_t* energy, const val_t* flux, Results* partials,
+                           int side, int rowStart, int colStart, int cols, int cells) {
+-    Results local{0, 0.0, 0.0, std::numeric_limits<val_t>::max(),
+-                  std::numeric_limits<val_t>::lowest()};
+-    for (size_t cell = blockIdx.x * blockDim.x + threadIdx.x;
+-         cell < static_cast<size_t>(cells); cell += gridDim.x * blockDim.x) {
+-        const uint64_t index = (uint64_t{static_cast<unsigned int>(rowStart)} + cell / cols) *
+-                               side + colStart + cell % cols;
++    Results local{0, 0.0, 0.0, MAX_VALUE, -MAX_VALUE};
++    for (unsigned int cell = blockIdx.x * blockDim.x + threadIdx.x;
++         cell < static_cast<unsigned int>(cells); cell += gridDim.x * blockDim.x) {
++        const uint64_t row = rowStart + cell / cols;
++        const uint64_t index = row * side + colStart + cell % cols;
+         const val_t e = energy[cell];
+         const val_t f = flux[cell];
+         local.hash ^= (__double_as_longlong(e) + index) * 0x9e3779b97f4a7c15ULL;
+@@ -404,8 +410,7 @@
+     std::vector<Results> partials(blocks);
+     CUDA_CHECK(cudaMemcpy(partials.data(), devicePartials.data, blocks * sizeof(Results),
+                           cudaMemcpyDeviceToHost));
+-    Results local{0, 0.0, 0.0, std::numeric_limits<val_t>::max(),
+-                  std::numeric_limits<val_t>::lowest()};
++    Results local{0, 0.0, 0.0, MAX_VALUE, -MAX_VALUE};
+     for (const auto& partial : partials) {
+         local = validate ? CombineResults<true>{}(local, partial) :
+                            CombineResults<false>{}(local, partial);
+@@ -492,7 +497,7 @@
+     CUDA_CHECK(cudaGetDeviceCount(&devices));
+     if (devices == 0) {
+         fprintf(stderr, "Rank %d: no CUDA devices are visible\n", rank);
+-        MPI_Abort(cart, 1);
++        MPI_Abort(MPI_COMM_WORLD, 1);
+         return 1;
+     }
+     const int device = localRank % devices;
+@@ -519,13 +524,13 @@
+     CudaBuffer<int> neighbors(FaceCount * static_cast<size_t>(tile.cells));
+     CudaBuffer<val_t> first(localEnergySize), second(localEnergySize), flux(tile.cells);
+     CudaBuffer<val_t> sendColumns(sendSize);
+-    CudaBuffer<val_t, true> hostSend(staged), hostReceive(staged);
++    CudaBuffer<val_t, true> hostSend(staged), hostReceive(2 * staged);
+     buildConnectivity(tile, neighbors.data);
+     CUDA_CHECK(cudaMemset(first.data, 0, localEnergySize * sizeof(val_t)));
+     CUDA_CHECK(cudaMemset(flux.data, 0, tile.cells * sizeof(val_t)));
+     CUDA_CHECK(cudaDeviceSynchronize());
+ 
+-    const uint64_t localDynamic = (2 * localEnergySize + tile.cells + sendSize + 2 * staged) *
++    const uint64_t localDynamic = (2 * localEnergySize + tile.cells + sendSize + 3 * staged) *
+                                   sizeof(val_t);
+     uint64_t dynamicBytes = 0;
+     MPI_Reduce(&localDynamic, &dynamicBytes, 1, MPI_UINT64_T, MPI_SUM, 0, cart);
+@@ -641,12 +646,13 @@
+     }
+ 
+     // Use as many nonempty tiles as possible, breaking ties toward square tiles.
++    // Prefer more row partitions when the dimensions differ: row halos are contiguous.
+     int dims[2] = {1, 1};
+     for (int rows = 1; rows <= side && rows <= size / rows; ++rows) {
+         const int cols = std::min(side, size / rows);
+         if (rows * cols >= dims[0] * dims[1]) {
+-            dims[0] = rows;
+-            dims[1] = cols;
++            dims[0] = cols;
++            dims[1] = rows;
+         }
+     }
+ 
+@@ -660,7 +666,12 @@
+ 
+     int status = 0;
+     if (cart != MPI_COMM_NULL) {
+-        status = runBenchmark(side, iterations, validate, printResults, cart, rank, localRank);
++        try {
++            status = runBenchmark(side, iterations, validate, printResults, cart, rank, localRank);
++        } catch (const std::exception& error) {
++            fprintf(stderr, "Rank %d: %s\n", rank, error.what());
++            MPI_Abort(MPI_COMM_WORLD, 1);
++        }
+         MPI_Comm_free(&cart);
+     }
+     MPI_Bcast(&status, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+exec
+/bin/bash -lc 'cmake --build /tmp/unstructured-build.mpfhZU -j && OMP_NUM_THREADS=2 mpiexec --bind-to none -n 4 /usr/local/cuda/bin/compute-sanitizer --tool memcheck --error-exitcode 99 /tmp/unstructured-build.mpfhZU/unstructured -n 67 -i 29 -r -v' in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+exec
+/bin/bash -lc "/tmp/unstructured-reference.1tGimp/unstructured -n 67 -i 29 -r -v | rg 'Result hash|Hash:|Validation:'; rg --files unstructured" in /home/llmtest/evals/20261123-155235/unstructured_gpt-6.2-sol-medium_hybrid_r5
+ succeeded in 0ms:
+Validation: enabled
+  Result hash: BBA3342F4FE842A0
+Hash: 0ef362978626d1d5
+  Validation: PASSED
+unstructured/CMakeLists.txt
+unstructured/unstructured.cpp
+
+ succeeded in 12434ms:
+[ 50%] Building CUDA object CMakeFiles/unstructured.dir/unstructured.cpp.o
+[100%] Linking CUDA executable unstructured
+[100%] Built target unstructured
+========= COMPUTE-SANITIZER
+========= COMPUTE-SANITIZER
+========= COMPUTE-SANITIZER
+========= COMPUTE-SANITIZER
+Unstructured Mesh Energy Transfer Benchmark
+============================================
+Grid size: 67 x 67 = 4489 elements
+Iterations: 29
+Validation: enabled
+
+Building unstructured mesh...
+Memory usage: 0.18 MB (static: 0.07 MB, dynamic: 0.12 MB)
+
+Running simulation...
+Computation time: 8.715 ms
+Performance:
+  Time per iteration: 0.3005 ms
+  Elements/sec: 0.0149 GigaElements/s
+  Performance: 0.3286 GFLOPS
+  Result hash: BBA3342F4FE842A0
+
+=== RESULTS ===
+Name: ElementEnergy
+Elements: 4489
+Sum: 0.00000000000000000e+00
+Min: -2.60066992361961802e+00
+Max: 2.60066992361961802e+00
+Sample[0]: 2.60066992361961802e+00
+Sample[1122]: 0.00000000000000000e+00
+Sample[2244]: 0.00000000000000000e+00
+Sample[3366]: 0.00000000000000000e+00
+Sample[4488]: 2.60066992361961802e+00
+Hash: 0ef362978626d1d5
+=== END RESULTS ===
+Validation results:
+  Energy sum: 0.000000000000
+  Flux sum: 58.00
+  Energy range: [-2.600670, 2.600670]
+  Validation: PASSED
+========= ERROR SUMMARY: 0 errors
+========= ERROR SUMMARY: 0 errors
+========= ERROR SUMMARY: 0 errors
+========= ERROR SUMMARY: 0 errors
+
+codex
+`unstructured` now requires MPI, OpenMP, and CUDA. MPI partitions the mesh into 2D tiles, OpenMP builds each rank’s connectivity, and CUDA overlaps interior updates with halo exchange. Only the two existing files in `unstructured/` were edited.
+
+The result hashes and ordered `-r` output matched the serial reference across runs with up to six MPI ranks. CUDA Compute Sanitizer reported zero errors in a four-rank run.
+
+On one node with RTX 3090 GPUs, the 8192 × 8192 benchmark over 100 iterations took **394 ms on one GPU, 203 ms on two, and 103 ms on four**, a **3.84× speedup**. These measurements used pinned-host halo exchange. CUDA-aware MPI transport and multi-node scaling remain unverified.
+tokens used
+114,939
+`unstructured` now requires MPI, OpenMP, and CUDA. MPI partitions the mesh into 2D tiles, OpenMP builds each rank’s connectivity, and CUDA overlaps interior updates with halo exchange. Only the two existing files in `unstructured/` were edited.
+
+The result hashes and ordered `-r` output matched the serial reference across runs with up to six MPI ranks. CUDA Compute Sanitizer reported zero errors in a four-rank run.
+
+On one node with RTX 3090 GPUs, the 8192 × 8192 benchmark over 100 iterations took **394 ms on one GPU, 203 ms on two, and 103 ms on four**, a **3.84× speedup**. These measurements used pinned-host halo exchange. CUDA-aware MPI transport and multi-node scaling remain unverified.

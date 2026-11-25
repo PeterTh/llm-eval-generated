@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.20)
+project(nbody_benchmark LANGUAGES CUDA)
+
+set_source_files_properties(nbody.cpp PROPERTIES LANGUAGE CUDA)
+add_executable(nbody nbody.cpp)
+set_target_properties(nbody PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+
+target_compile_options(nbody PRIVATE
+    -O3
+    --fmad=false
+    -Xcompiler=-O3,-march=native,-Wall,-Wextra
+)

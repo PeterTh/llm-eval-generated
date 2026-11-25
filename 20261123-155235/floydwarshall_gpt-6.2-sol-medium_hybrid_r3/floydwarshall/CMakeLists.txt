@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.20)
+project(floydwarshall_benchmark LANGUAGES CXX CUDA)
+
+set(MPI_CXX_SKIP_MPICXX TRUE)
+find_package(MPI REQUIRED COMPONENTS CXX)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+
+# Keep the existing source filename while compiling its kernels with CUDA.
+set_source_files_properties(floydwarshall.cpp PROPERTIES LANGUAGE CUDA)
+add_executable(floydwarshall floydwarshall.cpp)
+set_target_properties(floydwarshall PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+separate_arguments(openmp_host_flags NATIVE_COMMAND "${OpenMP_CXX_FLAGS}")
+if(CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+    list(JOIN openmp_host_flags "," openmp_host_flags)
+    target_compile_options(floydwarshall PRIVATE "-Xcompiler=${openmp_host_flags}")
+else()
+    target_compile_options(floydwarshall PRIVATE ${openmp_host_flags})
+endif()
+target_compile_options(floydwarshall PRIVATE -O3)
+target_link_libraries(floydwarshall PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX)

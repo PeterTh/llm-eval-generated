@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.20)
+project(unstructured_benchmark LANGUAGES CXX CUDA)
+
+find_package(MPI REQUIRED COMPONENTS CXX)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+
+set_source_files_properties(unstructured.cpp PROPERTIES LANGUAGE CUDA)
+add_executable(unstructured unstructured.cpp)
+set_target_properties(unstructured PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+target_link_libraries(unstructured PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX)
+target_compile_definitions(unstructured PRIVATE OMPI_SKIP_MPICXX MPICH_SKIP_MPICXX)
+target_compile_options(unstructured PRIVATE -O3)
+if(CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+    target_compile_options(unstructured PRIVATE -Xcompiler=${OpenMP_CXX_FLAGS} --fmad=false)
+else()
+    target_compile_options(unstructured PRIVATE ${OpenMP_CXX_FLAGS} -ffp-contract=off)
+endif()
